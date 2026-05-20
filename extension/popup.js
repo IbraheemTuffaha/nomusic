@@ -98,32 +98,82 @@ async function refreshCacheSize() {
         ? "empty"
         : `${fmtBytes(total)} (${jobs} job${jobs === 1 ? "" : "s"}, ` +
           `${sources} source${sources === 1 ? "" : "s"})`;
-    $("clearCache").disabled = total === 0;
+    // Keep the button enabled even when empty so a stale "empty" reading
+    // (e.g. backend just restarted) isn't a dead-end. The server treats
+    // clearing an empty cache as a no-op.
+    $("clearCache").disabled = false;
   } catch (_err) {
     $("cacheSize").textContent = "unknown";
+    $("clearCache").disabled = false;
+  }
+}
+
+async function refreshCacheTtl() {
+  const el = $("cacheTtl");
+  try {
+    const resp = await fetch(`${$("backend").value}/capabilities`, {
+      cache: "no-store",
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    const ttl = data?.cache?.ttl_days;
+    if (typeof ttl === "number" && ttl > 0) {
+      el.textContent = `auto-deletes after ${ttl} day${ttl === 1 ? "" : "s"}`;
+    } else {
+      el.textContent = "no auto-delete";
+    }
+  } catch (_err) {
+    el.textContent = "";
+  }
+}
+
+// Two-click confirmation. The first click arms the button (red, label
+// changes); the second click within ARM_WINDOW_MS actually clears. This
+// avoids relying on window.confirm(), which Chrome silently suppresses in
+// some extension popup contexts.
+const ARM_WINDOW_MS = 4000;
+let armTimer = null;
+
+function disarm(btn) {
+  btn.classList.remove("armed");
+  btn.textContent = "Clear";
+  if (armTimer) {
+    clearTimeout(armTimer);
+    armTimer = null;
   }
 }
 
 async function clearCache() {
   const btn = $("clearCache");
+  if (!btn.classList.contains("armed")) {
+    btn.classList.add("armed");
+    btn.textContent = "Confirm";
+    armTimer = setTimeout(() => disarm(btn), ARM_WINDOW_MS);
+    return;
+  }
+
+  disarm(btn);
   const sizeEl = $("cacheSize");
   const prev = sizeEl.textContent;
-  if (!confirm("Delete all cached source audio and processed chunks?")) return;
   btn.disabled = true;
   sizeEl.textContent = "clearing…";
   try {
     const resp = await fetch(`${$("backend").value}/cache/clear`, {
       method: "POST",
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if (!resp.ok) {
+      const detail = await resp.text().catch(() => "");
+      throw new Error(`HTTP ${resp.status}: ${detail || resp.statusText}`);
+    }
     const data = await resp.json();
-    $("err").textContent = `freed ${fmtBytes(data.deleted_bytes)}`;
-    setTimeout(() => ($("err").textContent = ""), 2000);
+    $("err").textContent = `freed ${fmtBytes(data.deleted_bytes || 0)}`;
+    setTimeout(() => ($("err").textContent = ""), 2500);
   } catch (err) {
+    console.error("[nomusic] clear failed", err);
     $("err").textContent = `clear failed: ${err.message}`;
     sizeEl.textContent = prev;
+  } finally {
     btn.disabled = false;
-    return;
   }
   await refreshCacheSize();
 }
@@ -149,4 +199,5 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("save").addEventListener("click", save);
   $("clearCache").addEventListener("click", clearCache);
   refreshCacheSize();
+  refreshCacheTtl();
 });

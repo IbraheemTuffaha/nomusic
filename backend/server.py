@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -60,6 +61,37 @@ class ProcessRequest(BaseModel):
         return v
 
 
+def _start_cache_ttl_sweeper(cache: JobCache) -> None:
+    """Run an initial sweep, then schedule one every
+    ``cache_sweep_interval_seconds``. Skipped entirely when TTL is 0.
+
+    Lives in a daemon thread so it doesn't block server shutdown."""
+    if SETTINGS.cache_ttl_days <= 0 or SETTINGS.cache_sweep_interval_seconds <= 0:
+        log.info("Cache TTL sweep disabled (ttl_days=%s)", SETTINGS.cache_ttl_days)
+        return
+
+    ttl_seconds = SETTINGS.cache_ttl_days * 86400.0
+
+    def _loop() -> None:
+        import time
+
+        while True:
+            try:
+                removed, freed = cache.sweep_older_than(ttl_seconds)
+                if removed:
+                    log.info(
+                        "TTL sweep: removed %d entries, freed %d bytes",
+                        removed,
+                        freed,
+                    )
+            except Exception:
+                log.exception("TTL sweep failed")
+            time.sleep(SETTINGS.cache_sweep_interval_seconds)
+
+    t = threading.Thread(target=_loop, name="nomusic-cache-ttl", daemon=True)
+    t.start()
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="nomusic", version="0.1.0")
 
@@ -93,6 +125,8 @@ def create_app() -> FastAPI:
     app.state.cache = cache
     app.state.registry = registry
 
+    _start_cache_ttl_sweeper(cache)
+
     @app.get("/healthz")
     def healthz() -> dict:
         return {"ok": True}
@@ -113,6 +147,9 @@ def create_app() -> FastAPI:
                 "keep_stems": list(SETTINGS.default_keep_stems),
                 "chunk_seconds": SETTINGS.chunk_seconds,
                 "chunk_overlap_seconds": SETTINGS.chunk_overlap_seconds,
+            },
+            "cache": {
+                "ttl_days": SETTINGS.cache_ttl_days,
             },
         }
 

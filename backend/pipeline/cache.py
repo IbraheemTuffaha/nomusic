@@ -163,6 +163,49 @@ class JobCache:
                 log.warning("clear_all: couldn't remove %s: %s", child, err)
         return freed
 
+    def sweep_older_than(self, ttl_seconds: float) -> tuple[int, int]:
+        """Delete cache entries whose newest file is older than ``ttl_seconds``.
+
+        Returns ``(entries_removed, bytes_freed)``. We use ``newest file``
+        (rather than directory mtime) because writing a chunk doesn't always
+        bump the parent dir's mtime on every filesystem, and we want the
+        access pattern "I rewatched it yesterday" to keep the entry alive.
+        """
+        if ttl_seconds <= 0:
+            return (0, 0)
+
+        import time
+
+        now = time.time()
+        removed = 0
+        freed = 0
+
+        # Jobs: ~/.cache/nomusic/<key>
+        for child in list(self.root.iterdir()):
+            if not child.is_dir() or child.name == "sources":
+                continue
+            if _dir_newest_mtime(child) < now - ttl_seconds:
+                freed += _dir_bytes(child)
+                shutil.rmtree(child, ignore_errors=True)
+                removed += 1
+
+        # Sources: ~/.cache/nomusic/sources/<url_hash>
+        sources_root = self.root / "sources"
+        if sources_root.exists():
+            for child in list(sources_root.iterdir()):
+                if not child.is_dir():
+                    continue
+                if _dir_newest_mtime(child) < now - ttl_seconds:
+                    freed += _dir_bytes(child)
+                    shutil.rmtree(child, ignore_errors=True)
+                    removed += 1
+
+        if removed:
+            log.info(
+                "TTL sweep removed %d entries (%d bytes)", removed, freed
+            )
+        return (removed, freed)
+
 
 def _dir_bytes(path: Path) -> int:
     total = 0
@@ -173,3 +216,21 @@ def _dir_bytes(path: Path) -> int:
         except OSError:
             pass
     return total
+
+
+def _dir_newest_mtime(path: Path) -> float:
+    """Latest mtime among files inside ``path`` (recursive).
+
+    Returns 0 for an empty directory — which causes ``sweep_older_than`` to
+    delete it. That's fine: an empty cache dir has nothing to protect.
+    """
+    newest = 0.0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file():
+                m = p.stat().st_mtime
+                if m > newest:
+                    newest = m
+        except OSError:
+            pass
+    return newest

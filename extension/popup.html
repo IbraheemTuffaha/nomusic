@@ -119,6 +119,17 @@
         gap: 8px;
       }
       .cache-row strong { color: #f3f4f7; font-weight: 600; }
+      .cache-row__info { display: flex; flex-direction: column; gap: 2px; }
+      .cache-row__info .hint { margin: 0; }
+      button.danger.armed {
+        background: #6e1e2e;
+        border-color: #ff7575;
+        color: #ffe6e6;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
     </style>
   </head>
   <body>
@@ -135,7 +146,10 @@
     <div id="stems"></div>
 
     <div class="cache-row" id="cacheRow">
-      <span>Cache: <strong id="cacheSize">—</strong></span>
+      <div class="cache-row__info">
+        <div>Cache: <strong id="cacheSize">—</strong></div>
+        <div class="hint" id="cacheTtl"></div>
+      </div>
       <button id="clearCache" class="danger" type="button">Clear</button>
     </div>
 

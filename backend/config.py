@@ -61,5 +61,17 @@ class Settings:
     # allow all origins but only for the localhost listener.
     allow_origins: tuple[str, ...] = ("*",)
 
+    # Cache entries (per-job dirs and per-source dirs) older than this are
+    # swept on server startup and once an hour while running. ``0`` disables
+    # the sweep entirely. Default keeps a week of recent work so a re-watch
+    # later in the day is instant but a forgotten 3h video doesn't sit at
+    # 2 GB on disk indefinitely.
+    cache_ttl_days: float = field(
+        default_factory=lambda: _env_float("CACHE_TTL_DAYS", 7.0)
+    )
+    cache_sweep_interval_seconds: float = field(
+        default_factory=lambda: _env_float("CACHE_SWEEP_INTERVAL_SECONDS", 3600.0)
+    )
+
 
 SETTINGS = Settings()
