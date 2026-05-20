@@ -60,16 +60,29 @@ class JobCache:
     # -- key helpers ---------------------------------------------------------
 
     @staticmethod
-    def key(url: str, model: str, keep_stems: list[str]) -> str:
-        normalized = json.dumps(
-            {
-                "v": SCHEMA_VERSION,
-                "url": url,
-                "model": model,
-                "stems": sorted(keep_stems),
-            },
-            sort_keys=True,
-        ).encode()
+    def key(
+        url: str,
+        model: str,
+        keep_stems: list[str],
+        *,
+        chunk_seconds: float | None = None,
+        chunk_overlap_seconds: float | None = None,
+    ) -> str:
+        # ``chunk_seconds`` is in the key so changing the default value
+        # auto-invalidates existing cache entries — old chunks would have
+        # incorrect timing for the new playback plan. Callers that don't
+        # care (legacy code, tests) can omit it.
+        payload: dict = {
+            "v": SCHEMA_VERSION,
+            "url": url,
+            "model": model,
+            "stems": sorted(keep_stems),
+        }
+        if chunk_seconds is not None:
+            payload["chunk_seconds"] = round(chunk_seconds, 4)
+        if chunk_overlap_seconds is not None:
+            payload["chunk_overlap_seconds"] = round(chunk_overlap_seconds, 4)
+        normalized = json.dumps(payload, sort_keys=True).encode()
         return hashlib.sha256(normalized).hexdigest()[:16]
 
     @staticmethod

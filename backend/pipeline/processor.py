@@ -141,7 +141,13 @@ class Processor:
     ) -> tuple[str, CacheMeta, VideoMetadata, list[ChunkPlan]]:
         """Probe the video, build/refresh the cache meta, and plan the chunks."""
         info = probe(url)
-        key = self.cache.key(url, model, keep_stems)
+        key = self.cache.key(
+            url,
+            model,
+            keep_stems,
+            chunk_seconds=self.chunk_seconds,
+            chunk_overlap_seconds=self.chunk_overlap_seconds,
+        )
         plans = plan_chunks(
             info.duration_seconds,
             self.chunk_seconds,

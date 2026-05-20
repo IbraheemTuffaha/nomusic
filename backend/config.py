@@ -54,14 +54,18 @@ class Settings:
     # where music removal isn't critical and they want ambient SFX preserved.
     default_keep_stems: tuple[str, ...] = ("vocals",)
 
-    # 30 s chunks per the design doc, with a small overlap to absorb edge
-    # artifacts from the separator. ``chunk_overlap_seconds`` is the *total*
-    # overlap between adjacent chunks; the crossfade uses the same window.
+    # 10 s chunks: faster first-chunk + seek recovery while staying above
+    # demucs's internal segment size (~7.8 s for htdemucs) so each chunk
+    # only needs one separator pass. Larger chunks reduce per-chunk fixed
+    # overhead at the cost of slower startup; smaller chunks invert that
+    # trade. ``chunk_overlap_seconds`` is the total overlap between adjacent
+    # chunks — kept small (5% of chunk) because the model + the 10 ms
+    # anti-click fade in the writer handle boundary quality.
     chunk_seconds: float = field(
-        default_factory=lambda: _env_float("CHUNK_SECONDS", 30.0)
+        default_factory=lambda: _env_float("CHUNK_SECONDS", 10.0)
     )
     chunk_overlap_seconds: float = field(
-        default_factory=lambda: _env_float("CHUNK_OVERLAP_SECONDS", 1.0)
+        default_factory=lambda: _env_float("CHUNK_OVERLAP_SECONDS", 0.5)
     )
 
     # CORS: extensions hit us with random ``chrome-extension://`` origins, so we

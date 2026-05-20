@@ -96,7 +96,13 @@ class JobRegistry:
         # button look stuck on "Starting". The cache key only needs (url,
         # model, stems), all of which we have, so we can return immediately
         # and let the worker thread do the slow probe.
-        key = self.cache.key(url, model, list(keep_stems))
+        key = self.cache.key(
+            url,
+            model,
+            list(keep_stems),
+            chunk_seconds=self.processor.chunk_seconds,
+            chunk_overlap_seconds=self.processor.chunk_overlap_seconds,
+        )
         existing_meta = self.cache.load_meta(key)
 
         with self._lock:
