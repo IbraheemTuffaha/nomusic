@@ -426,8 +426,6 @@
       this._realSetVolume = (v) => volumeDesc.set.call(this.video, v);
       this._realGetVolume = () => volumeDesc.get.call(this.video);
 
-      this._realSetVolume(0);
-
       // Seed our processed-audio gain to whatever the user was listening
       // at, so clicking the button doesn't jump the loudness.
       if (this.gain) {
@@ -436,18 +434,37 @@
           : Math.max(0, Math.min(1, this.originalVolume));
       }
 
-      try {
-        Object.defineProperty(this.video, "volume", {
-          configurable: true,
-          get: () => 0,
-          set: () => {
-            /* swallow */
-          },
-        });
-      } catch (err) {
-        console.warn("[nomusic] volume property override failed", err);
-      }
+      // Hook the main-world page-script setter patch. Each volume write
+      // the host page performs lands here as a CustomEvent before the
+      // audio renderer can pick up a non-zero value, so there is no
+      // bleed window. The patched setter pins the underlying volume to 0
+      // for us.
+      this._volIntentHandler = (e) => {
+        if (!e || !e.detail) return;
+        const { volume, muted } = e.detail;
+        if (typeof volume === "number" && volume > 0) {
+          this._userVolume = volume;
+        }
+        if (typeof muted === "boolean") this._lastMuted = muted;
+        this._applyEffectiveVolume();
+      };
+      this.video.addEventListener(
+        "nomusic:vol-intent",
+        this._volIntentHandler,
+      );
 
+      // Flag this element so page-script.js knows to intercept its
+      // volume writes. dataset writes propagate to the main world via
+      // the shared DOM.
+      this.video.dataset.nomusicVolBlock = "1";
+
+      // Initial pin (also exercises the page-script path).
+      this._realSetVolume(0);
+
+      // Fallback rAF re-assertion. If page-script.js failed to load
+      // (e.g. a browser that disables MAIN-world content scripts), we
+      // still keep underlying volume pinned. Cheap: one comparison +
+      // at most one setter call per frame.
       const tick = () => {
         if (this.disposed) return;
         try {
