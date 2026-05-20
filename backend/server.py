@@ -73,7 +73,7 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=list(SETTINGS.allow_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["*"],
         allow_private_network=True,
     )
@@ -157,6 +157,19 @@ def create_app() -> FastAPI:
             media_type="audio/wav",
             headers={"Cache-Control": "public, max-age=86400"},
         )
+
+    @app.get("/cache")
+    def cache_stats() -> dict:
+        return {"root": str(cache.root), **cache.stats()}
+
+    @app.post("/cache/clear")
+    def cache_clear() -> dict:
+        # Best-effort: also drop in-memory job entries so a freshly cleared
+        # cache doesn't surface stale "ready" status on the next /status call.
+        with registry._lock:  # internal lock; small API and same process
+            registry._jobs.clear()
+        freed = cache.clear_all()
+        return {"deleted_bytes": freed}
 
     @app.get("/audio/{job_id}")
     def audio(job_id: str) -> FileResponse:

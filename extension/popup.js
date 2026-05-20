@@ -70,6 +70,64 @@ async function load() {
   }
 }
 
+function fmtBytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2)} ${units[i]}`;
+}
+
+async function refreshCacheSize() {
+  try {
+    const resp = await fetch(`${$("backend").value}/cache`, {
+      cache: "no-store",
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    const total = data.total_bytes || 0;
+    const jobs = data.job_count || 0;
+    const sources = data.source_count || 0;
+    $("cacheSize").textContent =
+      total === 0
+        ? "empty"
+        : `${fmtBytes(total)} (${jobs} job${jobs === 1 ? "" : "s"}, ` +
+          `${sources} source${sources === 1 ? "" : "s"})`;
+    $("clearCache").disabled = total === 0;
+  } catch (_err) {
+    $("cacheSize").textContent = "unknown";
+  }
+}
+
+async function clearCache() {
+  const btn = $("clearCache");
+  const sizeEl = $("cacheSize");
+  const prev = sizeEl.textContent;
+  if (!confirm("Delete all cached source audio and processed chunks?")) return;
+  btn.disabled = true;
+  sizeEl.textContent = "clearing…";
+  try {
+    const resp = await fetch(`${$("backend").value}/cache/clear`, {
+      method: "POST",
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    $("err").textContent = `freed ${fmtBytes(data.deleted_bytes)}`;
+    setTimeout(() => ($("err").textContent = ""), 2000);
+  } catch (err) {
+    $("err").textContent = `clear failed: ${err.message}`;
+    sizeEl.textContent = prev;
+    btn.disabled = false;
+    return;
+  }
+  await refreshCacheSize();
+}
+
 async function save() {
   const backendUrl = $("backend").value.trim() || "http://127.0.0.1:8723";
   const model = $("model").value || null;
@@ -86,7 +144,9 @@ async function save() {
   setTimeout(() => ($("err").textContent = ""), 1200);
 }
 
-document.addEventListener("DOMContentLoaded", () => {
-  load();
+document.addEventListener("DOMContentLoaded", async () => {
+  await load();
   $("save").addEventListener("click", save);
+  $("clearCache").addEventListener("click", clearCache);
+  refreshCacheSize();
 });

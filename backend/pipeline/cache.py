@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -109,3 +110,66 @@ class JobCache:
             return
         meta.complete = True
         self.save_meta(key, meta)
+
+    # -- maintenance ---------------------------------------------------------
+
+    def stats(self) -> dict:
+        """Tally on-disk sizes. Returns bytes counts the popup can render."""
+        sources_root = self.root / "sources"
+        source_count = 0
+        source_bytes = 0
+        if sources_root.exists():
+            for p in sources_root.glob("*"):
+                if p.is_dir():
+                    source_count += 1
+                    source_bytes += _dir_bytes(p)
+
+        job_count = 0
+        job_bytes = 0
+        for p in self.root.iterdir():
+            if not p.is_dir() or p.name == "sources":
+                continue
+            job_count += 1
+            job_bytes += _dir_bytes(p)
+
+        return {
+            "total_bytes": source_bytes + job_bytes,
+            "source_bytes": source_bytes,
+            "job_bytes": job_bytes,
+            "source_count": source_count,
+            "job_count": job_count,
+        }
+
+    def clear_all(self) -> int:
+        """Delete every cached source and job. Returns bytes freed.
+
+        Survives an in-flight job at the cost of that job's next chunk write
+        failing (the worker thread crashes; the user re-clicks). The root
+        directory itself is preserved so subsequent writes don't need to
+        recreate it.
+        """
+        freed = 0
+        for child in list(self.root.iterdir()):
+            try:
+                freed += _dir_bytes(child) if child.is_dir() else child.stat().st_size
+            except OSError:
+                pass
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+            except OSError as err:
+                log.warning("clear_all: couldn't remove %s: %s", child, err)
+        return freed
+
+
+def _dir_bytes(path: Path) -> int:
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            pass
+    return total
