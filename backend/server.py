@@ -63,12 +63,19 @@ class ProcessRequest(BaseModel):
 def create_app() -> FastAPI:
     app = FastAPI(title="nomusic", version="0.1.0")
 
+    # ``allow_private_network=True`` opts into Chrome's Private Network
+    # Access flow: a fetch from a public origin (youtube.com) to a private
+    # IP (127.0.0.1) gets an extra preflight with
+    # ``Access-Control-Request-Private-Network: true`` and the response
+    # must echo ``Access-Control-Allow-Private-Network: true``. Without it
+    # Chrome silently drops the request even when regular CORS is correct.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(SETTINGS.allow_origins),
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
+        allow_private_network=True,
     )
 
     engine = get_engine(SETTINGS.engine_name)
