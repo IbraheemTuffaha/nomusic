@@ -2,7 +2,12 @@
 
 const $ = (id) => document.getElementById(id);
 
-const ALL_STEMS = ["vocals", "drums", "bass", "other"];
+const ALL_STEMS = [
+  { name: "vocals", desc: "speech & lead vocals" },
+  { name: "drums", desc: "percussion (music)" },
+  { name: "bass", desc: "bass (music)" },
+  { name: "other", desc: "ambient + melodic instruments" },
+];
 
 async function load() {
   const stored = await chrome.storage.sync.get([
@@ -39,16 +44,18 @@ async function load() {
     }
     select.value = stored.model || defaultModel || models[0] || "";
 
-    const defaultKeep =
-      caps.defaults?.keep_stems || ["vocals", "other"];
+    const defaultKeep = caps.defaults?.keep_stems || ["vocals"];
     const keep = stored.keepStems || defaultKeep;
     const stemsEl = $("stems");
     stemsEl.innerHTML = "";
+    stemsEl.style.flexDirection = "column";
+    stemsEl.style.alignItems = "flex-start";
+    stemsEl.style.gap = "4px";
     for (const s of ALL_STEMS) {
       const wrap = document.createElement("label");
       wrap.style.display = "inline-flex";
       wrap.style.alignItems = "center";
-      wrap.style.gap = "4px";
+      wrap.style.gap = "6px";
       wrap.style.margin = "0";
       wrap.style.textTransform = "none";
       wrap.style.letterSpacing = "0";
@@ -56,9 +63,11 @@ async function load() {
       wrap.style.fontSize = "12px";
       const cb = document.createElement("input");
       cb.type = "checkbox";
-      cb.value = s;
-      cb.checked = keep.includes(s);
-      wrap.append(cb, document.createTextNode(s));
+      cb.value = s.name;
+      cb.checked = keep.includes(s.name);
+      const text = document.createElement("span");
+      text.innerHTML = `<strong>${s.name}</strong> <span style="color:#8a92a0">— ${s.desc}</span>`;
+      wrap.append(cb, text);
       stemsEl.appendChild(wrap);
     }
   } else {

@@ -39,9 +39,13 @@ class Settings:
         )
     )
 
-    # Stems to keep in the final mix. ``vocals`` covers speech; ``other`` covers
-    # ambient sounds / sound effects. Drums and bass are the music we drop.
-    default_keep_stems: tuple[str, ...] = ("vocals", "other")
+    # Stems to keep in the final mix. Default = ``vocals`` only, because
+    # demucs's ``other`` stem is a residual bucket that contains melodic
+    # instruments (guitars, synths, strings, pianos) along with ambient
+    # sounds — keeping it leaves most music audible. The popup lets the user
+    # opt back into ``vocals + other`` if they're watching a sparse track
+    # where music removal isn't critical and they want ambient SFX preserved.
+    default_keep_stems: tuple[str, ...] = ("vocals",)
 
     # 30 s chunks per the design doc, with a small overlap to absorb edge
     # artifacts from the separator. ``chunk_overlap_seconds`` is the *total*
