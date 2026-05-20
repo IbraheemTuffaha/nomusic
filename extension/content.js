@@ -407,59 +407,36 @@
       this.originalMuted = this.video.muted;
       this.originalVolume = this.video.volume;
 
-      // YouTube et al. re-assert volume / muted state every frame from their
-      // own player code, so a single `video.muted = true` is undone almost
-      // immediately. We layer two mutes:
-      //
-      //   1. Override the instance's `muted` and `volume` properties so any
-      //      direct setter the host page calls is a no-op. The underlying
-      //      state still has to be set via the original setter from
-      //      HTMLMediaElement.prototype — instance overrides only shadow
-      //      reads/writes that come through the instance.
-      //   2. requestAnimationFrame loop that re-applies the underlying state
-      //      via the original setter, in case the host bypasses the instance
-      //      and writes through the prototype.
-      //
-      // We deliberately do NOT call createMediaElementSource on the host
-      // <video>: attaching one is permanent (no detach API exists), it gets
-      // silenced anyway for cross-origin media like YouTube, and once the
-      // AudioContext is closed on dispose the video element ends up waiting
-      // forever on audio that will never flow — the player shows an
-      // infinite loading spinner you can't dismiss.
+      // What we track across host events:
+      //   _userVolume — last slider position the user set (0..1). Survives
+      //                 mute toggles so unmuting restores the right level.
+      //   _lastMuted  — last muted state we observed. Lets the volumechange
+      //                 handler detect mute/unmute clicks (which can fire
+      //                 without a volume change).
+      this._userVolume =
+        this.originalVolume > 0 ? this.originalVolume : 1.0;
+      this._lastMuted = this.originalMuted;
+
+      // We override only ``volume`` and pin it to 0 via the prototype
+      // setter + rAF re-assertion. ``muted`` is left alone: audio is
+      // already silent because volume is 0, and reading video.muted gives
+      // us the user's real mute intent (needed by the volumechange path).
       const proto = HTMLMediaElement.prototype;
-      const mutedDesc = Object.getOwnPropertyDescriptor(proto, "muted");
       const volumeDesc = Object.getOwnPropertyDescriptor(proto, "volume");
+      this._realSetVolume = (v) => volumeDesc.set.call(this.video, v);
+      this._realGetVolume = () => volumeDesc.get.call(this.video);
 
-      const realSetMuted = (v) => mutedDesc.set.call(this.video, v);
-      const realSetVolume = (v) => volumeDesc.set.call(this.video, v);
-      const realGetMuted = () => mutedDesc.get.call(this.video);
-      const realGetVolume = () => volumeDesc.get.call(this.video);
-      this._realSetMuted = realSetMuted;
-      this._realSetVolume = realSetVolume;
-      this._realGetMuted = realGetMuted;
-      this._realGetVolume = realGetVolume;
+      this._realSetVolume(0);
 
-      // Start our gain at the user's current effective volume so toggling
-      // nomusic on doesn't jump the loudness around. Whatever they set
-      // before clicking the button is what they'll hear from the processed
-      // audio.
+      // Seed our processed-audio gain to whatever the user was listening
+      // at, so clicking the button doesn't jump the loudness.
       if (this.gain) {
         this.gain.gain.value = this.originalMuted
           ? 0
           : Math.max(0, Math.min(1, this.originalVolume));
       }
 
-      realSetMuted(true);
-      realSetVolume(0);
-
       try {
-        Object.defineProperty(this.video, "muted", {
-          configurable: true,
-          get: () => true,
-          set: () => {
-            /* swallow */
-          },
-        });
         Object.defineProperty(this.video, "volume", {
           configurable: true,
           get: () => 0,
@@ -468,20 +445,81 @@
           },
         });
       } catch (err) {
-        console.warn("[nomusic] property override failed", err);
+        console.warn("[nomusic] volume property override failed", err);
       }
 
       const tick = () => {
         if (this.disposed) return;
         try {
-          if (!realGetMuted()) realSetMuted(true);
-          if (realGetVolume() !== 0) realSetVolume(0);
+          if (this._realGetVolume() !== 0) this._realSetVolume(0);
         } catch (_err) {
           /* element detached */
         }
         this.muteAsserter = requestAnimationFrame(tick);
       };
       this.muteAsserter = requestAnimationFrame(tick);
+
+      // YouTube's player updates volume via its own state machine and
+      // sometimes doesn't round-trip through video.volume at all, so the
+      // volumechange listener never sees the change. They do persist the
+      // setting to localStorage on every interaction; we poll that as a
+      // redundant signal.
+      this._startYouTubeVolumePoll();
+    }
+
+    _startYouTubeVolumePoll() {
+      if (!/(?:^|\.)youtube\.com$/.test(location.hostname)) return;
+
+      const readYT = () => {
+        try {
+          const raw = localStorage.getItem("yt-player-volume");
+          if (!raw) return null;
+          const wrapper = JSON.parse(raw);
+          const data =
+            typeof wrapper.data === "string"
+              ? JSON.parse(wrapper.data)
+              : wrapper.data;
+          return {
+            volume: Math.max(0, Math.min(1, (data.volume ?? 100) / 100)),
+            muted: !!data.muted,
+          };
+        } catch (_err) {
+          return null;
+        }
+      };
+
+      let last = null;
+      const tick = () => {
+        if (this.disposed) return;
+        this._ytVolTimer = setTimeout(tick, 200);
+        const yt = readYT();
+        if (!yt) return;
+        if (last && last.volume === yt.volume && last.muted === yt.muted) {
+          return;
+        }
+        last = yt;
+        if (yt.volume > 0) this._userVolume = yt.volume;
+        this._lastMuted = yt.muted;
+        this._applyEffectiveVolume();
+      };
+      tick();
+    }
+
+    /** Push the current user intent (volume + mute) into the processed-
+     *  audio gain. Short setTargetAtTime ramp avoids zipper noise on fast
+     *  slider drags. */
+    _applyEffectiveVolume() {
+      if (!this.gain || !this.audioCtx) return;
+      const effective = this._lastMuted ? 0 : this._userVolume;
+      try {
+        this.gain.gain.setTargetAtTime(
+          effective,
+          this.audioCtx.currentTime,
+          0.005,
+        );
+      } catch (_err) {
+        this.gain.gain.value = effective;
+      }
     }
 
     /**
@@ -523,17 +561,14 @@
     unmuteVideo() {
       if (this.muteAsserter) cancelAnimationFrame(this.muteAsserter);
       this.muteAsserter = null;
+      if (this._ytVolTimer) clearTimeout(this._ytVolTimer);
+      this._ytVolTimer = null;
 
-      // Remove the instance overrides so the prototype's behavior comes back.
       try {
-        delete this.video.muted;
         delete this.video.volume;
       } catch (_err) {
         /* noop */
       }
-
-      // Restore underlying state via the original setters.
-      if (this._realSetMuted) this._realSetMuted(this.originalMuted);
       if (this._realSetVolume) this._realSetVolume(this.originalVolume);
     }
 
