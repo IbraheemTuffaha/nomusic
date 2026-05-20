@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local-only state
+.cache/
+*.wav
+*.mp3
+*.m4a
+*.opus
+*.webm
+*.mp4
+*.log
+
+# Vendored MLX demucs (cloned by install.sh)
+vendor/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Extension build artifacts
+extension/dist/
+extension/*.zip
