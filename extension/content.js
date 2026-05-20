@@ -65,13 +65,6 @@
       this.button = button;
       this.audioCtx = null;
       this.gain = null;
-      // Web Audio routing of the host video. Once a <video> is fed into a
-      // MediaElementAudioSourceNode, its audio bypasses the default output
-      // and only the Web Audio graph hears it — so setting hostGain to 0 is
-      // a hard mute YouTube's player can't override. We connect to
-      // destination at gain 0; on dispose we set the gain back to 1.
-      this.hostSource = null;
-      this.hostGain = null;
       this.muteAsserter = null;
       this.jobId = null;
       this.totalChunks = 0;
@@ -415,23 +408,26 @@
 
       // YouTube et al. re-assert volume / muted state every frame from their
       // own player code, so a single `video.muted = true` is undone almost
-      // immediately. We layer three mutes:
+      // immediately. We layer two mutes:
       //
       //   1. Override the instance's `muted` and `volume` properties so any
-      //      direct setter the host page calls is a no-op. The internal
+      //      direct setter the host page calls is a no-op. The underlying
       //      state still has to be set via the original setter from
       //      HTMLMediaElement.prototype — instance overrides only shadow
       //      reads/writes that come through the instance.
       //   2. requestAnimationFrame loop that re-applies the underlying state
       //      via the original setter, in case the host bypasses the instance
-      //      and writes through the prototype (e.g. .__proto__.muted setter).
-      //   3. Web Audio routing of the host element. Often silenced for
-      //      cross-origin media (so it won't single-handedly mute YouTube),
-      //      but for same-origin players it's the cleanest mute.
+      //      and writes through the prototype.
+      //
+      // We deliberately do NOT call createMediaElementSource on the host
+      // <video>: attaching one is permanent (no detach API exists), it gets
+      // silenced anyway for cross-origin media like YouTube, and once the
+      // AudioContext is closed on dispose the video element ends up waiting
+      // forever on audio that will never flow — the player shows an
+      // infinite loading spinner you can't dismiss.
       const proto = HTMLMediaElement.prototype;
       const mutedDesc = Object.getOwnPropertyDescriptor(proto, "muted");
       const volumeDesc = Object.getOwnPropertyDescriptor(proto, "volume");
-      this._origDescriptors = { muted: mutedDesc, volume: volumeDesc };
 
       const realSetMuted = (v) => mutedDesc.set.call(this.video, v);
       const realSetVolume = (v) => volumeDesc.set.call(this.video, v);
@@ -443,9 +439,6 @@
       realSetMuted(true);
       realSetVolume(0);
 
-      // Layer 1: instance overrides. The getter reports our intended values
-      // so any host-page logic that checks `video.muted` keeps believing it
-      // is muted, but the underlying state is the source of truth.
       try {
         Object.defineProperty(this.video, "muted", {
           configurable: true,
@@ -465,7 +458,6 @@
         console.warn("[nomusic] property override failed", err);
       }
 
-      // Layer 2: rAF re-assertion. Cheap (~one branch per frame).
       const tick = () => {
         if (this.disposed) return;
         try {
@@ -477,18 +469,6 @@
         this.muteAsserter = requestAnimationFrame(tick);
       };
       this.muteAsserter = requestAnimationFrame(tick);
-
-      // Layer 3: Web Audio routing. May be silenced for cross-origin media.
-      try {
-        this.hostSource = this.audioCtx.createMediaElementSource(this.video);
-        this.hostGain = this.audioCtx.createGain();
-        this.hostGain.gain.value = 0;
-        this.hostSource.connect(this.hostGain).connect(this.audioCtx.destination);
-      } catch (err) {
-        // Already routed by someone else, or cross-origin tainted. The
-        // property-level mutes above cover this case.
-        console.debug("[nomusic] MediaElementSource not used:", err?.message);
-      }
     }
 
     unmuteVideo() {
@@ -506,16 +486,6 @@
       // Restore underlying state via the original setters.
       if (this._realSetMuted) this._realSetMuted(this.originalMuted);
       if (this._realSetVolume) this._realSetVolume(this.originalVolume);
-
-      if (this.hostGain) {
-        // We can't fully un-route a MediaElementSource once created, so we
-        // leave the graph in place at unity gain to restore audibility.
-        try {
-          this.hostGain.gain.value = 1.0;
-        } catch (_err) {
-          /* noop */
-        }
-      }
     }
 
     attachVideoListeners() {
