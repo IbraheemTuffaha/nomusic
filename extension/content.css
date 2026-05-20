@@ -1,0 +1,60 @@
+/* All extension-injected UI is namespaced under .nomusic-* so we never collide
+   with host-page styles. We avoid !important except where the host site is
+   known to fight back (YouTube's z-index war). */
+
+.nomusic-btn {
+  position: absolute;
+  z-index: 2147483600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(15, 17, 22, 0.75);
+  color: #f5f6f8;
+  font: 600 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    sans-serif;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  backdrop-filter: saturate(140%) blur(8px);
+  -webkit-backdrop-filter: saturate(140%) blur(8px);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  transition: opacity 120ms ease, transform 120ms ease, background 120ms ease;
+  user-select: none;
+}
+
+.nomusic-btn:hover { background: rgba(28, 30, 38, 0.85); }
+.nomusic-btn:active { transform: translateY(1px); }
+.nomusic-btn[data-state="active"] {
+  background: rgba(34, 139, 90, 0.92);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+.nomusic-btn[data-state="working"] {
+  background: rgba(70, 95, 160, 0.92);
+}
+.nomusic-btn[data-state="error"] {
+  background: rgba(170, 60, 60, 0.92);
+}
+
+.nomusic-btn__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.85;
+}
+
+.nomusic-btn[data-state="working"] .nomusic-btn__dot {
+  animation: nomusic-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes nomusic-pulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.85); }
+  50%      { opacity: 1;    transform: scale(1.15); }
+}
+
+.nomusic-btn__progress {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}

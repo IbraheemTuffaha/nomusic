@@ -4,7 +4,6 @@
 # - Installs Python 3.11 and ffmpeg via Homebrew if missing
 # - Creates backend/.venv
 # - Installs Python deps from backend/requirements.txt
-# - Clones the demucs-mlx project into vendor/ (added to sys.path by server.py)
 #
 # Re-running this script is safe; each step is idempotent.
 
@@ -21,7 +20,7 @@ die()  { printf '\033[1;31m[err ]\033[0m %s\n' "$1" >&2; exit 1; }
 # --- platform check ----------------------------------------------------------
 
 if [[ "$(uname -s)" != "Darwin" ]] || [[ "$(uname -m)" != "arm64" ]]; then
-  die "nomusic's default MLX engine requires macOS on Apple Silicon."
+  die "nomusic's default engine targets macOS on Apple Silicon."
 fi
 
 # --- homebrew prerequisites --------------------------------------------------
@@ -52,28 +51,9 @@ fi
 # shellcheck disable=SC1091
 source backend/.venv/bin/activate
 
-step "Installing Python dependencies"
+step "Installing Python dependencies (this may take a few minutes for torch)"
 pip install --upgrade pip wheel
 pip install -r backend/requirements.txt
-
-# --- demucs-mlx --------------------------------------------------------------
-
-step "Vendoring demucs-mlx"
-mkdir -p vendor
-if [[ ! -d vendor/demucs-mlx ]]; then
-  # Upstream: https://github.com/ml-explore/mlx-examples (subtree) or a community
-  # port. We pin a known-working community port; users can swap the remote if
-  # they prefer the official one once it lands.
-  git clone --depth=1 https://github.com/ml-explore/mlx-examples.git vendor/mlx-examples
-  if [[ -d vendor/mlx-examples/demucs ]]; then
-    ln -sfn mlx-examples/demucs vendor/demucs-mlx
-  else
-    warn "vendor/mlx-examples does not contain a demucs/ subtree; please add a"
-    warn "demucs-mlx implementation at vendor/demucs-mlx before running /process."
-  fi
-else
-  echo "  vendor/demucs-mlx already present"
-fi
 
 # --- done --------------------------------------------------------------------
 

@@ -2,10 +2,16 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 yt-dlp>=2024.10.7
 soundfile>=0.12.1
-numpy>=1.26
-# MLX stack — Apple Silicon only.
-mlx>=0.18
-mlx-audio>=0.0.4
-# demucs-mlx is cloned by install.sh into vendor/demucs-mlx and added to
-# sys.path at runtime; it does not ship a PyPI release.
+numpy>=1.26,<2.3
+
+# Source separation. Today we use the upstream ``demucs`` package, which
+# auto-detects Apple Silicon's MPS backend and runs htdemucs at ~15-25x
+# realtime on an M-series chip. The engine wraps it behind the MLX engine
+# interface so a true demucs-mlx port can drop in later without touching any
+# call sites — see backend/engines/mlx_engine.py for the dependency-injection
+# hook.
+torch>=2.2
+torchaudio>=2.2
+demucs>=4.0.1
+
 pytest>=8.0

@@ -1,0 +1,91 @@
+// Popup logic: surfaces backend health and lets the user tweak settings.
+
+const $ = (id) => document.getElementById(id);
+
+const ALL_STEMS = ["vocals", "drums", "bass", "other"];
+
+async function load() {
+  const stored = await chrome.storage.sync.get([
+    "backendUrl",
+    "model",
+    "keepStems",
+  ]);
+  $("backend").value = stored.backendUrl || "http://127.0.0.1:8723";
+
+  let caps = null;
+  try {
+    const resp = await fetch(`${$("backend").value}/capabilities`, {
+      cache: "no-store",
+    });
+    if (resp.ok) caps = await resp.json();
+  } catch (_err) {
+    /* fall through */
+  }
+
+  if (caps) {
+    $("status").classList.add("ok");
+    $("statusText").textContent = "backend up";
+    $("device").textContent = caps.engine?.device || "";
+
+    const select = $("model");
+    select.innerHTML = "";
+    const models = caps.engine?.supported_models || [];
+    const defaultModel = caps.engine?.default_model;
+    for (const m of models) {
+      const opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = m + (m === defaultModel ? " (default)" : "");
+      select.appendChild(opt);
+    }
+    select.value = stored.model || defaultModel || models[0] || "";
+
+    const defaultKeep =
+      caps.defaults?.keep_stems || ["vocals", "other"];
+    const keep = stored.keepStems || defaultKeep;
+    const stemsEl = $("stems");
+    stemsEl.innerHTML = "";
+    for (const s of ALL_STEMS) {
+      const wrap = document.createElement("label");
+      wrap.style.display = "inline-flex";
+      wrap.style.alignItems = "center";
+      wrap.style.gap = "4px";
+      wrap.style.margin = "0";
+      wrap.style.textTransform = "none";
+      wrap.style.letterSpacing = "0";
+      wrap.style.color = "inherit";
+      wrap.style.fontSize = "12px";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = s;
+      cb.checked = keep.includes(s);
+      wrap.append(cb, document.createTextNode(s));
+      stemsEl.appendChild(wrap);
+    }
+  } else {
+    $("status").classList.add("bad");
+    $("statusText").textContent = "backend not reachable";
+    $("err").textContent =
+      "Start the backend: backend/.venv/bin/python backend/server.py";
+  }
+}
+
+async function save() {
+  const backendUrl = $("backend").value.trim() || "http://127.0.0.1:8723";
+  const model = $("model").value || null;
+  const checkboxes = $("stems").querySelectorAll('input[type="checkbox"]');
+  const keepStems = Array.from(checkboxes)
+    .filter((cb) => cb.checked)
+    .map((cb) => cb.value);
+  await chrome.storage.sync.set({
+    backendUrl,
+    model,
+    keepStems: keepStems.length ? keepStems : null,
+  });
+  $("err").textContent = "saved";
+  setTimeout(() => ($("err").textContent = ""), 1200);
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  load();
+  $("save").addEventListener("click", save);
+});

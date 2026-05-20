@@ -275,14 +275,18 @@ class Processor:
             trimmed[-tail_fade:] *= ramp
 
         out = self.cache.chunk_path(key, plan.index)
-        # Atomic write so a crash mid-write doesn't poison the cache.
-        tmp_path = out.with_suffix(".wav.part")
-        sf.write(str(tmp_path), trimmed, sample_rate, subtype="PCM_16")
+        # Atomic write so a crash mid-write doesn't poison the cache. We pass
+        # ``format`` explicitly because the temp file's extension doesn't end
+        # in ``.wav``.
+        tmp_path = out.with_suffix(".part")
+        sf.write(
+            str(tmp_path), trimmed, sample_rate, subtype="PCM_16", format="WAV"
+        )
         tmp_path.replace(out)
 
     def _concatenate_full(self, key: str, plans: list[ChunkPlan]) -> None:
         full_path = self.cache.full_path(key)
-        tmp_path = full_path.with_suffix(".wav.part")
+        tmp_path = full_path.with_suffix(".part")
         # Concatenate using soundfile streaming so we don't load everything at
         # once. Chunks already have crossfades baked in, but here we just butt
         # them together — the fade-ins/outs handle the seam.
@@ -297,6 +301,7 @@ class Processor:
             samplerate=sample_rate,
             channels=channels,
             subtype="PCM_16",
+            format="WAV",
         ) as out_f:
             for plan in plans:
                 with sf.SoundFile(str(self.cache.chunk_path(key, plan.index))) as in_f:

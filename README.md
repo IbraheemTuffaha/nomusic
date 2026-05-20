@@ -29,8 +29,8 @@ chunk while the rest is still being separated. Re-watches are instant (cached).
 ```
 
 This installs Python 3.11 + ffmpeg via Homebrew if needed, creates a venv in
-`backend/.venv`, installs the backend dependencies, and clones the `demucs-mlx`
-implementation into `vendor/`.
+`backend/.venv`, and installs the backend dependencies (including
+`torch` + `demucs`). First run takes a few minutes; later runs are fast.
 
 ## Run
 
@@ -58,11 +58,14 @@ FastAPI on 127.0.0.1:8723
 Engine abstraction (engines/base.py)
     │
     ▼
-MLX engine ── demucs-mlx ── htdemucs
+MLX engine ── demucs (PyTorch on MPS) ── htdemucs
 ```
 
-Engines are swappable. A future ONNX or CUDA engine can drop in by implementing
-the `Engine` interface in `backend/engines/base.py` — no server changes needed.
+Engines are swappable. A future ONNX, CUDA, or true-MLX engine drops in by
+implementing the `Engine` interface in `backend/engines/base.py` — no server
+changes needed. The current "MLX engine" is named for the Apple Silicon target;
+it runs htdemucs through `demucs` on the MPS backend until a stable MLX port
+of demucs lands.
 
 ## Layout
 

@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>nomusic</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        padding: 14px 16px;
+        width: 280px;
+        background: #11141a;
+        color: #f3f4f7;
+        font-size: 13px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 14px;
+        letter-spacing: 0.02em;
+      }
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-bottom: 12px;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.06);
+      }
+      .status .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #888;
+      }
+      .status.ok .dot { background: #4caf6e; }
+      .status.bad .dot { background: #d35a5a; }
+      label {
+        display: block;
+        margin: 10px 0 4px;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #aab1bd;
+      }
+      input, select {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 6px 8px;
+        background: #1a1e26;
+        border: 1px solid #2a2f3a;
+        border-radius: 6px;
+        color: #f3f4f7;
+        font: inherit;
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .row > input[type="checkbox"] { width: auto; }
+      .footer {
+        margin-top: 14px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      button {
+        padding: 6px 10px;
+        background: #2a3140;
+        border: 1px solid #3a4255;
+        border-radius: 6px;
+        color: #f3f4f7;
+        cursor: pointer;
+      }
+      button:hover { background: #353e51; }
+      .hint { color: #8a92a0; font-size: 11px; margin-top: 8px; }
+      .err { color: #ff9a9a; font-size: 12px; margin-top: 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>nomusic</h1>
+    <div class="status" id="status"><span class="dot"></span><span id="statusText">checking backend…</span></div>
+
+    <label for="backend">Backend URL</label>
+    <input id="backend" type="url" value="http://127.0.0.1:8723" />
+
+    <label for="model">Model</label>
+    <select id="model"></select>
+
+    <label>Keep stems</label>
+    <div class="row" id="stems"></div>
+
+    <div class="footer">
+      <span class="hint" id="device"></span>
+      <button id="save">Save</button>
+    </div>
+    <div class="err" id="err"></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
