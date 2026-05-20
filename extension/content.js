@@ -85,14 +85,23 @@
       this.pollAbort = null;
       this.statusTimer = null;
       this.syncTimer = null;
+      this.bufferTimer = null;
       this.disposed = false;
       this.originalMuted = video.muted;
       this.originalVolume = video.volume;
+      // When true, we (not the user) called video.pause() because the
+      // chunk for the current timecode isn't on disk yet. We track this so
+      // a manual pause stays paused but a buffering pause auto-resumes.
+      this._pausedByUs = false;
+      this._lastStatus = null;
       this._boundHandlers = {
         play: () => this.reschedule(),
         pause: () => this.stopAll(),
         seeking: () => this.stopAll(),
-        seeked: () => this.reschedule(),
+        seeked: () => {
+          this.reschedule();
+          this._maybeBufferPause();
+        },
         ratechange: () => this.reschedule(),
         emptied: () => this.dispose(),
       };
@@ -134,9 +143,14 @@
       this.gain.connect(this.audioCtx.destination);
 
       this.muteVideo();
+      // Pause the host video until chunk 0 is on disk; resume from the
+      // chunk-fetch handler. Better than playing silent: the user doesn't
+      // miss any seconds of content while the first chunk is being made.
+      this._pauseForBuffer();
       this.attachVideoListeners();
       this.pollLoop();
       this.startSyncMonitor();
+      this.startBufferMonitor();
     }
 
     async requestJob() {
@@ -171,7 +185,11 @@
         if (!resp.ok) throw new Error(`status ${resp.status}`);
         const status = await resp.json();
         this.totalChunks = status.total_chunks || this.totalChunks;
-        this.button.showStatus(status);
+        this._lastStatus = status;
+        // While we're buffer-paused we own the label; let the buffer
+        // monitor refresh it once buffering ends. Status updates still
+        // record into _lastStatus for later restore.
+        if (!this._pausedByUs) this.button.showStatus(status);
 
         if (status.state === "error") return;
 
@@ -211,6 +229,10 @@
           playStart: idx * stride,
         };
         this.chunks.set(idx, entry);
+        // If we paused because this chunk wasn't ready, resume now.
+        if (this._pausedByUs && this._isBuffered(this.video.currentTime)) {
+          this._resumeAfterBuffer();
+        }
         if (!this.video.paused && !this.disposed) {
           this.scheduleChunk(idx, entry);
         }
@@ -286,6 +308,57 @@
         }
       }
       this.activeSources.clear();
+    }
+
+    // -- buffer pause/resume -------------------------------------------------
+
+    _chunkIdxForTime(t) {
+      const stride = this.chunkSeconds - this.chunkOverlapSeconds;
+      return Math.max(0, Math.floor(t / stride));
+    }
+
+    _isBuffered(t) {
+      return this.chunks.has(this._chunkIdxForTime(t));
+    }
+
+    _pauseForBuffer() {
+      if (this._pausedByUs || this.disposed) return;
+      this._pausedByUs = true;
+      this.button.setLocal("Buffering");
+      try {
+        this.video.pause();
+      } catch (_err) {
+        /* element gone */
+      }
+    }
+
+    _resumeAfterBuffer() {
+      if (!this._pausedByUs || this.disposed) return;
+      this._pausedByUs = false;
+      if (this._lastStatus) this.button.showStatus(this._lastStatus);
+      try {
+        const p = this.video.play();
+        if (p && typeof p.catch === "function") p.catch(() => {});
+      } catch (_err) {
+        /* element gone */
+      }
+    }
+
+    _maybeBufferPause() {
+      if (this.disposed || this.video.paused || this._pausedByUs) return;
+      if (!this._isBuffered(this.video.currentTime)) this._pauseForBuffer();
+    }
+
+    /** rAF-rate check: as currentTime crosses into an unfetched chunk while
+     *  playing, pause until it lands. Cheap (one branch + a Map.has per
+     *  tick) so we can run it at SYNC_CHECK_MS. */
+    startBufferMonitor() {
+      const tick = () => {
+        if (this.disposed) return;
+        this.bufferTimer = setTimeout(tick, SYNC_CHECK_MS);
+        this._maybeBufferPause();
+      };
+      tick();
     }
 
     startSyncMonitor() {
@@ -466,7 +539,21 @@
       this.stopAll();
       if (this.statusTimer) clearTimeout(this.statusTimer);
       if (this.syncTimer) clearTimeout(this.syncTimer);
+      if (this.bufferTimer) clearTimeout(this.bufferTimer);
+      // If we paused for buffering, let the video resume now that we're
+      // letting go of it — otherwise it would stay paused with no audio
+      // override and the user would have to hit play themselves.
+      const resumeOnExit = this._pausedByUs;
+      this._pausedByUs = false;
       this.unmuteVideo();
+      if (resumeOnExit) {
+        try {
+          const p = this.video.play();
+          if (p && typeof p.catch === "function") p.catch(() => {});
+        } catch (_err) {
+          /* noop */
+        }
+      }
       try {
         this.audioCtx?.close();
       } catch (_err) {

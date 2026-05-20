@@ -28,6 +28,7 @@ log = logging.getLogger(__name__)
 
 class JobState(str, Enum):
     QUEUED = "queued"
+    PROBING = "probing"
     DOWNLOADING = "downloading"
     PROCESSING = "processing"
     READY = "ready"
@@ -36,6 +37,7 @@ class JobState(str, Enum):
 
 _PHASE_LABELS: dict[str, str] = {
     "queued": "Queued",
+    "probing": "Inspecting video",
     "downloading": "Downloading video",
     "processing": "Removing music",
     "ready": "Ready",
@@ -89,40 +91,45 @@ class JobRegistry:
         model: str,
         keep_stems: list[str],
     ) -> JobStatus:
-        # Cheap probe + plan up front so the client gets a job_id, total_chunks,
-        # and duration immediately. ``prepare()`` is fast: a yt-dlp metadata
-        # call, no media download.
-        key, meta, info, _plans = self.processor.prepare(
-            url, model=model, keep_stems=keep_stems
-        )
+        # No probe here: the yt-dlp metadata call takes 3-6s on YouTube
+        # because of the JS challenge, and blocking /process on it made the
+        # button look stuck on "Starting". The cache key only needs (url,
+        # model, stems), all of which we have, so we can return immediately
+        # and let the worker thread do the slow probe.
+        key = self.cache.key(url, model, list(keep_stems))
+        existing_meta = self.cache.load_meta(key)
 
         with self._lock:
             existing = self._jobs.get(key)
             if existing and existing.state in (
                 JobState.QUEUED,
+                JobState.PROBING,
                 JobState.DOWNLOADING,
                 JobState.PROCESSING,
             ):
                 return existing
 
-            initial_state = (
-                JobState.READY if meta.complete else JobState.QUEUED
-            )
+            if existing_meta and existing_meta.complete:
+                initial_state = JobState.READY
+                progress = 1.0
+            else:
+                initial_state = JobState.QUEUED
+                progress = 0.0
             status = JobStatus(
                 job_id=key,
                 cache_key=key,
                 state=initial_state,
                 phase=initial_state.value,
-                phase_progress=1.0 if meta.complete else 0.0,
+                phase_progress=progress,
                 phase_label=_PHASE_LABELS[initial_state.value],
-                chunks_ready=len(meta.chunks_ready),
-                total_chunks=meta.total_chunks,
-                duration_seconds=meta.duration_seconds,
-                title=info.title,
+                chunks_ready=len(existing_meta.chunks_ready) if existing_meta else 0,
+                total_chunks=existing_meta.total_chunks if existing_meta else 0,
+                duration_seconds=existing_meta.duration_seconds if existing_meta else 0.0,
+                title=existing_meta.title if existing_meta else "",
             )
             self._jobs[key] = status
 
-            if meta.complete:
+            if initial_state == JobState.READY:
                 return status
 
             t = threading.Thread(
@@ -168,15 +175,18 @@ class JobRegistry:
         model: str,
         keep_stems: list[str],
     ) -> None:
-        # Flip out of QUEUED immediately so the UI doesn't look frozen during
-        # the upfront source-audio download (can be 30-60s for a 3h video).
-        self._enter_phase(key, JobState.DOWNLOADING, progress=0.0)
+        # First user-visible phase. Indeterminate progress (None) because we
+        # don't know how long the JS-challenge probe will take.
+        self._enter_phase(key, JobState.PROBING, progress=None)
         try:
             with self._gpu_lock:
                 self.processor.run(
                     url,
                     model=model,
                     keep_stems=keep_stems,
+                    on_probed=lambda info, plans, meta: self._on_probed(
+                        key, info, plans, meta
+                    ),
                     on_progress=lambda meta, phase: self._on_separation_progress(
                         key, meta, phase
                     ),
@@ -219,6 +229,24 @@ class JobRegistry:
             phase_progress=progress,
             phase_label=_PHASE_LABELS.get(state.value, state.value),
             **extra,
+        )
+
+    def _on_probed(
+        self,
+        key: str,
+        info,
+        plans,
+        meta: CacheMeta,
+    ) -> None:
+        # Probe done. Surface metadata so the popup / button can show real
+        # duration + title; phase stays at PROBING until the first download
+        # tick flips it to DOWNLOADING.
+        self._update(
+            key,
+            title=info.title,
+            duration_seconds=info.duration_seconds,
+            total_chunks=meta.total_chunks,
+            chunks_ready=len(meta.chunks_ready),
         )
 
     def _on_download_progress(self, key: str, fraction: float | None) -> None:

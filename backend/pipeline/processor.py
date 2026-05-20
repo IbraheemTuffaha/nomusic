@@ -56,6 +56,10 @@ ProgressCb = Callable[[CacheMeta, str], None]
 # should fall back to an indeterminate spinner in that case.
 DownloadProgressCb = Callable[[float | None], None]
 
+# (info, plans, meta) fired once the probe completes — gives jobs.py enough
+# data to surface title / duration / total_chunks in /status.
+ProbedCb = Callable[["VideoMetadata", list, CacheMeta], None]
+
 
 @dataclass
 class ChunkPlan:
@@ -173,6 +177,7 @@ class Processor:
         *,
         model: str,
         keep_stems: list[str],
+        on_probed: ProbedCb | None = None,
         on_progress: ProgressCb | None = None,
         on_download_progress: DownloadProgressCb | None = None,
     ) -> str:
@@ -181,9 +186,11 @@ class Processor:
         Safe to call on an already-cached job: missing chunks are filled in,
         and a fully-cached job returns immediately.
         """
-        key, meta, _info, plans = self.prepare(
+        key, meta, info, plans = self.prepare(
             url, model=model, keep_stems=keep_stems
         )
+        if on_probed:
+            on_probed(info, plans, meta)
 
         if meta.complete:
             log.info("Cache hit for %s (%d chunks)", url, meta.total_chunks)
