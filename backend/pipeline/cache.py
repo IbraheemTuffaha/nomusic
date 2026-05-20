@@ -51,8 +51,20 @@ class JobCache:
         ).encode()
         return hashlib.sha256(normalized).hexdigest()[:16]
 
+    @staticmethod
+    def url_key(url: str) -> str:
+        """Stable hash for ``url`` alone. Used to cache the downloaded source
+        audio independently of (model, stems), so changing the kept stems or
+        model doesn't trigger a re-download of a 3h SpongeBob compilation."""
+        return hashlib.sha256(url.encode()).hexdigest()[:16]
+
     def dir_for(self, key: str) -> Path:
         path = self.root / key
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def source_dir(self, url: str) -> Path:
+        path = self.root / "sources" / self.url_key(url)
         path.mkdir(parents=True, exist_ok=True)
         return path
 

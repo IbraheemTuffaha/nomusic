@@ -31,7 +31,12 @@ import soundfile as sf
 from engines.base import Engine
 
 from .cache import CacheMeta, JobCache
-from .downloader import VideoMetadata, download_range, probe
+from .downloader import (
+    VideoMetadata,
+    download_source,
+    probe,
+    slice_source,
+)
 
 log = logging.getLogger(__name__)
 
@@ -170,13 +175,18 @@ class Processor:
             log.info("Cache hit for %s (%d chunks)", url, meta.total_chunks)
             return key
 
+        # Download the full source once. Each chunk is sliced from this file
+        # so cuts are sample-accurate (yt-dlp's per-range download cuts at the
+        # nearest preceding keyframe, which drifts by 5-10 s on AAC/Opus).
+        source_path = download_source(url, self.cache.source_dir(url))
+
         for plan in plans:
             if plan.index in meta.chunks_ready and self.cache.chunk_path(
                 key, plan.index
             ).exists():
                 continue
             self._process_one(
-                url,
+                source_path,
                 key,
                 plan,
                 model=model,
@@ -203,7 +213,7 @@ class Processor:
 
     def _process_one(
         self,
-        url: str,
+        source_path: Path,
         key: str,
         plan: ChunkPlan,
         *,
@@ -221,8 +231,8 @@ class Processor:
         with tempfile.TemporaryDirectory(prefix="nomusic-") as tmp_str:
             tmp = Path(tmp_str)
             raw = tmp / f"raw_{plan.index:03d}.wav"
-            emit("downloading")
-            download_range(url, raw, start=plan.start, end=plan.end)
+            emit("downloading")  # phase name kept for UI compatibility
+            slice_source(source_path, raw, start=plan.start, end=plan.end)
             emit("separating")
             result = self.engine.separate(raw, tmp / "stems", model=model)
             emit("mixing")

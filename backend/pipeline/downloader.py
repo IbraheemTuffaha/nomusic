@@ -1,16 +1,23 @@
-"""Audio acquisition via yt-dlp.
+"""Audio acquisition via yt-dlp + ffmpeg.
 
-We never touch yt-dlp's CLI; we use it as a Python library so we can keep the
-ergonomic of "give me a WAV at this path" stable across CLI changes upstream.
+We never touch yt-dlp's CLI; we use it as a Python library so the
+"give me a WAV at this path" contract stays stable across CLI changes
+upstream.
 
-The downloader exposes two public surfaces:
+Public surfaces:
 
-* :func:`probe`  - lightweight metadata fetch (title, duration, id) without
-  pulling the media. Used to plan chunks before processing.
-* :func:`download_range` - download a single time range to a deterministic WAV.
+* :func:`probe`           - lightweight metadata fetch (title, duration, id).
+* :func:`download_source` - pulls bestaudio for the *whole* video to a single
+  compressed file (m4a / webm / opus). Idempotent; reuses an existing file.
+* :func:`slice_source`    - cuts a precise [start, end) range out of a source
+  file into a 44.1 kHz stereo WAV using ffmpeg.
 
-Time-range downloads are the workhorse: the processor calls this once per chunk
-and the resulting WAVs are fed straight to the engine.
+We deliberately do *not* expose a "download just this range" function. yt-dlp's
+``download_ranges`` cuts at the nearest preceding keyframe in the compressed
+source, which can shift the start by 5-10 s for AAC/Opus streams — fine for
+video previews, fatal for sample-accurate audio sync. The download-once-and-
+slice approach gives sample-accurate cuts and is faster overall because it
+avoids the per-chunk yt-dlp / JS-challenge overhead.
 """
 
 from __future__ import annotations
@@ -103,6 +110,124 @@ def probe(url: str) -> VideoMetadata:
     )
 
 
+_SOURCE_STEM = "source"
+# Extensions yt-dlp may emit for bestaudio across the sites we support. Order
+# doesn't matter — we glob, find one, use it.
+_SOURCE_EXTS: tuple[str, ...] = (
+    "m4a",
+    "webm",
+    "opus",
+    "ogg",
+    "mp3",
+    "aac",
+    "mp4",
+    "wav",
+)
+
+
+def download_source(url: str, out_dir: Path) -> Path:
+    """Download the entire bestaudio stream for ``url`` into ``out_dir``.
+
+    Returns the path to the downloaded file. Idempotent: if a previously-
+    downloaded source file is already present, it's returned as-is.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    existing = _find_source(out_dir)
+    if existing is not None:
+        log.info("Using cached source audio: %s", existing.name)
+        return existing
+
+    from yt_dlp import YoutubeDL
+
+    template = str(out_dir / f"{_SOURCE_STEM}.%(ext)s")
+    opts: dict[str, Any] = {
+        **_common_opts(),
+        "format": "bestaudio/best",
+        "outtmpl": template,
+        "overwrites": True,
+    }
+    log.info("Downloading source audio for %s -> %s", url, out_dir)
+    with YoutubeDL(opts) as ydl:
+        ydl.download([url])
+
+    final = _find_source(out_dir)
+    if final is None:
+        raise RuntimeError(
+            f"yt-dlp didn't produce a source file in {out_dir}; "
+            "supported extensions: " + ", ".join(_SOURCE_EXTS)
+        )
+    return final
+
+
+def slice_source(
+    source: Path,
+    out_path: Path,
+    *,
+    start: float,
+    end: float,
+) -> Path:
+    """Cut ``[start, end)`` seconds of ``source`` into a 44.1 kHz stereo WAV.
+
+    Uses ffmpeg with output seek (``-ss`` after ``-i``) for sample-accurate
+    cuts — slightly slower than input seek but the only way to avoid the
+    keyframe-alignment drift we get from container-level partial decodes.
+    """
+    if end <= start:
+        raise ValueError(f"slice_source: end ({end}) must be > start ({start})")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    duration = end - start
+    tmp_path = out_path.with_suffix(".part")
+
+    import subprocess
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        # Output seek for accuracy: ffmpeg fully decodes from the start of the
+        # source and discards samples until ``start``. For ranges deep inside a
+        # 3h video this would be slow, so we combine fast input seek (-ss
+        # before -i) with -accurate_seek so the demuxer lands at the right
+        # packet, then re-seek precisely on the decoded output.
+        "-accurate_seek",
+        "-ss",
+        f"{max(0.0, start - 0.5):.3f}",
+        "-i",
+        str(source),
+        "-ss",
+        f"{min(0.5, start):.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-vn",
+        "-ar",
+        str(_TARGET_SAMPLE_RATE),
+        "-ac",
+        str(_TARGET_CHANNELS),
+        "-c:a",
+        "pcm_s16le",
+        "-f",
+        "wav",
+        str(tmp_path),
+    ]
+    subprocess.run(cmd, check=True)
+    tmp_path.replace(out_path)
+    return out_path
+
+
+def _find_source(out_dir: Path) -> Path | None:
+    for ext in _SOURCE_EXTS:
+        p = out_dir / f"{_SOURCE_STEM}.{ext}"
+        if p.exists() and p.stat().st_size > 0:
+            return p
+    return None
+
+
+# Back-compat shim. Old code (or external callers) may still import
+# download_range; we redirect them through download_source + slice_source so
+# the keyframe-drift bug can't sneak back in.
 def download_range(
     url: str,
     out_path: Path,
@@ -110,70 +235,6 @@ def download_range(
     start: float,
     end: float,
 ) -> Path:
-    """Download ``[start, end)`` seconds of ``url`` as a 44.1 kHz stereo WAV.
-
-    ``out_path`` is the final WAV path. Intermediate files are written next to
-    it with a ``.part`` prefix and cleaned up.
-    """
-    if end <= start:
-        raise ValueError(f"download_range: end ({end}) must be > start ({start})")
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # yt-dlp writes the output template; we strip the extension and let yt-dlp
-    # add the right one for the downloaded stream. The postprocessor then
-    # re-encodes to WAV.
-    template_stem = out_path.with_suffix("")
-
-    from yt_dlp import YoutubeDL
-
-    opts: dict[str, Any] = {
-        **_common_opts(),
-        "format": "bestaudio/best",
-        "outtmpl": f"{template_stem}.%(ext)s",
-        "download_ranges": _download_ranges(start, end),
-        "force_keyframes_at_cuts": False,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "wav",
-                "preferredquality": "0",
-            },
-        ],
-        # WAV postprocessor uses these:
-        "postprocessor_args": {
-            "ffmpegextractaudio": [
-                "-ar", str(_TARGET_SAMPLE_RATE),
-                "-ac", str(_TARGET_CHANNELS),
-            ],
-        },
-        "overwrites": True,
-    }
-
-    log.info("Downloading %.1fs-%.1fs of %s", start, end, url)
-    with YoutubeDL(opts) as ydl:
-        ydl.download([url])
-
-    final_wav = template_stem.with_suffix(".wav")
-    if not final_wav.exists():
-        raise RuntimeError(
-            f"yt-dlp postprocessor did not produce {final_wav}; "
-            "check that ffmpeg is installed."
-        )
-    if final_wav != out_path:
-        final_wav.replace(out_path)
-    return out_path
-
-
-def _download_ranges(start: float, end: float):
-    """Build the ``download_ranges`` callable yt-dlp expects.
-
-    yt-dlp expects a callable that receives ``info_dict`` and ``ydl`` and yields
-    dicts with ``start_time`` / ``end_time`` keys. Wrapping closures avoids
-    string-format issues with the CLI's ``--download-sections`` syntax.
-    """
-
-    def _ranges(_info_dict, _ydl):  # noqa: ANN001 - yt-dlp's signature
-        yield {"start_time": start, "end_time": end}
-
-    return _ranges
+    source_dir = out_path.parent / "_source"
+    source = download_source(url, source_dir)
+    return slice_source(source, out_path, start=start, end=end)

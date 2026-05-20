@@ -86,8 +86,10 @@ def _write_tone(path: Path, *, seconds: float, sample_rate: int = 44100) -> None
 
 
 def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
-    # Bypass yt-dlp by writing a deterministic source and intercepting probe +
-    # download_range to read slices of it.
+    # Bypass yt-dlp by writing a deterministic source and intercepting
+    # probe, download_source, and slice_source. ``download_source`` returns
+    # the path to the pre-written master WAV; ``slice_source`` does a
+    # straightforward sample-level cut into the requested WAV path.
     source = tmp_path / "source.wav"
     _write_tone(source, seconds=10.0)
 
@@ -103,19 +105,28 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
             webpage_url=url,
         )
 
-    def fake_download(url, out_path, *, start, end):
-        audio, sr = sf.read(str(source), always_2d=True, dtype="float32")
+    def fake_download_source(url, out_dir):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dst = out_dir / "source.wav"
+        if not dst.exists():
+            dst.write_bytes(source.read_bytes())
+        return dst
+
+    def fake_slice_source(src, out_path, *, start, end):
+        audio, sr = sf.read(str(src), always_2d=True, dtype="float32")
         slice_audio = audio[int(start * sr) : int(end * sr)]
-        sf.write(str(out_path), slice_audio, sr, subtype="PCM_16")
+        sf.write(str(out_path), slice_audio, sr, subtype="PCM_16", format="WAV")
         return out_path
 
     monkeypatch.setattr(dl, "probe", fake_probe)
-    monkeypatch.setattr(dl, "download_range", fake_download)
+    monkeypatch.setattr(dl, "download_source", fake_download_source)
+    monkeypatch.setattr(dl, "slice_source", fake_slice_source)
     # Processor imports them by name from pipeline.downloader, so patch there too.
     from pipeline import processor as proc
 
     monkeypatch.setattr(proc, "probe", fake_probe)
-    monkeypatch.setattr(proc, "download_range", fake_download)
+    monkeypatch.setattr(proc, "download_source", fake_download_source)
+    monkeypatch.setattr(proc, "slice_source", fake_slice_source)
 
     cache = JobCache(tmp_path / "cache")
     processor = Processor(
