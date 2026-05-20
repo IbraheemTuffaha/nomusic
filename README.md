@@ -19,8 +19,13 @@ chunk while the rest is still being separated. Re-watches are instant (cached).
 ## Requirements
 
 - macOS on Apple Silicon (M1/M2/M3/...). The default engine uses MLX.
-- Homebrew (for `ffmpeg`, Python 3.11+)
+- Homebrew (used to install `ffmpeg`, Python 3.11+, and `deno`)
 - Chrome, Edge, Brave, or another Chromium-based browser (Manifest V3)
+
+`deno` is the JavaScript runtime yt-dlp uses to defeat YouTube's player
+challenges. Without it (or `node` / `bun`), many YouTube videos fail to
+extract. `install.sh` installs it; if you already have Node, set
+`NOMUSIC_JS_RUNTIME=$(which node)` to override.
 
 ## Install
 

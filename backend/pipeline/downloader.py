@@ -16,6 +16,8 @@ and the resulting WAVs are fed straight to the engine.
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,39 @@ log = logging.getLogger(__name__)
 # us to round-trip through ffmpeg twice (download -> re-encode -> decode again).
 _TARGET_SAMPLE_RATE = 44100
 _TARGET_CHANNELS = 2
+
+
+def _common_opts() -> dict[str, Any]:
+    """Options shared by ``probe`` and ``download_range``.
+
+    YouTube requires a JavaScript runtime + EJS challenge solver scripts for
+    most videos (without them, extraction fails with the misleading "This
+    video is not available" error). We auto-detect ``node`` / ``deno`` / ``bun``
+    and pin to the first one found; ``NOMUSIC_JS_RUNTIME=/path/to/bin``
+    overrides. If nothing is available we still try the request — many
+    short-form videos work without it.
+    """
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        # Pull the EJS challenge-solver scripts that yt-dlp uses to defeat
+        # YouTube's player JS. Hosted by the yt-dlp project.
+        "remote_components": ["ejs:github"],
+    }
+
+    runtime_override = os.environ.get("NOMUSIC_JS_RUNTIME")
+    if runtime_override:
+        name = Path(runtime_override).name
+        opts["js_runtimes"] = {name: {"path": runtime_override}}
+        return opts
+
+    for name in ("deno", "node", "bun"):
+        path = shutil.which(name)
+        if path:
+            opts["js_runtimes"] = {name: {"path": path}}
+            break
+    return opts
 
 
 @dataclass(frozen=True)
@@ -42,12 +77,7 @@ def probe(url: str) -> VideoMetadata:
     """Fetch metadata without downloading the media."""
     from yt_dlp import YoutubeDL  # imported lazily; yt-dlp is heavy
 
-    opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-    }
+    opts = {**_common_opts(), "skip_download": True}
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
@@ -98,9 +128,7 @@ def download_range(
     from yt_dlp import YoutubeDL
 
     opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
+        **_common_opts(),
         "format": "bestaudio/best",
         "outtmpl": f"{template_stem}.%(ext)s",
         "download_ranges": _download_ranges(start, end),

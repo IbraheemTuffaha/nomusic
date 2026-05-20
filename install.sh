@@ -30,7 +30,10 @@ if ! command -v brew >/dev/null 2>&1; then
 fi
 
 step "Checking Homebrew packages"
-for pkg in python@3.11 ffmpeg git; do
+# deno is yt-dlp's preferred JavaScript runtime; without it (or node/bun)
+# many YouTube videos extract as "This video is not available" because the
+# signature-cipher challenge can't be solved.
+for pkg in python@3.11 ffmpeg git deno; do
   if brew list --formula "$pkg" >/dev/null 2>&1; then
     echo "  $pkg already installed"
   else
