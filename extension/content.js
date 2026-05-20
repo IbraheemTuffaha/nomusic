@@ -97,6 +97,7 @@
         },
         ratechange: () => this.reschedule(),
         emptied: () => this.dispose(),
+        volumechange: () => this._onHostVolumeChange(),
       };
     }
 
@@ -435,6 +436,18 @@
       const realGetVolume = () => volumeDesc.get.call(this.video);
       this._realSetMuted = realSetMuted;
       this._realSetVolume = realSetVolume;
+      this._realGetMuted = realGetMuted;
+      this._realGetVolume = realGetVolume;
+
+      // Start our gain at the user's current effective volume so toggling
+      // nomusic on doesn't jump the loudness around. Whatever they set
+      // before clicking the button is what they'll hear from the processed
+      // audio.
+      if (this.gain) {
+        this.gain.gain.value = this.originalMuted
+          ? 0
+          : Math.max(0, Math.min(1, this.originalVolume));
+      }
 
       realSetMuted(true);
       realSetVolume(0);
@@ -469,6 +482,46 @@
         this.muteAsserter = requestAnimationFrame(tick);
       };
       this.muteAsserter = requestAnimationFrame(tick);
+    }
+
+    /**
+     * Fires whenever the host page changes volume or muted on the <video>.
+     * We use it to forward the user's intent into our processed-audio gain
+     * node, then immediately re-silence the host element. The rAF
+     * re-assertion loop is the fallback; this handler closes the audible
+     * window from ~16 ms (one frame) to a single JS task.
+     */
+    _onHostVolumeChange() {
+      if (this.disposed || !this._realGetVolume || !this.gain) return;
+      const realVol = this._realGetVolume();
+      const realMuted = this._realGetMuted();
+
+      // Our own re-silence calls below trigger this same handler with the
+      // state (vol=0, muted=true). Bailing out on that combination breaks
+      // the feedback loop without needing a flag — and matches what the
+      // user wants anyway (no effective audio when vol=0 and muted).
+      if (realVol === 0 && realMuted) return;
+
+      const effective = realMuted ? 0 : realVol;
+      try {
+        // Short ramp so dragging the slider doesn't produce a zipper.
+        this.gain.gain.setTargetAtTime(
+          effective,
+          this.audioCtx.currentTime,
+          0.005,
+        );
+      } catch (_err) {
+        this.gain.gain.value = effective;
+      }
+
+      // Re-silence the host. Fires this handler again with realVol=0 +
+      // realMuted=true, which the early-return above swallows.
+      try {
+        this._realSetVolume(0);
+        this._realSetMuted(true);
+      } catch (_err) {
+        /* element gone */
+      }
     }
 
     unmuteVideo() {
