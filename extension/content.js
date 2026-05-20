@@ -680,13 +680,46 @@
       this.label.textContent = "nomusic";
       this.pct = document.createElement("span");
       this.pct.className = "nomusic-btn__pct";
-      this.el.append(this.fill, this.dot, this.label, this.pct);
+      // <span role="button"> rather than nested <button> — nested buttons
+      // are invalid HTML and some browsers (older Safari) misroute clicks
+      // when they appear.
+      this.dismissBtn = document.createElement("span");
+      this.dismissBtn.className = "nomusic-btn__dismiss";
+      this.dismissBtn.setAttribute("role", "button");
+      this.dismissBtn.setAttribute("aria-label", "Hide nomusic on this video");
+      this.dismissBtn.title = "Hide nomusic";
+      this.dismissBtn.textContent = "×";
+      this.dismissBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        this.dismiss();
+      });
+      this.el.append(
+        this.fill,
+        this.dot,
+        this.label,
+        this.pct,
+        this.dismissBtn,
+      );
       this.el.addEventListener("click", (e) => {
         e.stopPropagation();
         e.preventDefault();
         this.toggle();
       });
       this.setIdle();
+    }
+
+    /** Hide the button entirely. If nomusic is active, tear the session
+     *  down first so the host video is restored. The button stays
+     *  attached to the DOM but with display:none, so we don't re-create
+     *  it via the MutationObserver. A new <video> on SPA navigation gets
+     *  its own button. */
+    dismiss() {
+      if (this.session && !this.session.disposed) {
+        this.session.dispose();
+        this.session = null;
+      }
+      this.el.style.display = "none";
     }
 
     setIdle() {
