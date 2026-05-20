@@ -1,0 +1,11 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+yt-dlp>=2024.10.7
+soundfile>=0.12.1
+numpy>=1.26
+# MLX stack — Apple Silicon only.
+mlx>=0.18
+mlx-audio>=0.0.4
+# demucs-mlx is cloned by install.sh into vendor/demucs-mlx and added to
+# sys.path at runtime; it does not ship a PyPI release.
+pytest>=8.0
