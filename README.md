@@ -1,152 +1,247 @@
 # nomusic
 
-Watch YouTube, Facebook, and other videos with the music stripped out.
-Built for people who want to avoid music for religious or personal
-reasons but still want to follow the dialogue, news, lectures, or
-videos they care about.
+A free tool that lets you watch videos on YouTube, Facebook, and other
+sites without hearing the music. The dialogue, narration, and other
+sounds keep playing. The music is removed.
 
-## What it does
+Made for people who want to avoid music for religious or personal
+reasons.
 
-You click a small button that nomusic adds to any video player. The
-video keeps playing as normal, but the music is removed — you hear the
-voices and (optionally) the background sounds, without the music.
-
-It works on YouTube, Facebook, Twitter/X, Instagram, TikTok, Vimeo, and
-hundreds of other sites with `<video>` elements.
+---
 
 ## What you need
 
-- A Mac with an **Apple Silicon** chip (M1, M2, M3, or M4)
-- **Homebrew** installed. If you don't have it, run this in Terminal:
+- A **Mac with an Apple Silicon chip** — that's any Mac sold from late
+  2020 onwards. To check, click the Apple menu (top left of your
+  screen) and pick **About This Mac**. If you see **M1**, **M2**,
+  **M3**, or **M4** anywhere, you're good.
+- About **20 minutes** for first-time setup. After that, starting
+  nomusic takes 10 seconds.
 
-  ```bash
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-  ```
-- **Chrome**, **Brave**, **Edge**, or another Chromium-based browser
+You don't need to know anything technical. The steps below tell you
+exactly what to type or click.
 
-That's it. The installer handles everything else.
+---
 
-## Install
+## Step 1: Get the project files
 
-Open Terminal, go into the project folder, and run:
+1. Open this link in your browser:
+   **https://github.com/IbraheemTuffaha/nomusic**
+2. Look for a green button labeled **Code** near the top right of the
+   list of files. Click it.
+3. A small menu appears. Click **Download ZIP** at the bottom.
+4. Your browser saves a file called `nomusic-main.zip` to your
+   **Downloads** folder.
+5. Open the **Downloads** folder (it's in the dock, or in the Finder
+   sidebar). Double-click `nomusic-main.zip`. It unzips into a folder
+   called `nomusic-main`.
+6. Move that folder somewhere you can find it again — for example, drag
+   it to your **Documents** folder.
+
+That's it for downloading.
+
+---
+
+## Step 2: Open the Terminal app
+
+Terminal is a built-in Mac app that lets you type commands. Don't worry
+if you've never used it — you'll just copy and paste a few things.
+
+To open Terminal:
+1. Press **Command + Space** on your keyboard. A search box appears in
+   the middle of the screen.
+2. Type **Terminal** and press **Return**.
+
+A window opens with some text and a blinking cursor. That's Terminal.
+You'll type things into it and press **Return** to make them happen.
+
+Tip: if you ever can't see the cursor, click inside the Terminal
+window first.
+
+---
+
+## Step 3: Install Homebrew (one time only)
+
+Homebrew is a free helper program that nomusic uses to install a few
+pieces it needs. If you don't already have it, install it now. (If
+you're not sure, just do this step — it won't break anything.)
+
+Copy the line below, paste it into Terminal, and press **Return**:
 
 ```bash
-./install.sh
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 ```
 
-This installs everything nomusic needs (Python, ffmpeg, the audio
-separation model). The first install takes a few minutes because it
-downloads the AI model. After that it's quick.
+It will ask for your Mac's login password. Type it and press Return.
+**You won't see anything as you type — that's normal**, the characters
+are hidden for security. Just type it carefully and press Return.
 
-## Run it
+The install takes a few minutes. When it's done you'll see a message
+ending in **Installation successful!** and the cursor will come back.
 
-Two things have to be running for nomusic to work:
+---
 
-### 1. Start the local helper
+## Step 4: Install nomusic
 
-In Terminal, from the project folder:
+You'll now tell Terminal to "go into" the nomusic folder and run the
+installer.
+
+In Terminal:
+
+1. Type **`cd `** — that's the letters `c`, `d`, then a single space.
+   Leave the space at the end. Don't press Return yet.
+2. Open Finder, find the `nomusic-main` folder you saved in Step 1,
+   and **drag it onto the Terminal window**. The folder's full path
+   appears automatically after what you typed.
+3. Now press **Return**. The prompt will change to show that you're
+   "inside" the nomusic folder.
+4. Type this and press **Return**:
+
+   ```bash
+   ./install.sh
+   ```
+
+This downloads everything nomusic needs, including an 80 MB audio
+model. It takes 5-10 minutes the first time. Lots of text will scroll
+by — that's normal. When you see a message like **Install complete.**
+the installer is done.
+
+You only do this once.
+
+---
+
+## Step 5: Start nomusic
+
+Every time you want to use nomusic, you start the "helper" first. This
+is the part that actually removes the music from videos.
+
+In Terminal, still inside the nomusic folder from Step 4, type this
+and press **Return**:
 
 ```bash
 backend/.venv/bin/python backend/server.py
 ```
 
-Leave that Terminal window open. You'll see log messages — that's
-normal. Press `Ctrl+C` in that window when you want to stop it.
+You'll see a few log lines, the last one ending with something like
+`Uvicorn running on http://127.0.0.1:8723`. That means it's ready.
 
-### 2. Load the browser extension (only once)
+**Keep this Terminal window open** while you're using nomusic. Closing
+it stops nomusic.
 
-1. Open your browser and go to `chrome://extensions`
-2. Toggle **Developer mode** on (top-right corner)
-3. Click **Load unpacked**
-4. Pick the `extension` folder inside this project
-5. You'll see **nomusic** appear in your extensions list
+To stop nomusic later, click the Terminal window and press
+**Control + C** on your keyboard.
 
-You only have to do this once. It stays installed.
+Next time you want to use nomusic after a restart, you only need to
+repeat Step 5 — Steps 1 through 4 stay done.
+
+---
+
+## Step 6: Add nomusic to your browser (one time only)
+
+This step adds the nomusic button to videos in your browser. It works
+for **Chrome**, **Brave**, **Edge**, **Arc**, and most other modern
+browsers.
+
+1. Open your browser.
+2. Click in the address bar and type **`chrome://extensions`** then
+   press Return.
+3. Look at the top right of the page. There's a switch labeled
+   **Developer mode**. Turn it on.
+4. Three new buttons appear at the top left. Click **Load unpacked**.
+5. A file picker opens. Find your `nomusic-main` folder, then **go
+   into the `extension` folder inside it**, then click **Select**.
+6. **nomusic** appears in your list of extensions. Done.
+
+You only do this once. The extension stays installed.
+
+---
 
 ## How to use it
 
-1. Go to any video — YouTube, Facebook, a news clip, anything with a
-   video player.
-2. You'll see a small **nomusic** button on the video.
-3. Click it.
-4. The first time you click on a new video, the button will show:
+1. Make sure the helper is running (Step 5). If you're not sure, look
+   at the Terminal window — if it's still showing log messages and
+   doesn't say a prompt is back, it's running.
+2. Go to any video — YouTube, Facebook, Twitter/X, Instagram, news
+   sites, anywhere with a video player.
+3. You'll see a small **nomusic** button on the video.
+4. Click it.
+5. The first time you click on a video, you'll see status messages
+   ticking through:
    - **Inspecting video** (a couple of seconds)
-   - **Downloading video** with a percentage
-   - **Removing music** with a percentage
-5. Once the first chunk is ready (about 10 seconds of audio), the
-   video plays automatically without music.
-6. Click the button again any time to turn nomusic off.
+   - **Downloading video 45%**
+   - **Removing music 23%**
+6. As soon as the first 10 seconds are processed, the video plays on
+   its own without music. The video pauses briefly any time it's
+   waiting for more audio.
+7. Click the button again any time to turn nomusic off and hear the
+   original audio.
 
-The video pauses while waiting for the next chunk if needed, so you
-never miss content.
+**Re-watching the same video is instant** — nomusic remembers the work
+it already did, for up to 7 days.
 
-**Re-watching the same video is instant** — nomusic remembers what it
-already processed.
+---
 
 ## Settings
 
-Click the nomusic icon in your browser toolbar to open the settings
-popup. You can change:
+Click the small nomusic icon in your browser's toolbar (usually top
+right, sometimes hidden under a puzzle-piece icon) to open the
+settings panel.
 
-- **Backend URL** — leave this alone unless you know what you're doing
-- **Model** — `htdemucs` (default) is the right choice for most people
-- **Keep stems** — which parts of the audio to keep:
-  - `vocals` (default) — just speech and singing. Most aggressive
-    music removal. Best for music videos, songs, and anything where
-    you mostly want to hear talking.
-  - `other` — background sounds and instruments. Adding this back
-    keeps cartoon sound effects, ambient noise, etc., but also lets
-    some music through.
-  - `drums` / `bass` — these *are* the music. Leave them off unless
-    you're experimenting.
+The main option is **Keep stems** — which parts of the audio to keep:
 
-A good rule: turn on `other` if you're watching cartoons, movies, or
-TV where the sound effects matter. Leave it off for music videos or
-videos where you only care about the dialogue.
+- **vocals only** *(default)*: just speech and singing. The most
+  aggressive music removal. Best for music videos, songs, or
+  anything where you mainly want to hear talking.
+- **vocals + other**: also keeps background sounds like cartoon
+  sound effects, ambient noise, and so on. Best for cartoons,
+  movies, or TV shows where sound effects matter. Some background
+  music can come through this way.
+- **drums** and **bass** *are* the music. Leave them off unless
+  you're experimenting.
 
-## Cache and storage
+The panel also shows how much space the cache is using on your Mac,
+with a **Clear** button if you want to wipe it. The cache also clears
+itself automatically after 7 days.
 
-Each video you process is saved to your computer so re-watching is
-instant. The popup shows how much space the cache is using.
+---
 
-- **Clear** button — wipes everything cached (click twice to confirm)
-- Old cache is **automatically deleted after 7 days** so it doesn't
-  grow forever
-
-A 3-hour video is roughly 130 MB of cache. A short clip is a few MB.
-
-## Common problems
+## If something goes wrong
 
 **The button says "backend unreachable"**
-The local helper isn't running. Open Terminal and run the start
-command in the "Run it" section.
+The helper isn't running. Go back to Step 5 and start it.
 
 **The button says "Error"**
-Usually the video can't be downloaded (private, age-restricted, or
-the site doesn't support it). Try another video to confirm nomusic
-itself is working.
+The video can't be downloaded. This usually means it's private,
+age-restricted, or from a site that isn't supported. Try a different
+video first to make sure nomusic itself is working.
 
-**I still hear music**
-Open the nomusic popup and check that **vocals** is the only stem
-checked. If `other` is also checked, music will partially come through.
+**I can still hear music**
+Open the settings panel. If **other** is checked alongside vocals,
+some music can come through. Uncheck it for stronger removal.
 
-**Audio is slightly out of sync**
-Click the nomusic button to turn it off, then click again to restart
-the session. The audio resyncs to the video.
+**The audio drifts out of sync**
+Click the nomusic button to turn it off, then click it again. It
+resyncs.
 
-**It's taking forever on a long video**
-For a 3-hour video, expect to wait 30-60 seconds before the first
-audio plays (downloading the full source), then it should keep up
-with playback. You can pause and come back later — nomusic remembers
-where it left off.
+**A long video is taking forever to start**
+For a 3-hour video, the helper has to download the full audio (about
+30-60 seconds) before separation begins. After that the audio should
+start playing. You can pause and come back later — nomusic remembers
+where it left off and only does each chunk once.
+
+**I closed Terminal by accident**
+That stops the helper. Open Terminal again, run Step 5, and you're
+back. (Steps 1-4 don't have to be repeated.)
+
+---
 
 ## Privacy
 
-Everything runs on **your computer**. The local helper downloads the
-audio from the video site (just like yt-dlp), processes it with the
-audio separation model locally, and serves it back to your browser.
-Nothing is sent to any other server. The browser extension only talks
-to `http://127.0.0.1:8723` — your own machine.
+Everything happens on **your Mac**. The helper downloads the audio
+from the video site you're watching, processes it locally using the
+audio-separation model on your Mac's chip, and sends the result back
+to your browser. Nothing goes to anyone else's server. The browser
+extension only talks to your own machine.
 
 ---
 
