@@ -105,11 +105,19 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
             webpage_url=url,
         )
 
-    def fake_download_source(url, out_dir):
+    def fake_download_source(url, out_dir, *, progress_hook=None):
         out_dir.mkdir(parents=True, exist_ok=True)
         dst = out_dir / "source.wav"
         if not dst.exists():
             dst.write_bytes(source.read_bytes())
+        if progress_hook:
+            progress_hook(
+                {
+                    "status": "finished",
+                    "downloaded_bytes": dst.stat().st_size,
+                    "total_bytes": dst.stat().st_size,
+                }
+            )
         return dst
 
     def fake_slice_source(src, out_path, *, start, end):

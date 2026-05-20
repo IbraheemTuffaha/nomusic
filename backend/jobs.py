@@ -28,16 +28,33 @@ log = logging.getLogger(__name__)
 
 class JobState(str, Enum):
     QUEUED = "queued"
-    DOWNLOADING = "downloading"  # only the first call to download_range; coarse
+    DOWNLOADING = "downloading"
     PROCESSING = "processing"
     READY = "ready"
     ERROR = "error"
+
+
+_PHASE_LABELS: dict[str, str] = {
+    "queued": "Queued",
+    "downloading": "Downloading video",
+    "processing": "Removing music",
+    "ready": "Ready",
+    "error": "Error",
+}
 
 
 @dataclass
 class JobStatus:
     job_id: str  # equals the cache key
     state: JobState
+    # phase mirrors state.value for the UI; kept separate so future phases
+    # (probing, mixing, post-processing) can split out without renaming
+    # existing states.
+    phase: str = "queued"
+    # phase_progress is 0..1 within the current phase. None = indeterminate
+    # (rare; only when yt-dlp can't report total bytes).
+    phase_progress: float | None = 0.0
+    phase_label: str = "Queued"
     chunks_ready: int = 0
     total_chunks: int = 0
     duration_seconds: float = 0.0
@@ -88,14 +105,16 @@ class JobRegistry:
             ):
                 return existing
 
+            initial_state = (
+                JobState.READY if meta.complete else JobState.QUEUED
+            )
             status = JobStatus(
                 job_id=key,
                 cache_key=key,
-                state=(
-                    JobState.READY
-                    if meta.complete
-                    else JobState.QUEUED
-                ),
+                state=initial_state,
+                phase=initial_state.value,
+                phase_progress=1.0 if meta.complete else 0.0,
+                phase_label=_PHASE_LABELS[initial_state.value],
                 chunks_ready=len(meta.chunks_ready),
                 total_chunks=meta.total_chunks,
                 duration_seconds=meta.duration_seconds,
@@ -126,10 +145,14 @@ class JobRegistry:
         meta = self.cache.load_meta(job_id)
         if meta is None:
             return None
+        state = JobState.READY if meta.complete else JobState.QUEUED
         return JobStatus(
             job_id=job_id,
             cache_key=job_id,
-            state=JobState.READY if meta.complete else JobState.QUEUED,
+            state=state,
+            phase=state.value,
+            phase_progress=1.0 if meta.complete else 0.0,
+            phase_label=_PHASE_LABELS[state.value],
             chunks_ready=len(meta.chunks_ready),
             total_chunks=meta.total_chunks,
             duration_seconds=meta.duration_seconds,
@@ -147,41 +170,88 @@ class JobRegistry:
     ) -> None:
         # Flip out of QUEUED immediately so the UI doesn't look frozen during
         # the upfront source-audio download (can be 30-60s for a 3h video).
-        self._update(key, state=JobState.DOWNLOADING)
+        self._enter_phase(key, JobState.DOWNLOADING, progress=0.0)
         try:
             with self._gpu_lock:
                 self.processor.run(
                     url,
                     model=model,
                     keep_stems=keep_stems,
-                    on_progress=lambda meta, phase: self._on_progress(
+                    on_progress=lambda meta, phase: self._on_separation_progress(
                         key, meta, phase
+                    ),
+                    on_download_progress=lambda p: self._on_download_progress(
+                        key, p
                     ),
                 )
             meta = self.cache.load_meta(key)
             chunks_ready = len(meta.chunks_ready) if meta else 0
-            self._update(
+            total = meta.total_chunks if meta else 0
+            self._enter_phase(
                 key,
-                state=JobState.READY,
+                JobState.READY,
+                progress=1.0,
                 chunks_ready=chunks_ready,
+                total_chunks=total,
             )
             log.info("Job %s ready", key)
         except Exception as exc:
             log.exception("Job %s failed", key)
-            self._update(
+            self._enter_phase(
                 key,
-                state=JobState.ERROR,
+                JobState.ERROR,
+                progress=1.0,
                 error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}",
             )
 
-    def _on_progress(self, key: str, meta: CacheMeta, phase: str) -> None:
-        new_state = (
-            JobState.DOWNLOADING if phase == "downloading" else JobState.PROCESSING
-        )
+    def _enter_phase(
+        self,
+        key: str,
+        state: JobState,
+        *,
+        progress: float | None,
+        **extra,
+    ) -> None:
         self._update(
             key,
-            state=new_state,
-            chunks_ready=len(meta.chunks_ready),
+            state=state,
+            phase=state.value,
+            phase_progress=progress,
+            phase_label=_PHASE_LABELS.get(state.value, state.value),
+            **extra,
+        )
+
+    def _on_download_progress(self, key: str, fraction: float | None) -> None:
+        # yt-dlp emits 1.0 on completion; we stay in DOWNLOADING until the
+        # first separation chunk fires, so the UI doesn't briefly snap to
+        # 0% on the phase boundary.
+        self._update(key, state=JobState.DOWNLOADING, phase="downloading",
+                     phase_label=_PHASE_LABELS["downloading"],
+                     phase_progress=fraction)
+
+    def _on_separation_progress(
+        self,
+        key: str,
+        meta: CacheMeta,
+        phase: str,
+    ) -> None:
+        done = len(meta.chunks_ready)
+        total = max(1, meta.total_chunks)
+        # Smooth the bar inside a chunk: 'separating' = chunk just started
+        # (counts as half done), 'chunk_complete' = chunk fully done.
+        per_chunk = 0.0
+        if phase == "separating":
+            per_chunk = 0.3
+        elif phase == "mixing":
+            per_chunk = 0.7
+        progress = min(1.0, (done + per_chunk) / total)
+        self._update(
+            key,
+            state=JobState.PROCESSING,
+            phase="processing",
+            phase_label=_PHASE_LABELS["processing"],
+            phase_progress=progress,
+            chunks_ready=done,
             total_chunks=meta.total_chunks,
         )
 

@@ -40,10 +40,15 @@ from .downloader import (
 
 log = logging.getLogger(__name__)
 
-# (meta, phase) where phase is one of: 'downloading', 'separating', 'mixing',
-# 'chunk_complete'. Phase 'chunk_complete' is the only one that guarantees
-# meta.chunks_ready has been updated; the others are best-effort UI hints.
+# (meta, phase) where phase is one of: 'separating', 'mixing', 'chunk_complete'.
+# Phase 'chunk_complete' is the only one that guarantees meta.chunks_ready has
+# been updated; the others are best-effort UI hints.
 ProgressCb = Callable[[CacheMeta, str], None]
+
+# Source-download progress, 0..1. ``None`` means total size unknown
+# (rare with yt-dlp, but possible for some streaming containers); the UI
+# should fall back to an indeterminate spinner in that case.
+DownloadProgressCb = Callable[[float | None], None]
 
 
 @dataclass
@@ -161,6 +166,7 @@ class Processor:
         model: str,
         keep_stems: list[str],
         on_progress: ProgressCb | None = None,
+        on_download_progress: DownloadProgressCb | None = None,
     ) -> str:
         """Run the full chunked pipeline. Returns the cache key.
 
@@ -173,12 +179,29 @@ class Processor:
 
         if meta.complete:
             log.info("Cache hit for %s (%d chunks)", url, meta.total_chunks)
+            if on_download_progress:
+                on_download_progress(1.0)
             return key
 
         # Download the full source once. Each chunk is sliced from this file
         # so cuts are sample-accurate (yt-dlp's per-range download cuts at the
         # nearest preceding keyframe, which drifts by 5-10 s on AAC/Opus).
-        source_path = download_source(url, self.cache.source_dir(url))
+        def _yt_hook(d: dict) -> None:
+            if not on_download_progress:
+                return
+            try:
+                if d.get("status") == "downloading":
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                    done = d.get("downloaded_bytes", 0)
+                    on_download_progress(done / total if total else None)
+                elif d.get("status") == "finished":
+                    on_download_progress(1.0)
+            except Exception:  # never let a UI hook break the pipeline
+                log.debug("download progress hook raised", exc_info=True)
+
+        source_path = download_source(
+            url, self.cache.source_dir(url), progress_hook=_yt_hook
+        )
 
         for plan in plans:
             if plan.index in meta.chunks_ready and self.cache.chunk_path(

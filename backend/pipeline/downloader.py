@@ -125,16 +125,38 @@ _SOURCE_EXTS: tuple[str, ...] = (
 )
 
 
-def download_source(url: str, out_dir: Path) -> Path:
+def download_source(
+    url: str,
+    out_dir: Path,
+    *,
+    progress_hook=None,
+) -> Path:
     """Download the entire bestaudio stream for ``url`` into ``out_dir``.
 
     Returns the path to the downloaded file. Idempotent: if a previously-
     downloaded source file is already present, it's returned as-is.
+
+    ``progress_hook`` is forwarded to yt-dlp's progress hooks; see yt-dlp
+    docs for the dict shape (``status``, ``downloaded_bytes``,
+    ``total_bytes``, ``total_bytes_estimate``, ``speed``, ``eta``).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     existing = _find_source(out_dir)
     if existing is not None:
         log.info("Using cached source audio: %s", existing.name)
+        if progress_hook:
+            # Synthesize a "finished" event so callers driving a UI bar can
+            # jump to 100% on a cache hit without special-casing.
+            try:
+                progress_hook(
+                    {
+                        "status": "finished",
+                        "downloaded_bytes": existing.stat().st_size,
+                        "total_bytes": existing.stat().st_size,
+                    }
+                )
+            except Exception:  # never let a UI hook break the pipeline
+                pass
         return existing
 
     from yt_dlp import YoutubeDL
@@ -146,6 +168,8 @@ def download_source(url: str, out_dir: Path) -> Path:
         "outtmpl": template,
         "overwrites": True,
     }
+    if progress_hook:
+        opts["progress_hooks"] = [progress_hook]
     log.info("Downloading source audio for %s -> %s", url, out_dir)
     with YoutubeDL(opts) as ydl:
         ydl.download([url])

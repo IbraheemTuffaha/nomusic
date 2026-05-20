@@ -99,20 +99,21 @@
     }
 
     async start() {
-      this.button.setState("working", "starting");
+      this.button.setLocal("Starting");
 
       let info;
       try {
         info = await this.requestJob();
       } catch (err) {
         console.warn("[nomusic] /process failed", err);
-        this.button.setState("error", "backend unreachable");
+        this.button.setError("backend unreachable");
         return;
       }
 
       this.jobId = info.job_id;
       this.totalChunks = info.total_chunks || 1;
       this.duration = info.duration_seconds || 0;
+      this.button.showStatus(info);
 
       try {
         const caps = await this.fetchCapabilities();
@@ -136,8 +137,6 @@
       this.attachVideoListeners();
       this.pollLoop();
       this.startSyncMonitor();
-
-      this.button.setState("working", "0/" + this.totalChunks);
     }
 
     async requestJob() {
@@ -172,15 +171,9 @@
         if (!resp.ok) throw new Error(`status ${resp.status}`);
         const status = await resp.json();
         this.totalChunks = status.total_chunks || this.totalChunks;
-        this.button.setState(
-          status.state === "ready" ? "active" : "working",
-          `${status.chunks_ready}/${status.total_chunks || "?"}`,
-        );
+        this.button.showStatus(status);
 
-        if (status.state === "error") {
-          this.button.setState("error", "engine error");
-          return;
-        }
+        if (status.state === "error") return;
 
         // Fetch any newly-ready chunk in parallel; ordering doesn't matter,
         // each chunk knows its own play_start.
@@ -193,10 +186,7 @@
         }
         await Promise.all(fetches);
 
-        if (status.state === "ready") {
-          this.button.setState("active", `${this.totalChunks}/${this.totalChunks}`);
-          return; // stop polling
-        }
+        if (status.state === "ready") return; // stop polling
       } catch (err) {
         console.warn("[nomusic] poll failed", err);
       }
@@ -485,7 +475,7 @@
       this.audioCtx = null;
       this.chunks.clear();
       this.fetchedIdx.clear();
-      this.button.setState("idle", "");
+      this.button.dispose();
     }
   }
 
@@ -515,26 +505,74 @@
       this.el.className = "nomusic-btn";
       this.el.type = "button";
       this.el.title = "Strip music (nomusic)";
+      this.fill = document.createElement("span");
+      this.fill.className = "nomusic-btn__fill";
       this.dot = document.createElement("span");
       this.dot.className = "nomusic-btn__dot";
       this.label = document.createElement("span");
+      this.label.className = "nomusic-btn__label";
       this.label.textContent = "nomusic";
-      this.progress = document.createElement("span");
-      this.progress.className = "nomusic-btn__progress";
-      this.el.append(this.dot, this.label, this.progress);
+      this.pct = document.createElement("span");
+      this.pct.className = "nomusic-btn__pct";
+      this.el.append(this.fill, this.dot, this.label, this.pct);
       this.el.addEventListener("click", (e) => {
         e.stopPropagation();
         e.preventDefault();
         this.toggle();
       });
-      this.setState("idle", "");
+      this.setIdle();
     }
 
-    setState(state, progress) {
-      this.el.dataset.state = state;
-      this.progress.textContent = progress || "";
-      this.label.textContent =
-        state === "active" ? "nomusic on" : state === "error" ? "nomusic" : "nomusic";
+    setIdle() {
+      this.el.dataset.state = "idle";
+      this.label.textContent = "nomusic";
+      this.pct.textContent = "";
+      this.fill.style.width = "0%";
+    }
+
+    /** ``status`` is the raw JobStatus from the backend. */
+    showStatus(status) {
+      const state = status.state;
+      if (state === "ready") {
+        this.el.dataset.state = "active";
+        this.label.textContent = "nomusic on";
+        this.pct.textContent = "";
+        this.fill.style.width = "0%";
+        return;
+      }
+      if (state === "error") {
+        this.el.dataset.state = "error";
+        this.label.textContent = "error";
+        this.pct.textContent = "";
+        this.fill.style.width = "0%";
+        return;
+      }
+      this.el.dataset.state = "working";
+      this.label.textContent = status.phase_label || "Working";
+      const p = status.phase_progress;
+      if (typeof p === "number" && isFinite(p)) {
+        const pct = Math.max(0, Math.min(100, Math.round(p * 100)));
+        this.pct.textContent = `${pct}%`;
+        this.fill.style.width = `${pct}%`;
+      } else {
+        this.pct.textContent = "";
+        this.fill.style.width = "0%";
+      }
+    }
+
+    /** Lightweight transitions for cases without a full status object. */
+    setLocal(label) {
+      this.el.dataset.state = "working";
+      this.label.textContent = label;
+      this.pct.textContent = "";
+      this.fill.style.width = "0%";
+    }
+
+    setError(label) {
+      this.el.dataset.state = "error";
+      this.label.textContent = label || "error";
+      this.pct.textContent = "";
+      this.fill.style.width = "0%";
     }
 
     async toggle() {
@@ -545,6 +583,10 @@
       }
       this.session = new Session(this.video, this);
       await this.session.start();
+    }
+
+    dispose() {
+      this.setIdle();
     }
 
     position(host) {
