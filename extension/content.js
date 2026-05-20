@@ -486,41 +486,37 @@
 
     /**
      * Fires whenever the host page changes volume or muted on the <video>.
-     * We use it to forward the user's intent into our processed-audio gain
-     * node, then immediately re-silence the host element. The rAF
-     * re-assertion loop is the fallback; this handler closes the audible
-     * window from ~16 ms (one frame) to a single JS task.
+     * We update our intent state (_userVolume from non-zero volume reads,
+     * _lastMuted from any mute change) and push the effective volume to
+     * our gain. Then we re-silence the host's volume so the original audio
+     * stays off. The 'muted' attribute is left alone — the page can flip
+     * it freely; volume=0 is what actually keeps the host silent.
      */
     _onHostVolumeChange() {
       if (this.disposed || !this._realGetVolume || !this.gain) return;
       const realVol = this._realGetVolume();
-      const realMuted = this._realGetMuted();
+      const muted = this.video.muted;
 
-      // Our own re-silence calls below trigger this same handler with the
-      // state (vol=0, muted=true). Bailing out on that combination breaks
-      // the feedback loop without needing a flag — and matches what the
-      // user wants anyway (no effective audio when vol=0 and muted).
-      if (realVol === 0 && realMuted) return;
-
-      const effective = realMuted ? 0 : realVol;
-      try {
-        // Short ramp so dragging the slider doesn't produce a zipper.
-        this.gain.gain.setTargetAtTime(
-          effective,
-          this.audioCtx.currentTime,
-          0.005,
-        );
-      } catch (_err) {
-        this.gain.gain.value = effective;
+      let changed = false;
+      if (realVol > 0) {
+        // Page set a real volume — that's the user's intent. (When the
+        // page reads back 0 it's our pin, so it doesn't tell us anything.)
+        this._userVolume = realVol;
+        changed = true;
+      }
+      if (muted !== this._lastMuted) {
+        this._lastMuted = muted;
+        changed = true;
       }
 
-      // Re-silence the host. Fires this handler again with realVol=0 +
-      // realMuted=true, which the early-return above swallows.
-      try {
-        this._realSetVolume(0);
-        this._realSetMuted(true);
-      } catch (_err) {
-        /* element gone */
+      if (changed) this._applyEffectiveVolume();
+
+      if (realVol !== 0) {
+        try {
+          this._realSetVolume(0);
+        } catch (_err) {
+          /* element gone */
+        }
       }
     }
 
