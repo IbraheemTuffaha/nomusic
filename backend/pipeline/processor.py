@@ -35,7 +35,10 @@ from .downloader import VideoMetadata, download_range, probe
 
 log = logging.getLogger(__name__)
 
-ProgressCb = Callable[[CacheMeta], None]
+# (meta, phase) where phase is one of: 'downloading', 'separating', 'mixing',
+# 'chunk_complete'. Phase 'chunk_complete' is the only one that guarantees
+# meta.chunks_ready has been updated; the others are best-effort UI hints.
+ProgressCb = Callable[[CacheMeta, str], None]
 
 
 @dataclass
@@ -172,12 +175,19 @@ class Processor:
                 key, plan.index
             ).exists():
                 continue
-            self._process_one(url, key, plan, model=model, keep_stems=keep_stems)
+            self._process_one(
+                url,
+                key,
+                plan,
+                model=model,
+                keep_stems=keep_stems,
+                on_progress=on_progress,
+            )
             self.cache.record_chunk(key, plan.index)
             if on_progress:
                 refreshed = self.cache.load_meta(key)
                 if refreshed:
-                    on_progress(refreshed)
+                    on_progress(refreshed, "chunk_complete")
 
         # Concatenate when every chunk is on disk.
         all_present = all(
@@ -199,12 +209,23 @@ class Processor:
         *,
         model: str,
         keep_stems: list[str],
+        on_progress: ProgressCb | None = None,
     ) -> None:
+        def emit(phase: str) -> None:
+            if not on_progress:
+                return
+            meta = self.cache.load_meta(key)
+            if meta:
+                on_progress(meta, phase)
+
         with tempfile.TemporaryDirectory(prefix="nomusic-") as tmp_str:
             tmp = Path(tmp_str)
             raw = tmp / f"raw_{plan.index:03d}.wav"
+            emit("downloading")
             download_range(url, raw, start=plan.start, end=plan.end)
+            emit("separating")
             result = self.engine.separate(raw, tmp / "stems", model=model)
+            emit("mixing")
             mixed = self._mix_stems(result.stems, keep_stems)
             self._write_chunk(mixed, result.sample_rate, key, plan)
 

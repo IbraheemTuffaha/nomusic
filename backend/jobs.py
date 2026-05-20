@@ -145,14 +145,15 @@ class JobRegistry:
         model: str,
         keep_stems: list[str],
     ) -> None:
-        self._update(key, state=JobState.DOWNLOADING)
         try:
             with self._gpu_lock:
                 self.processor.run(
                     url,
                     model=model,
                     keep_stems=keep_stems,
-                    on_progress=lambda meta: self._on_progress(key, meta),
+                    on_progress=lambda meta, phase: self._on_progress(
+                        key, meta, phase
+                    ),
                 )
             meta = self.cache.load_meta(key)
             chunks_ready = len(meta.chunks_ready) if meta else 0
@@ -170,10 +171,13 @@ class JobRegistry:
                 error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}",
             )
 
-    def _on_progress(self, key: str, meta: CacheMeta) -> None:
+    def _on_progress(self, key: str, meta: CacheMeta, phase: str) -> None:
+        new_state = (
+            JobState.DOWNLOADING if phase == "downloading" else JobState.PROCESSING
+        )
         self._update(
             key,
-            state=JobState.PROCESSING,
+            state=new_state,
             chunks_ready=len(meta.chunks_ready),
             total_chunks=meta.total_chunks,
         )

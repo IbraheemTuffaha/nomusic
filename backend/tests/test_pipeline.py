@@ -126,11 +126,18 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     )
 
     progress_seen: list[int] = []
+    phases_seen: list[str] = []
+
+    def _progress(meta, phase):
+        phases_seen.append(phase)
+        if phase == "chunk_complete":
+            progress_seen.append(len(meta.chunks_ready))
+
     key = processor.run(
         "fake://video",
         model="fake",
         keep_stems=["vocals", "other"],
-        on_progress=lambda m: progress_seen.append(len(m.chunks_ready)),
+        on_progress=_progress,
     )
 
     meta = cache.load_meta(key)
@@ -144,6 +151,12 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     # Progress callback fires for each completed chunk.
     assert progress_seen == sorted(progress_seen)
     assert progress_seen[-1] == meta.total_chunks
+    # Phase ordering: each chunk emits downloading -> separating -> mixing
+    # -> chunk_complete (in order, though phases for different chunks may
+    # interleave). Just verify all four phases were seen at least once.
+    assert {"downloading", "separating", "mixing", "chunk_complete"}.issubset(
+        set(phases_seen)
+    )
 
     # Re-running is a no-op: cache hit short-circuits the pipeline.
     key2 = processor.run("fake://video", model="fake", keep_stems=["vocals", "other"])

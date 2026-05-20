@@ -57,10 +57,10 @@ def main() -> int:
 
     t0 = time.time()
 
-    def on_progress(meta):
+    def on_progress(meta, phase):
         elapsed = time.time() - t0
         print(
-            f"[{elapsed:5.1f}s] chunk {len(meta.chunks_ready)}/{meta.total_chunks}"
+            f"[{elapsed:5.1f}s] {phase:14s} chunk {len(meta.chunks_ready)}/{meta.total_chunks}"
         )
 
     key = processor.run(
