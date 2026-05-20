@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 # Bump when the on-disk chunk encoding, sample rate, or directory layout
 # changes. Old entries become invisible to the new code and the TTL sweep
 # (or the user's "Clear cache" button) reclaims their disk.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 CHUNK_EXT = ".opus"
 CHUNK_MEDIA_TYPE = "audio/ogg"

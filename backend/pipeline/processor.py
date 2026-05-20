@@ -286,20 +286,45 @@ class Processor:
         stems: dict[str, Path],
         keep: list[str],
     ) -> np.ndarray:
-        """Sum the kept stems and return a (samples, channels) float32 array."""
+        """Sum the kept stems and return a (samples, channels) float32 array.
+
+        Applies RMS-matched loudness compensation. The vocals stem alone
+        typically sits 6-12 dB below the full mix's RMS energy, so playing
+        it back at the same slider position sounds quieter than the original
+        track. We compute the RMS of all four stems summed (the original
+        mix) and the RMS of the kept stems, then apply a gain to close the
+        gap — capped at 2x (+6 dB) so an instrumental section with near-
+        silent vocals doesn't get pumped up to full volume.
+        """
         missing = [s for s in keep if s not in stems]
         if missing:
             raise RuntimeError(f"engine did not return stems: {missing}")
 
-        mix: np.ndarray | None = None
-        for name in keep:
-            audio, _ = sf.read(str(stems[name]), always_2d=True, dtype="float32")
-            mix = audio if mix is None else mix + audio
-        assert mix is not None
-        # Soft-clip to avoid hard ceiling: tanh keeps the loud-passage feel
-        # without introducing audible square-wave clipping.
+        # Load every stem we got back so we can use the full-mix RMS as a
+        # loudness reference. This costs one extra disk read + sum per
+        # chunk; negligible compared with separation.
+        arrays: dict[str, np.ndarray] = {}
+        for name, path in stems.items():
+            audio, _ = sf.read(str(path), always_2d=True, dtype="float32")
+            arrays[name] = audio
+
+        mix = sum(arrays[n] for n in keep)
+        full_mix = sum(arrays.values())
+
+        full_rms = float(np.sqrt(np.mean(np.square(full_mix))) + 1e-9)
+        kept_rms = float(np.sqrt(np.mean(np.square(mix))) + 1e-9)
+        # max(1, ...) so we never attenuate; min(2, ...) bounds the pump on
+        # quiet-vocal chunks. The chunk-to-chunk gain spread is then ≤ 6 dB,
+        # which is below the threshold where typical listeners notice level
+        # shifts at scene boundaries.
+        boost = min(2.0, max(1.0, full_rms / kept_rms))
+        if boost > 1.0:
+            mix = mix * boost
+
+        # Soft-clip if the boost pushed past unity. tanh preserves loud-
+        # passage character without audible square-wave clipping.
         peak = float(np.abs(mix).max() or 1.0)
-        if peak > 1.0:
+        if peak > 0.99:
             mix = np.tanh(mix / peak) * 0.99
         return mix
 
