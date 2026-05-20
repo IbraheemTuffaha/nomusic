@@ -258,47 +258,42 @@ class Processor:
         key: str,
         plan: ChunkPlan,
     ) -> None:
-        """Apply crossfade fades + trim, then persist as ``chunk_NNN.wav``."""
-        overlap_samples = int(self.chunk_overlap_seconds * sample_rate)
-        half_overlap = overlap_samples // 2
+        """Write ``chunk_NNN.wav`` covering exactly ``[play_start, play_end]``.
 
+        The download window includes ``half_overlap`` of pre-roll / post-roll
+        on each side so the separator has clean context at boundaries — but
+        the written chunk is trimmed to the precise playable region. The
+        extension schedules chunks back-to-back at ``idx * stride`` on the
+        video timeline; any pre-roll left in the file would shift each chunk
+        by the overlap amount and stack into accumulating drift.
+
+        A short anti-click fade (~10 ms) is applied to each end so the
+        boundary between adjacent chunks doesn't produce an audible click.
+        """
         n = audio.shape[0]
-        # Compute trim: how much we shave from each side. The download range
-        # includes ``half_overlap`` of pre-roll on each end (except the very
-        # first/last chunks), and we keep that material — but fade it so the
-        # adjacent chunk's fade-in mirrors it. The MSE-style queued playback in
-        # the extension does *not* mix overlaps; we instead deliver a clean cut
-        # at ``play_start``/``play_end`` with the fade baked in as an
-        # equal-power envelope.
-        head_fade = 0 if plan.play_start == 0 else half_overlap
-        tail_fade = (
-            0
-            if plan.play_end >= plan.play_start + (n / sample_rate) - 1e-3
-            else half_overlap
-        )
-
-        # Convert the download window to sample indices for the playable region.
         head_trim = int((plan.play_start - plan.start) * sample_rate)
         tail_trim_end = head_trim + int(
             (plan.play_end - plan.play_start) * sample_rate
         )
-        # Include the fade region on each side of the playable window so the
-        # downstream player has material to fade against.
-        slice_start = max(0, head_trim - head_fade)
-        slice_end = min(n, tail_trim_end + tail_fade)
-        trimmed = audio[slice_start:slice_end]
+        # Clamp inside the downloaded buffer in case the download came back
+        # slightly short (ffmpeg seek rounding).
+        head_trim = max(0, min(head_trim, n))
+        tail_trim_end = max(head_trim, min(tail_trim_end, n))
+        trimmed = audio[head_trim:tail_trim_end].copy()
 
-        if head_fade:
-            ramp = np.linspace(0.0, 1.0, head_fade, dtype=np.float32)[:, None]
-            trimmed[:head_fade] *= ramp
-        if tail_fade:
-            ramp = np.linspace(1.0, 0.0, tail_fade, dtype=np.float32)[:, None]
-            trimmed[-tail_fade:] *= ramp
+        click_fade = min(
+            int(0.010 * sample_rate),  # 10 ms
+            trimmed.shape[0] // 2,
+        )
+        if click_fade > 1:
+            head_ramp = np.linspace(0.0, 1.0, click_fade, dtype=np.float32)[:, None]
+            tail_ramp = np.linspace(1.0, 0.0, click_fade, dtype=np.float32)[:, None]
+            trimmed[:click_fade] *= head_ramp
+            trimmed[-click_fade:] *= tail_ramp
 
         out = self.cache.chunk_path(key, plan.index)
-        # Atomic write so a crash mid-write doesn't poison the cache. We pass
-        # ``format`` explicitly because the temp file's extension doesn't end
-        # in ``.wav``.
+        # Atomic write so a crash mid-write doesn't poison the cache. ``format``
+        # is explicit because the temp filename doesn't end in ``.wav``.
         tmp_path = out.with_suffix(".part")
         sf.write(
             str(tmp_path), trimmed, sample_rate, subtype="PCM_16", format="WAV"
