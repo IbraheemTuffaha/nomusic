@@ -118,6 +118,10 @@ class JobRegistry:
             if existing_meta and existing_meta.complete:
                 initial_state = JobState.READY
                 progress = 1.0
+                # Replay is a "use" of the cache entry; renew its TTL by
+                # bumping meta.json's mtime so the hourly sweep doesn't
+                # reap a video the user is actively re-watching.
+                self.cache.touch(key)
             else:
                 initial_state = JobState.QUEUED
                 progress = 0.0

@@ -151,6 +151,27 @@ class JobCache:
         meta.complete = True
         self.save_meta(key, meta)
 
+    def touch(self, key: str) -> None:
+        """Bump the cached job's mtime so the TTL sweep treats it as recent.
+
+        Called when a re-watch hits an already-complete cache entry — without
+        this, replays don't extend the entry's lifetime and a video you
+        watch every day still gets reaped 7 days after the original
+        processing. We touch ``meta.json`` (always exists for a tracked job)
+        rather than every chunk file because the sweep uses the *newest*
+        file mtime in the directory.
+        """
+        meta_path = self.dir_for(key) / "meta.json"
+        if meta_path.exists():
+            try:
+                import os
+                import time
+
+                now = time.time()
+                os.utime(meta_path, (now, now))
+            except OSError as err:
+                log.debug("touch(%s) failed: %s", key, err)
+
     # -- maintenance ---------------------------------------------------------
 
     def stats(self) -> dict:
