@@ -564,11 +564,19 @@
       if (this._ytVolTimer) clearTimeout(this._ytVolTimer);
       this._ytVolTimer = null;
 
-      try {
-        delete this.video.volume;
-      } catch (_err) {
-        /* noop */
+      if (this._volIntentHandler) {
+        this.video.removeEventListener(
+          "nomusic:vol-intent",
+          this._volIntentHandler,
+        );
+        this._volIntentHandler = null;
       }
+
+      // Releasing the data attribute makes the main-world setter patch a
+      // no-op for this element again. Future volume writes flow through
+      // normally.
+      delete this.video.dataset.nomusicVolBlock;
+
       if (this._realSetVolume) this._realSetVolume(this.originalVolume);
     }
 
