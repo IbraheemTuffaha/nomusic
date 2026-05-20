@@ -1,13 +1,20 @@
 """Disk cache for finished jobs.
 
-Cache key = SHA-256 of ``(url, model, sorted(keep_stems))``. The cache stores:
+Cache key = SHA-256 of ``(SCHEMA_VERSION, url, model, sorted(keep_stems))``.
+Bumping ``SCHEMA_VERSION`` orphans every existing cache entry — the new code
+won't find them so it produces fresh ones, and the TTL sweep reaps the
+abandoned dirs within a week.
 
-* ``meta.json``   - normalized job metadata (url, model, stems, chunk plan)
-* ``chunk_NNN.wav`` - per-chunk WAVs (16-bit PCM, 44.1 kHz stereo)
-* ``full.wav``    - concatenated full-length WAV (written once all chunks ready)
+The cache stores:
 
-We deliberately keep the on-disk format trivial so a debugging session can use
-``afplay`` / ``ffplay`` directly without a Python interpreter.
+* ``meta.json``       - normalized job metadata (url, model, stems, chunk plan)
+* ``chunk_NNN.opus``  - per-chunk OGG/Opus, 48 kHz stereo, ~96 kbps VBR.
+  Opus instead of WAV is ~15x smaller and decodes natively in Web Audio.
+
+A 'full audio' fallback was previously cached on disk; we don't write it any
+more because the extension always plays chunks back-to-back, and the
+concatenated copy doubled disk usage. The ``/audio/{id}`` endpoint now
+streams chunks together on demand.
 """
 
 from __future__ import annotations
@@ -20,6 +27,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# Bump when the on-disk chunk encoding, sample rate, or directory layout
+# changes. Old entries become invisible to the new code and the TTL sweep
+# (or the user's "Clear cache" button) reclaims their disk.
+SCHEMA_VERSION = 2
+
+CHUNK_EXT = ".opus"
+CHUNK_MEDIA_TYPE = "audio/ogg"
 
 
 @dataclass
@@ -47,7 +62,12 @@ class JobCache:
     @staticmethod
     def key(url: str, model: str, keep_stems: list[str]) -> str:
         normalized = json.dumps(
-            {"url": url, "model": model, "stems": sorted(keep_stems)},
+            {
+                "v": SCHEMA_VERSION,
+                "url": url,
+                "model": model,
+                "stems": sorted(keep_stems),
+            },
             sort_keys=True,
         ).encode()
         return hashlib.sha256(normalized).hexdigest()[:16]
@@ -99,10 +119,7 @@ class JobCache:
     # -- chunks --------------------------------------------------------------
 
     def chunk_path(self, key: str, idx: int) -> Path:
-        return self.dir_for(key) / f"chunk_{idx:03d}.wav"
-
-    def full_path(self, key: str) -> Path:
-        return self.dir_for(key) / "full.wav"
+        return self.dir_for(key) / f"chunk_{idx:03d}{CHUNK_EXT}"
 
     def record_chunk(self, key: str, idx: int) -> None:
         meta = self.load_meta(key)

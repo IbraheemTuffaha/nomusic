@@ -33,7 +33,7 @@ from config import SETTINGS  # noqa: E402
 from engines import get_engine  # noqa: E402
 from engines.base import DEMUCS_STEMS  # noqa: E402
 from jobs import JobRegistry  # noqa: E402
-from pipeline.cache import JobCache  # noqa: E402
+from pipeline.cache import CHUNK_MEDIA_TYPE, JobCache  # noqa: E402
 from pipeline.processor import Processor  # noqa: E402
 
 logging.basicConfig(
@@ -193,7 +193,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=425, detail="chunk not ready")
         return FileResponse(
             str(path),
-            media_type="audio/wav",
+            media_type=CHUNK_MEDIA_TYPE,
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
@@ -211,17 +211,46 @@ def create_app() -> FastAPI:
         return {"deleted_bytes": freed}
 
     @app.get("/audio/{job_id}")
-    def audio(job_id: str) -> FileResponse:
+    def audio(job_id: str):
+        """On-demand concatenation of every chunk into a single OGG stream.
+
+        We no longer keep a precomputed full file on disk (cut storage in
+        half), so this endpoint stitches the per-chunk OGG/Opus files
+        together as bytes flow out. OGG containers concatenate cleanly:
+        writing one file's bytes after another produces a valid combined
+        stream that Web Audio, VLC, and ffplay all decode as one track.
+        """
+        import os
+        from fastapi.responses import StreamingResponse
+
         meta = cache.load_meta(job_id)
         if meta is None:
             raise HTTPException(status_code=404, detail="unknown job_id")
-        path = cache.full_path(job_id)
-        if not path.exists():
+        if not meta.complete:
             raise HTTPException(status_code=425, detail="full audio not ready")
-        return FileResponse(
-            str(path),
-            media_type="audio/wav",
-            headers={"Cache-Control": "public, max-age=86400"},
+
+        def _gen():
+            for idx in range(meta.total_chunks):
+                p = cache.chunk_path(job_id, idx)
+                if not p.exists():
+                    return  # cache truncated mid-stream; stop short
+                with open(p, "rb") as f:
+                    while True:
+                        block = f.read(64 * 1024)
+                        if not block:
+                            break
+                        yield block
+
+        total = sum(
+            os.path.getsize(cache.chunk_path(job_id, i))
+            for i in range(meta.total_chunks)
+            if cache.chunk_path(job_id, i).exists()
+        )
+        headers = {"Cache-Control": "public, max-age=86400"}
+        if total:
+            headers["Content-Length"] = str(total)
+        return StreamingResponse(
+            _gen(), media_type=CHUNK_MEDIA_TYPE, headers=headers
         )
 
     return app

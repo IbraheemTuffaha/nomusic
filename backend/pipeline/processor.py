@@ -1,25 +1,26 @@
-"""Chunked separation + crossfade.
+"""Chunked separation + Opus encode.
 
-The processor turns a video URL into a sequence of clean, music-free WAV chunks.
-It coordinates the downloader, the engine, and the cache; it does not know
-about HTTP, asyncio, or the extension.
+The processor turns a video URL into a sequence of clean, music-free OGG/Opus
+chunks. It coordinates the downloader, the engine, and the cache; it does not
+know about HTTP, asyncio, or the extension.
 
 Pipeline per chunk:
 
-1. Download the relevant time range as a WAV (downloader).
+1. Slice the source audio precisely (download_source -> slice_source).
 2. Run source separation (engine).
-3. Mix the kept stems (e.g. ``vocals + other``) into one chunk WAV.
-4. Apply a half-window crossfade so adjacent chunks blend smoothly.
-5. Write ``chunk_NNN.wav`` into the cache.
-
-The full WAV (``full.wav``) is concatenated lazily, once all chunks exist.
+3. Mix the kept stems into one float32 audio array.
+4. Trim to the playable window + apply a 10 ms anti-click fade.
+5. Pipe WAV bytes through ffmpeg to encode as OGG/Opus and atomically write
+   ``chunk_NNN.opus`` into the cache.
 """
 
 from __future__ import annotations
 
+import io
 import logging
 import math
 import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,11 @@ from .downloader import (
     probe,
     slice_source,
 )
+
+# Opus only supports 8/12/16/24/48 kHz; demucs hands us 44.1 kHz. ffmpeg
+# resamples internally during encode at this bitrate it's transparent for
+# vocals and the file size drops ~15x vs PCM_16 WAV.
+_OPUS_BITRATE = "96k"
 
 log = logging.getLogger(__name__)
 
@@ -224,17 +230,16 @@ class Processor:
                 if refreshed:
                     on_progress(refreshed, "chunk_complete")
 
-        # Concatenate when every chunk is on disk.
+        # Mark complete when every chunk is on disk.
         all_present = all(
             self.cache.chunk_path(key, p.index).exists() for p in plans
         )
         if all_present:
-            self._concatenate_full(key, plans)
             self.cache.mark_complete(key)
             if not self.keep_source_after_complete:
                 # Source has served its purpose. Re-watches read straight from
-                # the chunk WAVs; only a stems/model change would need it back,
-                # and that re-downloads transparently.
+                # the chunk Opus files; only a stems/model change would need
+                # it back, and that re-downloads transparently.
                 self.cache.drop_source(url)
 
         return key
@@ -332,42 +337,47 @@ class Processor:
             trimmed[-click_fade:] *= tail_ramp
 
         out = self.cache.chunk_path(key, plan.index)
-        # Atomic write so a crash mid-write doesn't poison the cache. ``format``
-        # is explicit because the temp filename doesn't end in ``.wav``.
         tmp_path = out.with_suffix(".part")
-        sf.write(
-            str(tmp_path), trimmed, sample_rate, subtype="PCM_16", format="WAV"
-        )
+        _encode_opus(trimmed, sample_rate, tmp_path)
         tmp_path.replace(out)
 
-    def _concatenate_full(self, key: str, plans: list[ChunkPlan]) -> None:
-        full_path = self.cache.full_path(key)
-        tmp_path = full_path.with_suffix(".part")
-        # Concatenate using soundfile streaming so we don't load everything at
-        # once. Chunks already have crossfades baked in, but here we just butt
-        # them together — the fade-ins/outs handle the seam.
-        first_chunk = sf.SoundFile(str(self.cache.chunk_path(key, plans[0].index)))
-        sample_rate = first_chunk.samplerate
-        channels = first_chunk.channels
-        first_chunk.close()
 
-        with sf.SoundFile(
-            str(tmp_path),
-            mode="w",
-            samplerate=sample_rate,
-            channels=channels,
-            subtype="PCM_16",
-            format="WAV",
-        ) as out_f:
-            for plan in plans:
-                with sf.SoundFile(str(self.cache.chunk_path(key, plan.index))) as in_f:
-                    block_size = sample_rate * 4
-                    while True:
-                        block = in_f.read(block_size, dtype="float32")
-                        if not len(block):
-                            break
-                        out_f.write(block)
-        tmp_path.replace(full_path)
+
+def _encode_opus(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
+    """Encode ``audio`` (samples, channels) to OGG/Opus at ``out_path``.
+
+    Pipes a WAV through ffmpeg's stdin and writes the resulting OGG/Opus
+    file. Going through ffmpeg lets us inherit its high-quality resampler
+    (libswresample); libsndfile can't resample, and Opus is restricted to
+    8/12/16/24/48 kHz, so we'd otherwise need a separate Python resampler.
+    """
+    wav_buf = io.BytesIO()
+    sf.write(wav_buf, audio, sample_rate, subtype="PCM_16", format="WAV")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-f",
+        "wav",
+        "-i",
+        "pipe:0",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        _OPUS_BITRATE,
+        "-vbr",
+        "on",
+        "-application",
+        "audio",
+        "-f",
+        "ogg",
+        str(out_path),
+    ]
+    subprocess.run(cmd, input=wav_buf.getvalue(), check=True, capture_output=True)
 
 
 def iter_ready_chunks(meta: CacheMeta) -> Iterator[int]:
