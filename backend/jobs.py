@@ -145,6 +145,9 @@ class JobRegistry:
         model: str,
         keep_stems: list[str],
     ) -> None:
+        # Flip out of QUEUED immediately so the UI doesn't look frozen during
+        # the upfront source-audio download (can be 30-60s for a 3h video).
+        self._update(key, state=JobState.DOWNLOADING)
         try:
             with self._gpu_lock:
                 self.processor.run(
