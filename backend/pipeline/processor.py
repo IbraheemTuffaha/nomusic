@@ -112,11 +112,13 @@ class Processor:
         *,
         chunk_seconds: float,
         chunk_overlap_seconds: float,
+        keep_source_after_complete: bool = False,
     ) -> None:
         self.engine = engine
         self.cache = cache
         self.chunk_seconds = chunk_seconds
         self.chunk_overlap_seconds = chunk_overlap_seconds
+        self.keep_source_after_complete = keep_source_after_complete
 
     # -- planning ------------------------------------------------------------
 
@@ -229,6 +231,11 @@ class Processor:
         if all_present:
             self._concatenate_full(key, plans)
             self.cache.mark_complete(key)
+            if not self.keep_source_after_complete:
+                # Source has served its purpose. Re-watches read straight from
+                # the chunk WAVs; only a stems/model change would need it back,
+                # and that re-downloads transparently.
+                self.cache.drop_source(url)
 
         return key
 

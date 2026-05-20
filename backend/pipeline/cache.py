@@ -69,6 +69,16 @@ class JobCache:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def drop_source(self, url: str) -> int:
+        """Delete the cached source audio for ``url``. Returns bytes freed."""
+        path = self.root / "sources" / self.url_key(url)
+        if not path.exists():
+            return 0
+        freed = _dir_bytes(path)
+        shutil.rmtree(path, ignore_errors=True)
+        log.info("Dropped source cache for %s (%d bytes)", url, freed)
+        return freed
+
     # -- meta ----------------------------------------------------------------
 
     def load_meta(self, key: str) -> CacheMeta | None:

@@ -117,6 +117,7 @@ def create_app() -> FastAPI:
         cache=cache,
         chunk_seconds=SETTINGS.chunk_seconds,
         chunk_overlap_seconds=SETTINGS.chunk_overlap_seconds,
+        keep_source_after_complete=SETTINGS.keep_source_after_complete,
     )
     registry = JobRegistry(processor=processor, cache=cache)
 
@@ -150,6 +151,7 @@ def create_app() -> FastAPI:
             },
             "cache": {
                 "ttl_days": SETTINGS.cache_ttl_days,
+                "keep_source_after_complete": SETTINGS.keep_source_after_complete,
             },
         }
 
