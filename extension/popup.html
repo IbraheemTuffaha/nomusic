@@ -38,15 +38,15 @@
       }
       .status.ok .dot { background: #4caf6e; }
       .status.bad .dot { background: #d35a5a; }
-      label {
+      .field-label {
         display: block;
-        margin: 10px 0 4px;
+        margin: 12px 0 4px;
         font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 0.06em;
         color: #aab1bd;
       }
-      input, select {
+      input[type="url"], select {
         width: 100%;
         box-sizing: border-box;
         padding: 6px 8px;
@@ -56,12 +56,30 @@
         color: #f3f4f7;
         font: inherit;
       }
-      .row {
+      /* Stems list: stacked rows, all flush-left, checkbox top-aligned with
+         multi-line description text. */
+      #stems {
         display: flex;
-        gap: 6px;
-        align-items: center;
+        flex-direction: column;
+        gap: 8px;
+        margin-top: 4px;
       }
-      .row > input[type="checkbox"] { width: auto; }
+      .stem-row {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        line-height: 1.35;
+        font-size: 12px;
+      }
+      .stem-row input[type="checkbox"] {
+        flex: 0 0 auto;
+        width: 14px;
+        height: 14px;
+        margin: 2px 0 0; /* nudge to top-align with first text line */
+        accent-color: #4caf6e;
+      }
+      .stem-row .stem-name { font-weight: 600; }
+      .stem-row .stem-desc { color: #8a92a0; }
       .footer {
         margin-top: 14px;
         display: flex;
@@ -85,14 +103,14 @@
     <h1>nomusic</h1>
     <div class="status" id="status"><span class="dot"></span><span id="statusText">checking backend…</span></div>
 
-    <label for="backend">Backend URL</label>
+    <label class="field-label" for="backend">Backend URL</label>
     <input id="backend" type="url" value="http://127.0.0.1:8723" />
 
-    <label for="model">Model</label>
+    <label class="field-label" for="model">Model</label>
     <select id="model"></select>
 
-    <label>Keep stems</label>
-    <div class="row" id="stems"></div>
+    <span class="field-label">Keep stems</span>
+    <div id="stems"></div>
 
     <div class="footer">
       <span class="hint" id="device"></span>

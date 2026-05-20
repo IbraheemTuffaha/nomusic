@@ -48,27 +48,19 @@ async function load() {
     const keep = stored.keepStems || defaultKeep;
     const stemsEl = $("stems");
     stemsEl.innerHTML = "";
-    stemsEl.style.flexDirection = "column";
-    stemsEl.style.alignItems = "flex-start";
-    stemsEl.style.gap = "4px";
     for (const s of ALL_STEMS) {
-      const wrap = document.createElement("label");
-      wrap.style.display = "inline-flex";
-      wrap.style.alignItems = "center";
-      wrap.style.gap = "6px";
-      wrap.style.margin = "0";
-      wrap.style.textTransform = "none";
-      wrap.style.letterSpacing = "0";
-      wrap.style.color = "inherit";
-      wrap.style.fontSize = "12px";
+      const row = document.createElement("label");
+      row.className = "stem-row";
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.value = s.name;
       cb.checked = keep.includes(s.name);
       const text = document.createElement("span");
-      text.innerHTML = `<strong>${s.name}</strong> <span style="color:#8a92a0">— ${s.desc}</span>`;
-      wrap.append(cb, text);
-      stemsEl.appendChild(wrap);
+      text.innerHTML =
+        `<span class="stem-name">${s.name}</span> ` +
+        `<span class="stem-desc">— ${s.desc}</span>`;
+      row.append(cb, text);
+      stemsEl.appendChild(row);
     }
   } else {
     $("status").classList.add("bad");
