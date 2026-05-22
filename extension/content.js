@@ -673,8 +673,12 @@
       this.el.title = "Strip music (nomusic)";
       this.fill = document.createElement("span");
       this.fill.className = "nomusic-btn__fill";
-      this.dot = document.createElement("span");
-      this.dot.className = "nomusic-btn__dot";
+      // Brand icon replaces the old colored dot as the leading visual.
+      // It picks up the same pulse animation while the backend is working.
+      this.icon = document.createElement("img");
+      this.icon.className = "nomusic-btn__icon";
+      this.icon.src = chrome.runtime.getURL("icons/button.png");
+      this.icon.alt = "";
       this.label = document.createElement("span");
       this.label.className = "nomusic-btn__label";
       this.label.textContent = "nomusic";
@@ -696,7 +700,7 @@
       });
       this.el.append(
         this.fill,
-        this.dot,
+        this.icon,
         this.label,
         this.pct,
         this.dismissBtn,

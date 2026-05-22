@@ -100,29 +100,30 @@
   z-index: 0;
 }
 
-.nomusic-btn__dot,
+.nomusic-btn__icon,
 .nomusic-btn__label,
 .nomusic-btn__pct {
   position: relative;
   z-index: 1;
 }
 
-.nomusic-btn__dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: currentColor;
-  opacity: 0.85;
+.nomusic-btn__icon {
+  height: 14px;
+  width: auto;
   flex: 0 0 auto;
+  display: block;
+  /* Subtle separation from the dark pill so the lime mark reads cleanly. */
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35));
 }
 
-.nomusic-btn[data-state="working"] .nomusic-btn__dot {
+.nomusic-btn[data-state="working"] .nomusic-btn__icon {
   animation: nomusic-pulse 1.1s ease-in-out infinite;
+  transform-origin: center;
 }
 
 @keyframes nomusic-pulse {
-  0%, 100% { opacity: 0.25; transform: scale(0.85); }
-  50%      { opacity: 1;    transform: scale(1.15); }
+  0%, 100% { opacity: 0.55; transform: scale(0.92); }
+  50%      { opacity: 1;    transform: scale(1.08); }
 }
 
 .nomusic-btn__label {

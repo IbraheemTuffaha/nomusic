@@ -1,5 +1,9 @@
 # nomusic
 
+<p align="center">
+  <img src="assets/logo.png" alt="nomusic" width="180" />
+</p>
+
 A free tool that lets you watch videos on YouTube, Facebook, and other
 sites without hearing the music. The dialogue, narration, and other
 sounds keep playing. The music is removed.
