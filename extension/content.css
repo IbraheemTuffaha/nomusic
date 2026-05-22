@@ -51,7 +51,9 @@
   background: rgba(170, 60, 60, 0.92);
 }
 
-/* Dismiss control: hidden at rest, fades in along with the button on hover. */
+/* Dismiss control: hidden at rest, fades in along with the button on hover.
+   The X is drawn with two pseudo-element bars instead of a "×" glyph so it
+   sits exactly at the bubble's optical center regardless of font metrics. */
 .nomusic-btn__dismiss {
   position: absolute;
   top: -7px;
@@ -62,11 +64,6 @@
   background: rgba(15, 17, 22, 0.96);
   border: none;
   color: #f5f6f8;
-  font: 600 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
-    sans-serif;
-  display: flex;
-  align-items: center;
-  justify-content: center;
   opacity: 0;
   cursor: pointer;
   transition: opacity 150ms ease, background 120ms ease, transform 120ms ease;
@@ -74,6 +71,19 @@
   pointer-events: none;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
 }
+.nomusic-btn__dismiss::before,
+.nomusic-btn__dismiss::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 9px;
+  height: 1.5px;
+  border-radius: 1px;
+  background: currentColor;
+}
+.nomusic-btn__dismiss::before { transform: translate(-50%, -50%) rotate(45deg); }
+.nomusic-btn__dismiss::after  { transform: translate(-50%, -50%) rotate(-45deg); }
 /* Only hover reveals the ×. Keyboard focus on the pill doesn't, since a
    focused-but-not-hovered button doesn't really need a dismiss target. */
 .nomusic-btn:hover .nomusic-btn__dismiss {

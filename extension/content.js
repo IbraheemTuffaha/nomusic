@@ -692,7 +692,9 @@
       this.dismissBtn.setAttribute("role", "button");
       this.dismissBtn.setAttribute("aria-label", "Hide nomusic on this video");
       this.dismissBtn.title = "Hide nomusic";
-      this.dismissBtn.textContent = "×";
+      // The X is drawn geometrically via ::before/::after in content.css
+      // because the "×" glyph's font metrics render off-center in the
+      // dismiss bubble.
       this.dismissBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         e.preventDefault();
