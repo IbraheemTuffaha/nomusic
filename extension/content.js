@@ -110,6 +110,11 @@
       } catch (err) {
         console.warn("[nomusic] /process failed", err);
         this.button.setError("backend unreachable");
+        // Mark the session terminal but leave the error visual alone so
+        // the auto-revert timer can do its 2.5s display. Without this the
+        // first post-error click would just dispose this dead session
+        // instead of starting a fresh one.
+        this.dispose({ preserveButtonState: true });
         return;
       }
 
@@ -185,7 +190,10 @@
         // record into _lastStatus for later restore.
         if (!this._pausedByUs) this.button.showStatus(status);
 
-        if (status.state === "error") return;
+        if (status.state === "error") {
+          this.dispose({ preserveButtonState: true });
+          return;
+        }
 
         // Fetch any newly-ready chunk in parallel; ordering doesn't matter,
         // each chunk knows its own play_start.
@@ -611,7 +619,7 @@
       }
     }
 
-    dispose() {
+    dispose({ preserveButtonState = false } = {}) {
       if (this.disposed) return;
       this.disposed = true;
       this.detachVideoListeners();
@@ -641,7 +649,10 @@
       this.audioCtx = null;
       this.chunks.clear();
       this.fetchedIdx.clear();
-      this.button.dispose();
+      // Error paths set the button to "error" and rely on its own
+      // auto-revert timer for the visual transition. Calling button.dispose
+      // here would clobber that.
+      if (!preserveButtonState) this.button.dispose();
     }
   }
 
@@ -667,6 +678,8 @@
     constructor(video) {
       this.video = video;
       this.session = null;
+      // Error state is intentionally transient — see _scheduleErrorRevert.
+      this._errorRevertTimer = null;
       this.el = document.createElement("button");
       this.el.className = "nomusic-btn";
       this.el.type = "button";
@@ -729,6 +742,7 @@
     }
 
     setIdle() {
+      this._clearErrorRevert();
       this.el.dataset.state = "idle";
       this.label.textContent = "nomusic";
       this.pct.textContent = "";
@@ -739,6 +753,7 @@
     showStatus(status) {
       const state = status.state;
       if (state === "ready") {
+        this._clearErrorRevert();
         this.el.dataset.state = "active";
         this.label.textContent = "nomusic on";
         this.pct.textContent = "";
@@ -750,8 +765,10 @@
         this.label.textContent = "error";
         this.pct.textContent = "";
         this.fill.style.width = "0%";
+        this._scheduleErrorRevert();
         return;
       }
+      this._clearErrorRevert();
       this.el.dataset.state = "working";
       this.label.textContent = status.phase_label || "Working";
       const p = status.phase_progress;
@@ -767,6 +784,7 @@
 
     /** Lightweight transitions for cases without a full status object. */
     setLocal(label) {
+      this._clearErrorRevert();
       this.el.dataset.state = "working";
       this.label.textContent = label;
       this.pct.textContent = "";
@@ -778,6 +796,25 @@
       this.label.textContent = label || "error";
       this.pct.textContent = "";
       this.fill.style.width = "0%";
+      this._scheduleErrorRevert();
+    }
+
+    // Error is transient feedback, not a sticky mode. After a brief moment
+    // the pill returns to its idle shape so the user can click again
+    // cleanly instead of staring at a red bar.
+    _scheduleErrorRevert() {
+      this._clearErrorRevert();
+      this._errorRevertTimer = setTimeout(() => {
+        this._errorRevertTimer = null;
+        if (this.el.dataset.state === "error") this.setIdle();
+      }, 2500);
+    }
+
+    _clearErrorRevert() {
+      if (this._errorRevertTimer) {
+        clearTimeout(this._errorRevertTimer);
+        this._errorRevertTimer = null;
+      }
     }
 
     async toggle() {
