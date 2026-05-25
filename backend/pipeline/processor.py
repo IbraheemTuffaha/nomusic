@@ -22,6 +22,7 @@ import math
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
@@ -279,13 +280,35 @@ class Processor:
         with tempfile.TemporaryDirectory(prefix="nomusic-") as tmp_str:
             tmp = Path(tmp_str)
             raw = tmp / f"raw_{plan.index:03d}.wav"
+
+            t0 = time.perf_counter()
             emit("downloading")  # phase name kept for UI compatibility
             slice_source(source_path, raw, start=plan.start, end=plan.end)
+            t_slice = time.perf_counter() - t0
+
             emit("separating")
+            t1 = time.perf_counter()
             result = self.engine.separate(raw, tmp / "stems", model=model)
+            t_separate = time.perf_counter() - t1
+
             emit("mixing")
+            t2 = time.perf_counter()
             mixed = self._mix_stems(result.stems, keep_stems)
             self._write_chunk(mixed, result.sample_rate, key, plan)
+            t_mix_write = time.perf_counter() - t2
+
+            # Per-chunk benchmark: realtime ratio is the headline metric
+            # (how many seconds of audio we process per wall-clock second).
+            # Headline number first, breakdown after, so a grep is enough
+            # to scan a long log without parsing.
+            wall = time.perf_counter() - t0
+            chunk_dur = plan.play_end - plan.play_start
+            ratio = chunk_dur / wall if wall > 0 else 0.0
+            log.info(
+                "chunk %d: %.2fs wall (%.1fx realtime) — "
+                "slice=%.2fs separate=%.2fs mix+write=%.2fs",
+                plan.index, wall, ratio, t_slice, t_separate, t_mix_write,
+            )
 
     @staticmethod
     def _mix_stems(
