@@ -185,11 +185,13 @@ class JobRegistry:
         model: str,
         keep_stems: list[str],
     ) -> None:
-        # First user-visible phase. Indeterminate progress (None) because we
-        # don't know how long the JS-challenge probe will take.
-        self._enter_phase(key, JobState.PROBING, progress=None)
         try:
             with self._gpu_lock:
+                # Stay in QUEUED while waiting for the GPU lock. Only flip to
+                # PROBING once we actually own it, so a second concurrent job
+                # honestly reports "Queued" instead of falsely showing
+                # "Inspecting video" while it's really blocked here.
+                self._enter_phase(key, JobState.PROBING, progress=None)
                 self.processor.run(
                     url,
                     model=model,
