@@ -96,7 +96,7 @@
         seeking: () => this.stopAll(),
         seeked: () => {
           this.reschedule();
-          this._maybeBufferPause();
+          this._reconcileBufferState();
         },
         ratechange: () => this.reschedule(),
         emptied: () => this.dispose(),
@@ -363,19 +363,42 @@
       }
     }
 
-    _maybeBufferPause() {
-      if (this.disposed || this.video.paused || this._pausedByUs) return;
-      if (!this._isBuffered(this.video.currentTime)) this._pauseForBuffer();
+    /** Bidirectional buffer-state reconciliation. Called every
+     *  SYNC_CHECK_MS by the buffer monitor and synchronously from the
+     *  ``seeked`` handler for immediate response.
+     *
+     *  Three jobs:
+     *    1. Heal a stale ``_pausedByUs`` flag — if the user un-paused the
+     *       video via the host site's controls, our flag is now lying
+     *       about who owns the pause.
+     *    2. Resume when we paused for buffer and the current chunk has
+     *       since landed in ``this.chunks`` (covers the case where a seek
+     *       arrives into already-buffered territory while we still hold a
+     *       prior pause).
+     *    3. Pause when we're playing and the current chunk isn't buffered. */
+    _reconcileBufferState() {
+      if (this.disposed) return;
+      if (this._pausedByUs && !this.video.paused) {
+        // User overrode us. Don't keep claiming ownership of the pause.
+        this._pausedByUs = false;
+      }
+      const buffered = this._isBuffered(this.video.currentTime);
+      if (this._pausedByUs && buffered) {
+        this._resumeAfterBuffer();
+        return;
+      }
+      if (this.video.paused || this._pausedByUs) return;
+      if (!buffered) this._pauseForBuffer();
     }
 
-    /** rAF-rate check: as currentTime crosses into an unfetched chunk while
-     *  playing, pause until it lands. Cheap (one branch + a Map.has per
-     *  tick) so we can run it at SYNC_CHECK_MS. */
+    /** rAF-rate check: drives ``_reconcileBufferState`` every
+     *  SYNC_CHECK_MS so playback recovers from any state desync within
+     *  one tick. Cheap (one branch + a Map.has per tick). */
     startBufferMonitor() {
       const tick = () => {
         if (this.disposed) return;
         this.bufferTimer = setTimeout(tick, SYNC_CHECK_MS);
-        this._maybeBufferPause();
+        this._reconcileBufferState();
       };
       tick();
     }
