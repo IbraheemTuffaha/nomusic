@@ -86,6 +86,10 @@
       // chunk for the current timecode isn't on disk yet. We track this so
       // a manual pause stays paused but a buffering pause auto-resumes.
       this._pausedByUs = false;
+      // Flipped true once pollLoop exits (state == ready/error). Tells
+      // _resumeAfterBuffer that no future poll will repaint the label,
+      // so it has to restore "nomusic on" itself.
+      this._pollingEnded = false;
       this._boundHandlers = {
         play: () => this.reschedule(),
         pause: () => this.stopAll(),
@@ -142,7 +146,10 @@
       // Pause the host video until chunk 0 is on disk; resume from the
       // chunk-fetch handler. Better than playing silent: the user doesn't
       // miss any seconds of content while the first chunk is being made.
-      this._pauseForBuffer();
+      // This is the initial pause — we deliberately don't relabel the
+      // button to "Buffering" here because the live phase label
+      // (Downloading / Removing music %) is more informative.
+      this._pauseForBuffer({ showBufferingLabel: false });
       this.attachVideoListeners();
       this.pollLoop();
       this.startSyncMonitor();
@@ -187,6 +194,7 @@
         this.button.showStatus(status);
 
         if (status.state === "error") {
+          this._pollingEnded = true;
           this.dispose({ preserveButtonState: true });
           return;
         }
@@ -202,7 +210,10 @@
         }
         await Promise.all(fetches);
 
-        if (status.state === "ready") return; // stop polling
+        if (status.state === "ready") {
+          this._pollingEnded = true;
+          return; // stop polling
+        }
       } catch (err) {
         console.warn("[nomusic] poll failed", err);
       }
@@ -319,12 +330,15 @@
       return this.chunks.has(this._chunkIdxForTime(t));
     }
 
-    _pauseForBuffer() {
+    _pauseForBuffer({ showBufferingLabel = true } = {}) {
       if (this._pausedByUs || this.disposed) return;
       this._pausedByUs = true;
-      // No button label change — the pulsing icon and the paused video
-      // are enough cue, and the poll loop keeps the real phase label
-      // (Downloading / Removing music) visible.
+      // Initial pause at session start (showBufferingLabel:false) leaves the
+      // live phase label alone — the user wants to see Downloading /
+      // Removing music %. A mid-watch buffer pause (the default) overrides
+      // with "Buffering" since at that point the user has been watching
+      // happily and needs to know why playback stopped.
+      if (showBufferingLabel) this.button.setBuffering();
       try {
         this.video.pause();
       } catch (_err) {
@@ -335,6 +349,12 @@
     _resumeAfterBuffer() {
       if (!this._pausedByUs || this.disposed) return;
       this._pausedByUs = false;
+      // If polling is still active, the next status tick will overwrite the
+      // "Buffering" label naturally. If polling has ended (state was ready
+      // or error) we have to restore the active label ourselves.
+      if (this._pollingEnded && this.button.el.dataset.state === "working") {
+        this.button.showStatus({ state: "ready" });
+      }
       try {
         const p = this.video.play();
         if (p && typeof p.catch === "function") p.catch(() => {});
@@ -773,6 +793,14 @@
         this.pct.textContent = "";
         this.fill.style.width = "0%";
       }
+    }
+
+    setBuffering() {
+      this._clearErrorRevert();
+      this.el.dataset.state = "working";
+      this.label.textContent = "Buffering";
+      this.pct.textContent = "";
+      this.fill.style.width = "0%";
     }
 
     setError(label) {
