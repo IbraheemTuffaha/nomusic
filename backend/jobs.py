@@ -394,12 +394,24 @@ class JobRegistry:
         """
         with self._lock:
             if key not in self._jobs:
+                log.info("prioritize: unknown job key=%s from_chunk=%d", key, from_chunk)
                 return False
             control = self._controls.get(key)
             if control is None:
                 self._pending_priority[key] = from_chunk
+                log.info(
+                    "prioritize: stashed (control not yet built) key=%s from_chunk=%d",
+                    key, from_chunk,
+                )
                 return True
+        before_size = len(control.pending)
+        before_head = list(control.pending)[:5]
         control.prioritize(from_chunk)
+        after_head = list(control.pending)[:5]
+        log.info(
+            "prioritize: key=%s from_chunk=%d pending=%d head_before=%s head_after=%s",
+            key, from_chunk, before_size, before_head, after_head,
+        )
         return True
 
     # -- internals -----------------------------------------------------------

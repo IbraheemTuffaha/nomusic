@@ -26,6 +26,15 @@
   const SYNC_TOLERANCE_S = 0.08;
   const SYNC_CHECK_MS = 250;
 
+  // Debug logging for seek/buffer/prioritize state transitions. Flip to
+  // ``false`` (or remove the calls) once the seek-backwards investigation
+  // is done. Browser DevTools' console filter is the easiest way to scan;
+  // every line is prefixed with [nomusic].
+  const DEBUG = true;
+  const dlog = DEBUG
+    ? (...args) => console.log("[nomusic]", ...args)
+    : () => {};
+
   // ---------------------------------------------------------------------------
   // settings (cached in-memory; chrome.storage drives the popup)
   // ---------------------------------------------------------------------------
@@ -98,6 +107,13 @@
         pause: () => this.stopAll(),
         seeking: () => this.stopAll(),
         seeked: () => {
+          dlog("seeked", {
+            currentTime: this.video.currentTime,
+            chunk: this._chunkIdxForTime(this.video.currentTime),
+            buffered: this._isBuffered(this.video.currentTime),
+            pausedByUs: this._pausedByUs,
+            videoPaused: this.video.paused,
+          });
           this.reschedule();
           this._reconcileBufferState();
           this._sendPrioritizeHint();
@@ -160,6 +176,13 @@
       // params, and any pre-scrub before the user clicked nomusic. The
       // hint is debounced 250 ms, which still lands well before the
       // probe + download phases finish on the backend.
+      const startChunk = this._chunkIdxForTime(this.video.currentTime);
+      dlog("session start", {
+        currentTime: this.video.currentTime,
+        chunk: startChunk,
+        totalChunks: this.totalChunks,
+        chunkSeconds: this.chunkSeconds,
+      });
       this._sendPrioritizeHint();
       this.pollLoop();
       this.startSyncMonitor();
@@ -260,6 +283,13 @@
           playStart: idx * stride,
         };
         this.chunks.set(idx, entry);
+        dlog("chunk arrived", {
+          idx,
+          currentTime: this.video.currentTime,
+          currentChunk: this._chunkIdxForTime(this.video.currentTime),
+          pausedByUs: this._pausedByUs,
+          videoPaused: this.video.paused,
+        });
         // If we paused because this chunk wasn't ready, resume now.
         if (this._pausedByUs && this._isBuffered(this.video.currentTime)) {
           this._resumeAfterBuffer();
@@ -361,6 +391,11 @@
       // with "Buffering" since at that point the user has been watching
       // happily and needs to know why playback stopped.
       if (showBufferingLabel) this.button.setBuffering();
+      dlog("pauseForBuffer", {
+        currentTime: this.video.currentTime,
+        chunk: this._chunkIdxForTime(this.video.currentTime),
+        showBufferingLabel,
+      });
       try {
         this.video.pause();
       } catch (_err) {
@@ -371,6 +406,10 @@
     _resumeAfterBuffer() {
       if (!this._pausedByUs || this.disposed) return;
       this._pausedByUs = false;
+      dlog("resumeAfterBuffer", {
+        currentTime: this.video.currentTime,
+        chunk: this._chunkIdxForTime(this.video.currentTime),
+      });
       // If polling is still active, the next status tick will overwrite the
       // "Buffering" label naturally. If polling has ended (state was ready
       // or error) we have to restore the active label ourselves.
@@ -379,7 +418,9 @@
       }
       try {
         const p = this.video.play();
-        if (p && typeof p.catch === "function") p.catch(() => {});
+        if (p && typeof p.catch === "function") {
+          p.catch((err) => dlog("video.play() rejected", err?.name || err));
+        }
       } catch (_err) {
         /* element gone */
       }
@@ -396,14 +437,14 @@
         this._prioritizeTimer = null;
         if (this.disposed || this._pollingEnded || !this.jobId) return;
         const fromChunk = this._chunkIdxForTime(this.video.currentTime);
+        dlog("prioritize POST", { fromChunk, currentTime: this.video.currentTime });
         fetch(`${settings.backendUrl}/process/${this.jobId}/prioritize`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ from_chunk: fromChunk }),
-        }).catch(() => {
-          /* fire-and-forget; the worst case is the worker keeps its old
-             order and the user waits a bit longer at the seek point. */
-        });
+        })
+          .then((r) => dlog("prioritize response", r.status))
+          .catch((err) => dlog("prioritize POST failed", err));
       }, 250);
     }
 
@@ -424,10 +465,12 @@
       if (this.disposed) return;
       if (this._pausedByUs && !this.video.paused) {
         // User overrode us. Don't keep claiming ownership of the pause.
+        dlog("reconcile: healing stale _pausedByUs (video resumed externally)");
         this._pausedByUs = false;
       }
       const buffered = this._isBuffered(this.video.currentTime);
       if (this._pausedByUs && buffered) {
+        dlog("reconcile: chunk arrived under our pause -> resume");
         this._resumeAfterBuffer();
         return;
       }
