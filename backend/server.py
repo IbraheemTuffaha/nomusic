@@ -61,6 +61,10 @@ class ProcessRequest(BaseModel):
         return v
 
 
+class PrioritizeRequest(BaseModel):
+    from_chunk: int = Field(..., ge=0)
+
+
 def _start_cache_ttl_sweeper(cache: JobCache) -> None:
     """Run an initial sweep, then schedule one every
     ``cache_sweep_interval_seconds``. Skipped entirely when TTL is 0.
@@ -172,6 +176,18 @@ def create_app() -> FastAPI:
             log.exception("submit failed")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return status.to_dict()
+
+    @app.post("/process/{job_id}/prioritize")
+    def prioritize(job_id: str, req: PrioritizeRequest) -> dict:
+        """Re-order the worker's pending chunks so ``from_chunk`` is next.
+
+        Fire-and-forget from the client's perspective. Returns ``applied``
+        so a curious caller can tell whether the job was still mutable
+        (it isn't once the job is fully done), but a normal seek doesn't
+        need to inspect the response.
+        """
+        ok = registry.prioritize(job_id, req.from_chunk)
+        return {"applied": ok}
 
     @app.get("/status/{job_id}")
     def status(job_id: str) -> dict:

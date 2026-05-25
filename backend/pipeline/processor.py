@@ -23,9 +23,10 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Optional
 
 import numpy as np
 import soundfile as sf
@@ -60,6 +61,13 @@ DownloadProgressCb = Callable[[float | None], None]
 # (info, plans, meta) fired once the probe completes — gives jobs.py enough
 # data to surface title / duration / total_chunks in /status.
 ProbedCb = Callable[["VideoMetadata", list, CacheMeta], None]
+
+# Returns the next chunk index to process, or ``None`` when the work queue
+# is exhausted. When the caller supplies one, the processor lets it drive
+# the chunk order — that's how jobs.py implements "process from the
+# seeked-to position first, loop back to earlier chunks after". When None,
+# the processor uses its own internal FIFO over the plan list.
+NextChunkProvider = Callable[[], Optional[int]]
 
 
 @dataclass
@@ -187,11 +195,16 @@ class Processor:
         on_probed: ProbedCb | None = None,
         on_progress: ProgressCb | None = None,
         on_download_progress: DownloadProgressCb | None = None,
+        next_chunk_provider: NextChunkProvider | None = None,
     ) -> str:
         """Run the full chunked pipeline. Returns the cache key.
 
         Safe to call on an already-cached job: missing chunks are filled in,
         and a fully-cached job returns immediately.
+
+        ``next_chunk_provider`` lets the caller drive chunk order (e.g.
+        prioritize chunks near the user's seek position); when None the
+        processor falls back to a simple FIFO over remaining chunks.
         """
         key, meta, info, plans = self.prepare(
             url, model=model, keep_stems=keep_stems
@@ -225,10 +238,31 @@ class Processor:
             url, self.cache.source_dir(url), progress_hook=_yt_hook
         )
 
-        for plan in plans:
-            if plan.index in meta.chunks_ready and self.cache.chunk_path(
-                key, plan.index
-            ).exists():
+        plans_by_index = {p.index: p for p in plans}
+        # Default provider: simple FIFO over remaining chunks. Used by the
+        # CLI and tests; jobs.py supplies its own that supports reordering.
+        if next_chunk_provider is None:
+            fallback = deque(
+                p.index for p in plans if p.index not in meta.chunks_ready
+            )
+            next_chunk_provider = lambda: fallback.popleft() if fallback else None
+
+        while True:
+            idx = next_chunk_provider()
+            if idx is None:
+                break
+            plan = plans_by_index.get(idx)
+            if plan is None:
+                log.warning("provider returned unknown chunk index %d", idx)
+                continue
+            # Race-safety: another caller (or a prior reorder pop) may have
+            # already completed this chunk between picks. Skip if so.
+            current_meta = self.cache.load_meta(key)
+            if (
+                current_meta
+                and plan.index in current_meta.chunks_ready
+                and self.cache.chunk_path(key, plan.index).exists()
+            ):
                 continue
             self._process_one(
                 source_path,

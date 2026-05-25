@@ -90,6 +90,9 @@
       // _resumeAfterBuffer that no future poll will repaint the label,
       // so it has to restore "nomusic on" itself.
       this._pollingEnded = false;
+      // Debounce timer for the /prioritize POST on seek so scrubbing a
+      // timeline doesn't fire one request per intermediate frame.
+      this._prioritizeTimer = null;
       this._boundHandlers = {
         play: () => this.reschedule(),
         pause: () => this.stopAll(),
@@ -97,6 +100,7 @@
         seeked: () => {
           this.reschedule();
           this._reconcileBufferState();
+          this._sendPrioritizeHint();
         },
         ratechange: () => this.reschedule(),
         emptied: () => this.dispose(),
@@ -151,6 +155,12 @@
       // (Downloading / Removing music %) is more informative.
       this._pauseForBuffer({ showBufferingLabel: false });
       this.attachVideoListeners();
+      // Tell the backend to start where the user actually is, not at
+      // chunk 0 — handles YouTube's "resume from history", &t=NNN URL
+      // params, and any pre-scrub before the user clicked nomusic. The
+      // hint is debounced 250 ms, which still lands well before the
+      // probe + download phases finish on the backend.
+      this._sendPrioritizeHint();
       this.pollLoop();
       this.startSyncMonitor();
       this.startBufferMonitor();
@@ -199,10 +209,15 @@
           return;
         }
 
-        // Fetch any newly-ready chunk in parallel; ordering doesn't matter,
-        // each chunk knows its own play_start.
+        // Fetch any newly-ready chunk in parallel. With seek-driven
+        // reordering, ready chunks are no longer contiguous from 0, so
+        // we iterate the explicit ``ready_chunks`` set the backend sends.
+        // Each chunk knows its own play_start so order doesn't matter.
+        const readyChunks = Array.isArray(status.ready_chunks)
+          ? status.ready_chunks
+          : [];
         const fetches = [];
-        for (let i = 0; i < status.chunks_ready; i++) {
+        for (const i of readyChunks) {
           if (!this.fetchedIdx.has(i)) {
             this.fetchedIdx.add(i);
             fetches.push(this.fetchAndQueueChunk(i));
@@ -361,6 +376,28 @@
       } catch (_err) {
         /* element gone */
       }
+    }
+
+    /** After the user seeks, ask the backend to process the chunk at the
+     *  new position next (then onward, then loop back). Debounced so a
+     *  scrub doesn't generate dozens of POSTs. No-op once polling has
+     *  ended because the worker is already done. */
+    _sendPrioritizeHint() {
+      if (this.disposed || this._pollingEnded || !this.jobId) return;
+      if (this._prioritizeTimer) clearTimeout(this._prioritizeTimer);
+      this._prioritizeTimer = setTimeout(() => {
+        this._prioritizeTimer = null;
+        if (this.disposed || this._pollingEnded || !this.jobId) return;
+        const fromChunk = this._chunkIdxForTime(this.video.currentTime);
+        fetch(`${settings.backendUrl}/process/${this.jobId}/prioritize`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ from_chunk: fromChunk }),
+        }).catch(() => {
+          /* fire-and-forget; the worst case is the worker keeps its old
+             order and the user waits a bit longer at the seek point. */
+        });
+      }, 250);
     }
 
     /** Bidirectional buffer-state reconciliation. Called every
@@ -667,6 +704,7 @@
       if (this.statusTimer) clearTimeout(this.statusTimer);
       if (this.syncTimer) clearTimeout(this.syncTimer);
       if (this.bufferTimer) clearTimeout(this.bufferTimer);
+      if (this._prioritizeTimer) clearTimeout(this._prioritizeTimer);
       // If we paused for buffering, let the video resume now that we're
       // letting go of it — otherwise it would stay paused with no audio
       // override and the user would have to hit play themselves.

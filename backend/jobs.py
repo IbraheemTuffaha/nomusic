@@ -12,13 +12,14 @@ rather than fighting for the GPU.
 
 from __future__ import annotations
 
+import collections
 import logging
 import threading
 import time
 import traceback
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 from pipeline.cache import CacheMeta, JobCache
 from pipeline.processor import Processor
@@ -58,6 +59,10 @@ class JobStatus:
     phase_progress: float | None = 0.0
     phase_label: str = "Queued"
     chunks_ready: int = 0
+    # Sorted list of completed chunk indices. With seek-driven reordering
+    # these are no longer contiguous from 0, so the client needs the actual
+    # set, not just the count, to know which /chunk/{idx} URLs to fetch.
+    ready_chunks: list[int] = field(default_factory=list)
     total_chunks: int = 0
     duration_seconds: float = 0.0
     title: str = ""
@@ -72,12 +77,59 @@ class JobStatus:
         return d
 
 
+class _JobControl:
+    """Per-job runtime control surface.
+
+    Owns the pending-chunk deque that the worker pops from and the HTTP
+    layer mutates via ``JobRegistry.prioritize``. The deque holds chunk
+    indices in the order they should be processed; under its own lock so
+    a /prioritize call can reorder it while the worker is mid-chunk.
+    """
+
+    def __init__(self, total_chunks: int, done: set[int]) -> None:
+        self.lock = threading.Lock()
+        self.pending: collections.deque[int] = collections.deque(
+            i for i in range(total_chunks) if i not in done
+        )
+
+    def next_chunk(self) -> Optional[int]:
+        with self.lock:
+            return self.pending.popleft() if self.pending else None
+
+    def prioritize(self, from_chunk: int) -> None:
+        """Rotate to [from_chunk, from_chunk+1, …, N-1, 0, 1, …, from_chunk-1],
+        keeping only entries currently still pending. No-op if the queue is
+        empty.
+
+        We sort both halves explicitly: after even one reorder the deque is
+        no longer in ascending order, so a position-preserving filter would
+        leave whichever chunks happened to be near the front of the prior
+        ordering ahead of the new seek target. Sorting guarantees the next
+        pop is always ``from_chunk`` (or the next still-pending index after
+        it) regardless of how scrambled the prior order was.
+        """
+        with self.lock:
+            if not self.pending:
+                return
+            pending = set(self.pending)
+            front = sorted(i for i in pending if i >= from_chunk)
+            back = sorted(i for i in pending if i < from_chunk)
+            self.pending = collections.deque(front + back)
+
+
 class JobRegistry:
     def __init__(self, processor: Processor, cache: JobCache) -> None:
         self.processor = processor
         self.cache = cache
         self._jobs: dict[str, JobStatus] = {}
         self._threads: dict[str, threading.Thread] = {}
+        # Per-job control for chunk ordering. Built lazily inside
+        # ``_on_probed`` (once we know total_chunks) and discarded when the
+        # worker finishes.
+        self._controls: dict[str, _JobControl] = {}
+        # If /prioritize arrives before the control exists (job is still
+        # probing/downloading), stash the hint here and apply on creation.
+        self._pending_priority: dict[str, int] = {}
         self._lock = threading.Lock()
         # One job runs at a time on the engine; further jobs block here.
         self._gpu_lock = threading.Lock()
@@ -133,6 +185,7 @@ class JobRegistry:
                 phase_progress=progress,
                 phase_label=_PHASE_LABELS[initial_state.value],
                 chunks_ready=len(existing_meta.chunks_ready) if existing_meta else 0,
+                ready_chunks=sorted(existing_meta.chunks_ready) if existing_meta else [],
                 total_chunks=existing_meta.total_chunks if existing_meta else 0,
                 duration_seconds=existing_meta.duration_seconds if existing_meta else 0.0,
                 title=existing_meta.title if existing_meta else "",
@@ -171,6 +224,7 @@ class JobRegistry:
             phase_progress=1.0 if meta.complete else 0.0,
             phase_label=_PHASE_LABELS[state.value],
             chunks_ready=len(meta.chunks_ready),
+            ready_chunks=sorted(meta.chunks_ready),
             total_chunks=meta.total_chunks,
             duration_seconds=meta.duration_seconds,
             title=meta.title,
@@ -186,45 +240,55 @@ class JobRegistry:
         keep_stems: list[str],
     ) -> None:
         try:
-            with self._gpu_lock:
-                # Stay in QUEUED while waiting for the GPU lock. Only flip to
-                # PROBING once we actually own it, so a second concurrent job
-                # honestly reports "Queued" instead of falsely showing
-                # "Inspecting video" while it's really blocked here.
-                self._enter_phase(key, JobState.PROBING, progress=None)
-                self.processor.run(
-                    url,
-                    model=model,
-                    keep_stems=keep_stems,
-                    on_probed=lambda info, plans, meta: self._on_probed(
-                        key, info, plans, meta
-                    ),
-                    on_progress=lambda meta, phase: self._on_separation_progress(
-                        key, meta, phase
-                    ),
-                    on_download_progress=lambda p: self._on_download_progress(
-                        key, p
-                    ),
+            try:
+                with self._gpu_lock:
+                    # Stay in QUEUED while waiting for the GPU lock. Only flip
+                    # to PROBING once we actually own it, so a second
+                    # concurrent job honestly reports "Queued" instead of
+                    # falsely showing "Inspecting video" while really blocked.
+                    self._enter_phase(key, JobState.PROBING, progress=None)
+                    self.processor.run(
+                        url,
+                        model=model,
+                        keep_stems=keep_stems,
+                        on_probed=lambda info, plans, meta: self._on_probed(
+                            key, info, plans, meta
+                        ),
+                        on_progress=lambda meta, phase: self._on_separation_progress(
+                            key, meta, phase
+                        ),
+                        on_download_progress=lambda p: self._on_download_progress(
+                            key, p
+                        ),
+                        next_chunk_provider=self._make_chunk_provider(key),
+                    )
+                meta = self.cache.load_meta(key)
+                chunks_ready = len(meta.chunks_ready) if meta else 0
+                ready_chunks = sorted(meta.chunks_ready) if meta else []
+                total = meta.total_chunks if meta else 0
+                self._enter_phase(
+                    key,
+                    JobState.READY,
+                    progress=1.0,
+                    chunks_ready=chunks_ready,
+                    ready_chunks=ready_chunks,
+                    total_chunks=total,
                 )
-            meta = self.cache.load_meta(key)
-            chunks_ready = len(meta.chunks_ready) if meta else 0
-            total = meta.total_chunks if meta else 0
-            self._enter_phase(
-                key,
-                JobState.READY,
-                progress=1.0,
-                chunks_ready=chunks_ready,
-                total_chunks=total,
-            )
-            log.info("Job %s ready", key)
-        except Exception as exc:
-            log.exception("Job %s failed", key)
-            self._enter_phase(
-                key,
-                JobState.ERROR,
-                progress=1.0,
-                error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}",
-            )
+                log.info("Job %s ready", key)
+            except Exception as exc:
+                log.exception("Job %s failed", key)
+                self._enter_phase(
+                    key,
+                    JobState.ERROR,
+                    progress=1.0,
+                    error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}",
+                )
+        finally:
+            # The control + any orphaned priority hint are only meaningful
+            # while a worker is consuming chunks; drop both unconditionally.
+            with self._lock:
+                self._controls.pop(key, None)
+                self._pending_priority.pop(key, None)
 
     def _enter_phase(
         self,
@@ -259,7 +323,19 @@ class JobRegistry:
             duration_seconds=info.duration_seconds,
             total_chunks=meta.total_chunks,
             chunks_ready=len(meta.chunks_ready),
+            ready_chunks=sorted(meta.chunks_ready),
         )
+        # Now that we know total_chunks, build the per-job control. If a
+        # /prioritize call beat us here, apply the stashed hint now.
+        with self._lock:
+            if key not in self._controls:
+                self._controls[key] = _JobControl(
+                    total_chunks=meta.total_chunks,
+                    done=set(meta.chunks_ready),
+                )
+            hint = self._pending_priority.pop(key, None)
+        if hint is not None:
+            self._controls[key].prioritize(hint)
 
     def _on_download_progress(self, key: str, fraction: float | None) -> None:
         # yt-dlp emits 1.0 on completion; we stay in DOWNLOADING until the
@@ -292,8 +368,41 @@ class JobRegistry:
             phase_label=_PHASE_LABELS["processing"],
             phase_progress=progress,
             chunks_ready=done,
+            ready_chunks=sorted(meta.chunks_ready),
             total_chunks=meta.total_chunks,
         )
+
+    # -- prioritization ------------------------------------------------------
+
+    def _make_chunk_provider(self, key: str) -> Callable[[], Optional[int]]:
+        """Build the callable that ``Processor.run`` calls between chunks."""
+
+        def provider() -> Optional[int]:
+            control = self._controls.get(key)
+            if control is None:
+                return None
+            return control.next_chunk()
+
+        return provider
+
+    def prioritize(self, key: str, from_chunk: int) -> bool:
+        """Rotate the job's pending-chunk order so ``from_chunk`` is next.
+
+        Returns False if the job is unknown or already done. If the control
+        hasn't been built yet (we're still probing/downloading), the hint
+        is stashed and applied as soon as the control comes into being.
+        """
+        with self._lock:
+            if key not in self._jobs:
+                return False
+            control = self._controls.get(key)
+            if control is None:
+                self._pending_priority[key] = from_chunk
+                return True
+        control.prioritize(from_chunk)
+        return True
+
+    # -- internals -----------------------------------------------------------
 
     def _update(self, key: str, **fields) -> None:
         with self._lock:
