@@ -206,7 +206,14 @@ def create_app() -> FastAPI:
         path = cache.chunk_path(job_id, chunk_idx)
         if not path.exists():
             # 425 Too Early: client should poll /status and retry.
-            raise HTTPException(status_code=425, detail="chunk not ready")
+            # no-store is critical — without it, the browser can cache the
+            # 425 and serve it forever, so a chunk that landed on disk a
+            # second later would still appear "not ready" to the client.
+            raise HTTPException(
+                status_code=425,
+                detail="chunk not ready",
+                headers={"Cache-Control": "no-store"},
+            )
         return FileResponse(
             str(path),
             media_type=CHUNK_MEDIA_TYPE,

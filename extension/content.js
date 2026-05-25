@@ -237,9 +237,16 @@
 
     async fetchAndQueueChunk(idx) {
       try {
+        // ``cache: "default"`` lets the browser honor the backend's
+        // Cache-Control header (max-age=86400 for 200, no-store for 425).
+        // ``force-cache`` is wrong here because it returns ANY cached
+        // response unconditionally — so a 425 from "chunk not ready yet"
+        // gets remembered forever and poisons every retry, even after the
+        // chunk lands on disk. That manifested as seek-backwards getting
+        // stuck on chunks the backend had finished long ago.
         const resp = await fetch(
           `${settings.backendUrl}/chunk/${this.jobId}/${idx}`,
-          { cache: "force-cache" },
+          { cache: "default" },
         );
         if (!resp.ok) {
           this.fetchedIdx.delete(idx); // allow retry on next poll
