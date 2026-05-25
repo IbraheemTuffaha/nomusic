@@ -86,7 +86,6 @@
       // chunk for the current timecode isn't on disk yet. We track this so
       // a manual pause stays paused but a buffering pause auto-resumes.
       this._pausedByUs = false;
-      this._lastStatus = null;
       this._boundHandlers = {
         play: () => this.reschedule(),
         pause: () => this.stopAll(),
@@ -102,8 +101,6 @@
     }
 
     async start() {
-      this.button.setLocal("Starting");
-
       let info;
       try {
         info = await this.requestJob();
@@ -184,11 +181,10 @@
         if (!resp.ok) throw new Error(`status ${resp.status}`);
         const status = await resp.json();
         this.totalChunks = status.total_chunks || this.totalChunks;
-        this._lastStatus = status;
-        // While we're buffer-paused we own the label; let the buffer
-        // monitor refresh it once buffering ends. Status updates still
-        // record into _lastStatus for later restore.
-        if (!this._pausedByUs) this.button.showStatus(status);
+        // Always reflect the backend phase in the label, even while we're
+        // paused for buffering — the pulsing icon + paused video already
+        // convey "waiting", and the phase label is more useful content.
+        this.button.showStatus(status);
 
         if (status.state === "error") {
           this.dispose({ preserveButtonState: true });
@@ -326,7 +322,9 @@
     _pauseForBuffer() {
       if (this._pausedByUs || this.disposed) return;
       this._pausedByUs = true;
-      this.button.setLocal("Buffering");
+      // No button label change — the pulsing icon and the paused video
+      // are enough cue, and the poll loop keeps the real phase label
+      // (Downloading / Removing music) visible.
       try {
         this.video.pause();
       } catch (_err) {
@@ -337,7 +335,6 @@
     _resumeAfterBuffer() {
       if (!this._pausedByUs || this.disposed) return;
       this._pausedByUs = false;
-      if (this._lastStatus) this.button.showStatus(this._lastStatus);
       try {
         const p = this.video.play();
         if (p && typeof p.catch === "function") p.catch(() => {});
@@ -761,11 +758,7 @@
         return;
       }
       if (state === "error") {
-        this.el.dataset.state = "error";
-        this.label.textContent = "error";
-        this.pct.textContent = "";
-        this.fill.style.width = "0%";
-        this._scheduleErrorRevert();
+        this.setError(status.phase_label || "Error");
         return;
       }
       this._clearErrorRevert();
@@ -782,18 +775,9 @@
       }
     }
 
-    /** Lightweight transitions for cases without a full status object. */
-    setLocal(label) {
-      this._clearErrorRevert();
-      this.el.dataset.state = "working";
-      this.label.textContent = label;
-      this.pct.textContent = "";
-      this.fill.style.width = "0%";
-    }
-
     setError(label) {
       this.el.dataset.state = "error";
-      this.label.textContent = label || "error";
+      this.label.textContent = label || "Error";
       this.pct.textContent = "";
       this.fill.style.width = "0%";
       this._scheduleErrorRevert();
