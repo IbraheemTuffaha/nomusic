@@ -22,10 +22,19 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Callable, Optional
 
+from config import SETTINGS
 from pipeline.cache import CacheMeta, JobCache
 from pipeline.processor import Processor
 
 log = logging.getLogger(__name__)
+
+
+class WorkerAbandoned(Exception):
+    """Raised from the chunk provider when a job has had no SSE subscriber for
+    longer than ``idle_timeout_seconds``. It propagates up through
+    ``Processor.run`` and out of ``with self._gpu_lock:``, so the GPU lock is
+    released naturally on the way out and the worker thread exits. The client
+    re-spawns the job from disk-cached progress on its next click."""
 
 
 class JobState(str, Enum):
@@ -308,6 +317,7 @@ class JobRegistry:
         model: str,
         keep_stems: list[str],
     ) -> None:
+        abandoned = False
         try:
             try:
                 with self._gpu_lock:
@@ -344,6 +354,16 @@ class JobRegistry:
                     total_chunks=total,
                 )
                 log.info("Job %s ready", key)
+            except WorkerAbandoned:
+                # Listed before the generic handler so an idle-abandon isn't
+                # mistaken for a failure. The GPU lock has already released via
+                # the with-block unwind; just flag it for finally to clean up.
+                abandoned = True
+                log.info(
+                    "Job %s abandoned: idle > %ss",
+                    key,
+                    SETTINGS.idle_timeout_seconds,
+                )
             except Exception as exc:
                 log.exception("Job %s failed", key)
                 self._enter_phase(
@@ -370,6 +390,12 @@ class JobRegistry:
                 # loses nothing; each stream still drains and closes itself. A
                 # stream that opens after this sees the terminal state from
                 # disk and short-circuits without subscribing.
+                if abandoned:
+                    # Drop the JobStatus so a later /process spawns a fresh
+                    # worker (resuming from disk-cached chunks) rather than
+                    # finding a stale entry. Completed/errored jobs are kept
+                    # for /status until memory_gc reclaims them.
+                    self._jobs.pop(key, None)
 
     def _enter_phase(
         self,
@@ -456,10 +482,30 @@ class JobRegistry:
     # -- prioritization ------------------------------------------------------
 
     def _make_chunk_provider(self, key: str) -> Callable[[], Optional[int]]:
-        """Build the callable that ``Processor.run`` calls between chunks."""
+        """Build the callable that ``Processor.run`` calls between chunks.
+
+        Returns the next chunk index, ``None`` when the queue is exhausted, or
+        raises ``WorkerAbandoned`` when nobody has been streaming status for
+        longer than ``idle_timeout_seconds``. The idle check runs here — at the
+        chunk boundary — so abandoning costs at most one in-flight chunk and
+        unwinds cleanly out of the GPU lock.
+        """
+        idle_timeout = SETTINGS.idle_timeout_seconds
 
         def provider() -> Optional[int]:
-            control = self._controls.get(key)
+            with self._lock:
+                has_sub = bool(self._subscribers.get(key))
+                last_disc = self._last_disconnect_at.get(key)
+                status = self._jobs.get(key)
+                created_at = status.created_at if status else time.time()
+                control = self._controls.get(key)
+            if idle_timeout > 0 and not has_sub:
+                # No subscriber: count from the last disconnect, or from job
+                # creation if nobody ever connected (covers a /process whose
+                # client never opened /events).
+                ref = last_disc if last_disc is not None else created_at
+                if time.time() - ref >= idle_timeout:
+                    raise WorkerAbandoned
             if control is None:
                 return None
             return control.next_chunk()
