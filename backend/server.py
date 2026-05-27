@@ -96,6 +96,34 @@ def _start_cache_ttl_sweeper(cache: JobCache) -> None:
     t.start()
 
 
+def _start_memory_gc(registry: JobRegistry) -> None:
+    """Periodically reclaim in-memory job entries whose disk cache is gone.
+
+    Runs alongside the disk TTL sweeper on its own daemon thread, so the
+    in-memory JobStatus map can't grow without bound on a long-lived server.
+    Keyed to its own interval so a hosted deployment can GC aggressively
+    without touching the disk-sweep cadence. ``0`` disables it."""
+    interval = SETTINGS.memory_gc_interval_seconds
+    if interval <= 0:
+        log.info("Memory GC disabled (interval=%s)", interval)
+        return
+
+    def _loop() -> None:
+        import time
+
+        while True:
+            time.sleep(interval)
+            try:
+                dropped = registry.memory_gc()
+                if dropped:
+                    log.info("Memory GC dropped %d stale in-memory job(s)", dropped)
+            except Exception:
+                log.exception("Memory GC failed")
+
+    t = threading.Thread(target=_loop, name="nomusic-memory-gc", daemon=True)
+    t.start()
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="nomusic", version="0.1.0")
 
@@ -131,6 +159,7 @@ def create_app() -> FastAPI:
     app.state.registry = registry
 
     _start_cache_ttl_sweeper(cache)
+    _start_memory_gc(registry)
 
     @app.get("/healthz")
     def healthz() -> dict:

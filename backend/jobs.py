@@ -230,6 +230,30 @@ class JobRegistry:
             title=meta.title,
         )
 
+    def memory_gc(self) -> int:
+        """Drop in-memory JobStatus entries whose disk cache is already gone.
+
+        Completed and errored jobs are intentionally kept in ``_jobs`` after
+        their worker exits so ``/status`` keeps reporting the final state.
+        This bounds that retention: once the disk TTL sweep has reaped a job's
+        cache directory (or it never had one), the in-memory entry is dead
+        weight, so we reclaim it. Jobs with a live worker thread are never
+        touched. Returns the number of entries dropped.
+        """
+        with self._lock:
+            candidates = [k for k in self._jobs if k not in self._threads]
+        dropped = 0
+        for key in candidates:
+            # Disk check is I/O; do it outside the lock.
+            if self.cache.load_meta(key) is not None:
+                continue
+            with self._lock:
+                if key in self._threads:
+                    continue  # a fresh submit spawned a worker since we looked
+                if self._jobs.pop(key, None) is not None:
+                    dropped += 1
+        return dropped
+
     # -- worker --------------------------------------------------------------
 
     def _run(
@@ -285,10 +309,15 @@ class JobRegistry:
                 )
         finally:
             # The control + any orphaned priority hint are only meaningful
-            # while a worker is consuming chunks; drop both unconditionally.
+            # while a worker is consuming chunks; drop them unconditionally.
+            # Dropping the thread handle too marks the job as having no live
+            # worker, which is what ``memory_gc`` keys off to know an entry is
+            # eligible for reclamation. The JobStatus itself stays in _jobs so
+            # /status and a late SSE connection still see the final state.
             with self._lock:
                 self._controls.pop(key, None)
                 self._pending_priority.pop(key, None)
+                self._threads.pop(key, None)
 
     def _enter_phase(
         self,

@@ -94,5 +94,30 @@ class Settings:
         default_factory=lambda: _env_bool("KEEP_SOURCE_AFTER_COMPLETE", False)
     )
 
+    # How long a worker keeps running after its last SSE subscriber drops.
+    # When no client has been streaming status for this long, the worker
+    # abandons the job between chunks — releasing the GPU lock — so an idle
+    # server (user closed the tab, walked away) stops burning the GPU. The
+    # client re-spawns the worker from disk-cached progress on its next click,
+    # so abandoning is cheap. ``0`` disables idle-abandon (workers always run
+    # to completion regardless of who's watching).
+    idle_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("IDLE_TIMEOUT_SECONDS", 30.0)
+    )
+    # Gap between SSE keep-alive comments on an otherwise-quiet stream. Keeps
+    # proxies and the browser from treating a long processing pause (e.g. a
+    # slow probe + download with no chunk events) as a dead connection.
+    sse_keepalive_seconds: float = field(
+        default_factory=lambda: _env_float("SSE_KEEPALIVE_SECONDS", 15.0)
+    )
+    # Interval for the in-memory GC pass that drops JobStatus entries whose
+    # disk cache has already been swept away. Runs on its own daemon thread
+    # alongside the disk TTL sweep, keying in-memory lifetime to the on-disk
+    # TTL so server memory never outlives the files it describes. ``0``
+    # disables it.
+    memory_gc_interval_seconds: float = field(
+        default_factory=lambda: _env_float("MEMORY_GC_INTERVAL_SECONDS", 3600.0)
+    )
+
 
 SETTINGS = Settings()
