@@ -22,7 +22,6 @@
   window.__nomusicLoaded = true;
 
   const DEFAULT_BACKEND = "http://127.0.0.1:8723";
-  const STATUS_POLL_MS = 500;
   const SYNC_TOLERANCE_S = 0.08;
   const SYNC_CHECK_MS = 250;
 
@@ -84,8 +83,9 @@
       this.chunks = new Map();
       this.activeSources = new Set();
       this.fetchedIdx = new Set();
-      this.pollAbort = null;
-      this.statusTimer = null;
+      // SSE stream of backend status (replaces /status polling). Opened in
+      // start(); closed in dispose() and when a terminal state arrives.
+      this.eventSource = null;
       this.syncTimer = null;
       this.bufferTimer = null;
       this.disposed = false;
@@ -95,10 +95,10 @@
       // chunk for the current timecode isn't on disk yet. We track this so
       // a manual pause stays paused but a buffering pause auto-resumes.
       this._pausedByUs = false;
-      // Flipped true once pollLoop exits (state == ready/error). Tells
-      // _resumeAfterBuffer that no future poll will repaint the label,
-      // so it has to restore "nomusic on" itself.
-      this._pollingEnded = false;
+      // Flipped true once the SSE stream ends (state == ready/error, or the
+      // server closed it). Tells _resumeAfterBuffer that no future status
+      // event will repaint the label, so it has to restore "nomusic on".
+      this._streamEnded = false;
       // Debounce timer for the /prioritize POST on seek so scrubbing a
       // timeline doesn't fire one request per intermediate frame.
       this._prioritizeTimer = null;
@@ -184,7 +184,11 @@
         chunkSeconds: this.chunkSeconds,
       });
       this._sendPrioritizeHint();
-      this.pollLoop();
+      // Open the status stream now — after audioCtx + capabilities exist, so
+      // the first event (especially a cached replay's immediate terminal
+      // event) can decode chunks with the right stride. This is still within
+      // a few hundred ms of /process, far inside the backend's idle window.
+      this._openEventStream();
       this.startSyncMonitor();
       this.startBufferMonitor();
     }
@@ -211,51 +215,76 @@
       return resp.json();
     }
 
-    async pollLoop() {
+    /** Subscribe to the backend's SSE status stream. EventSource handles
+     *  reconnection on transient network drops on its own; the backend
+     *  returns 204 for an unknown job, which drives readyState to CLOSED and
+     *  stops the reconnect loop. */
+    _openEventStream() {
       if (this.disposed) return;
-      try {
-        const resp = await fetch(
-          `${settings.backendUrl}/status/${this.jobId}`,
-          { cache: "no-store" },
-        );
-        if (!resp.ok) throw new Error(`status ${resp.status}`);
-        const status = await resp.json();
-        this.totalChunks = status.total_chunks || this.totalChunks;
-        // Always reflect the backend phase in the label, even while we're
-        // paused for buffering — the pulsing icon + paused video already
-        // convey "waiting", and the phase label is more useful content.
-        this.button.showStatus(status);
-
-        if (status.state === "error") {
-          this._pollingEnded = true;
-          this.dispose({ preserveButtonState: true });
+      this.eventSource = new EventSource(
+        `${settings.backendUrl}/events/${this.jobId}`,
+      );
+      this.eventSource.onmessage = (e) => {
+        let payload;
+        try {
+          payload = JSON.parse(e.data);
+        } catch (err) {
+          console.warn("[nomusic] bad SSE payload", err);
           return;
         }
-
-        // Fetch any newly-ready chunk in parallel. With seek-driven
-        // reordering, ready chunks are no longer contiguous from 0, so
-        // we iterate the explicit ``ready_chunks`` set the backend sends.
-        // Each chunk knows its own play_start so order doesn't matter.
-        const readyChunks = Array.isArray(status.ready_chunks)
-          ? status.ready_chunks
-          : [];
-        const fetches = [];
-        for (const i of readyChunks) {
-          if (!this.fetchedIdx.has(i)) {
-            this.fetchedIdx.add(i);
-            fetches.push(this.fetchAndQueueChunk(i));
-          }
+        this.handleStatus(payload);
+      };
+      this.eventSource.onerror = () => {
+        // A 204 (unknown job) or our own .close() on a terminal state puts
+        // readyState at CLOSED — there's no more stream to wait on. A
+        // transient drop instead sits in CONNECTING while EventSource retries,
+        // so we leave _streamEnded alone in that case.
+        if (
+          this.eventSource &&
+          this.eventSource.readyState === EventSource.CLOSED
+        ) {
+          this._streamEnded = true;
         }
-        await Promise.all(fetches);
+      };
+    }
 
-        if (status.state === "ready") {
-          this._pollingEnded = true;
-          return; // stop polling
-        }
-      } catch (err) {
-        console.warn("[nomusic] poll failed", err);
+    /** Apply one status snapshot (initial or pushed). Mirrors what the old
+     *  poll loop did per tick: repaint the label, fetch any newly-ready
+     *  chunks, and tear down on a terminal state. */
+    handleStatus(status) {
+      if (this.disposed) return;
+      this.totalChunks = status.total_chunks || this.totalChunks;
+      // Always reflect the backend phase in the label, even while we're
+      // paused for buffering — the pulsing icon + paused video already
+      // convey "waiting", and the phase label is more useful content.
+      this.button.showStatus(status);
+
+      if (status.state === "error") {
+        this._streamEnded = true;
+        if (this.eventSource) this.eventSource.close();
+        this.dispose({ preserveButtonState: true });
+        return;
       }
-      this.statusTimer = setTimeout(() => this.pollLoop(), STATUS_POLL_MS);
+
+      // Fetch any newly-ready chunk. With seek-driven reordering, ready
+      // chunks are no longer contiguous from 0, so we iterate the explicit
+      // ``ready_chunks`` set the backend sends. Each chunk knows its own
+      // play_start, so order doesn't matter. fetchedIdx dedups across the
+      // repeated snapshots SSE delivers.
+      const readyChunks = Array.isArray(status.ready_chunks)
+        ? status.ready_chunks
+        : [];
+      for (const i of readyChunks) {
+        if (!this.fetchedIdx.has(i)) {
+          this.fetchedIdx.add(i);
+          this.fetchAndQueueChunk(i);
+        }
+      }
+
+      if (status.state === "ready") {
+        this._streamEnded = true;
+        if (this.eventSource) this.eventSource.close();
+      }
     }
 
     async fetchAndQueueChunk(idx) {
@@ -410,10 +439,10 @@
         currentTime: this.video.currentTime,
         chunk: this._chunkIdxForTime(this.video.currentTime),
       });
-      // If polling is still active, the next status tick will overwrite the
-      // "Buffering" label naturally. If polling has ended (state was ready
-      // or error) we have to restore the active label ourselves.
-      if (this._pollingEnded && this.button.el.dataset.state === "working") {
+      // While the SSE stream is live, the next status event overwrites the
+      // "Buffering" label naturally. Once the stream has ended (state was
+      // ready or error) we have to restore the active label ourselves.
+      if (this._streamEnded && this.button.el.dataset.state === "working") {
         this.button.showStatus({ state: "ready" });
       }
       try {
@@ -428,14 +457,14 @@
 
     /** After the user seeks, ask the backend to process the chunk at the
      *  new position next (then onward, then loop back). Debounced so a
-     *  scrub doesn't generate dozens of POSTs. No-op once polling has
+     *  scrub doesn't generate dozens of POSTs. No-op once the stream has
      *  ended because the worker is already done. */
     _sendPrioritizeHint() {
-      if (this.disposed || this._pollingEnded || !this.jobId) return;
+      if (this.disposed || this._streamEnded || !this.jobId) return;
       if (this._prioritizeTimer) clearTimeout(this._prioritizeTimer);
       this._prioritizeTimer = setTimeout(() => {
         this._prioritizeTimer = null;
-        if (this.disposed || this._pollingEnded || !this.jobId) return;
+        if (this.disposed || this._streamEnded || !this.jobId) return;
         const fromChunk = this._chunkIdxForTime(this.video.currentTime);
         dlog("prioritize POST", { fromChunk, currentTime: this.video.currentTime });
         fetch(`${settings.backendUrl}/process/${this.jobId}/prioritize`, {
@@ -751,7 +780,10 @@
       this.disposed = true;
       this.detachVideoListeners();
       this.stopAll();
-      if (this.statusTimer) clearTimeout(this.statusTimer);
+      if (this.eventSource) {
+        this.eventSource.close();
+        this.eventSource = null;
+      }
       if (this.syncTimer) clearTimeout(this.syncTimer);
       if (this.bufferTimer) clearTimeout(this.bufferTimer);
       if (this._prioritizeTimer) clearTimeout(this._prioritizeTimer);

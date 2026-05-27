@@ -12,6 +12,7 @@ rather than fighting for the GPU.
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import logging
 import threading
@@ -130,9 +131,51 @@ class JobRegistry:
         # If /prioritize arrives before the control exists (job is still
         # probing/downloading), stash the hint here and apply on creation.
         self._pending_priority: dict[str, int] = {}
+        # SSE bookkeeping. ``_subscribers`` maps a job key to the live
+        # asyncio.Queues feeding each open /events stream; the worker thread
+        # pushes status snapshots onto them via the event loop.
+        # ``_last_disconnect_at`` records when a job's last subscriber dropped
+        # off, which the idle-abandon timer reads. ``_loop`` is the running
+        # asyncio loop, captured at startup so a worker thread can hand work
+        # back to it safely.
+        self._subscribers: dict[str, list[asyncio.Queue]] = {}
+        self._last_disconnect_at: dict[str, float] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._lock = threading.Lock()
         # One job runs at a time on the engine; further jobs block here.
         self._gpu_lock = threading.Lock()
+
+    # -- SSE subscription ----------------------------------------------------
+
+    def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Capture the server's event loop so worker threads can schedule
+        queue writes onto it. Called once from the FastAPI lifespan startup."""
+        self._loop = loop
+
+    def subscribe(self, key: str) -> asyncio.Queue:
+        """Register an /events stream for ``key`` and return its queue.
+
+        Clearing ``_last_disconnect_at`` here means a returning viewer resets
+        the idle clock the instant their stream opens."""
+        q: asyncio.Queue = asyncio.Queue()
+        with self._lock:
+            self._subscribers.setdefault(key, []).append(q)
+            self._last_disconnect_at.pop(key, None)
+        return q
+
+    def unsubscribe(self, key: str, q: asyncio.Queue) -> None:
+        """Drop one stream's queue. When the last subscriber for a still-live
+        job leaves, stamp the disconnect time so the idle timer can start
+        counting. We only stamp when the job is still in ``_jobs`` — there's
+        no point timing out a job that already finished."""
+        with self._lock:
+            subs = self._subscribers.get(key)
+            if not subs:
+                return
+            if q in subs:
+                subs.remove(q)
+            if not subs and key in self._jobs:
+                self._last_disconnect_at[key] = time.time()
 
     # -- public --------------------------------------------------------------
 
@@ -251,6 +294,8 @@ class JobRegistry:
                 if key in self._threads:
                     continue  # a fresh submit spawned a worker since we looked
                 if self._jobs.pop(key, None) is not None:
+                    self._subscribers.pop(key, None)
+                    self._last_disconnect_at.pop(key, None)
                     dropped += 1
         return dropped
 
@@ -318,6 +363,13 @@ class JobRegistry:
                 self._controls.pop(key, None)
                 self._pending_priority.pop(key, None)
                 self._threads.pop(key, None)
+                self._subscribers.pop(key, None)
+                self._last_disconnect_at.pop(key, None)
+                # The terminal _update(READY/ERROR) above already enqueued its
+                # snapshot to every open stream, so dropping _subscribers here
+                # loses nothing; each stream still drains and closes itself. A
+                # stream that opens after this sees the terminal state from
+                # disk and short-circuits without subscribing.
 
     def _enter_phase(
         self,
@@ -446,6 +498,8 @@ class JobRegistry:
     # -- internals -----------------------------------------------------------
 
     def _update(self, key: str, **fields) -> None:
+        snapshot: dict | None = None
+        subs: list[asyncio.Queue] = []
         with self._lock:
             status = self._jobs.get(key)
             if status is None:
@@ -453,3 +507,14 @@ class JobRegistry:
             for name, value in fields.items():
                 setattr(status, name, value)
             status.updated_at = time.time()
+            # Snapshot inside the lock and hand the immutable dict — not the
+            # live JobStatus — to subscribers, so the worker can keep mutating
+            # status while an SSE coroutine serializes a past state.
+            subs = list(self._subscribers.get(key, []))
+            if subs:
+                snapshot = status.to_dict()
+        # call_soon_threadsafe hops from this worker thread to the event loop,
+        # which is the only safe way to touch an asyncio.Queue from off-loop.
+        if snapshot is not None and self._loop is not None:
+            for q in subs:
+                self._loop.call_soon_threadsafe(q.put_nowait, snapshot)

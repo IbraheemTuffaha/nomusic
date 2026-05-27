@@ -7,15 +7,19 @@ Endpoints:
   GET  /capabilities
   POST /process              {url, model?, keep_stems?} -> {job_id, ...}
   GET  /status/{job_id}      -> JobStatus
+  GET  /events/{job_id}      -> text/event-stream (SSE status updates)
   GET  /chunk/{job_id}/{idx} -> audio/wav (404 if not yet ready)
   GET  /audio/{job_id}       -> audio/wav (the concatenated full track)
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import sys
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -24,9 +28,9 @@ _BACKEND_DIR = Path(__file__).resolve().parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from fastapi import FastAPI, HTTPException  # noqa: E402
+from fastapi import FastAPI, HTTPException, Request, Response  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import FileResponse  # noqa: E402
+from fastapi.responses import FileResponse, StreamingResponse  # noqa: E402
 from pydantic import BaseModel, Field, field_validator  # noqa: E402
 
 from config import SETTINGS  # noqa: E402
@@ -124,8 +128,22 @@ def _start_memory_gc(registry: JobRegistry) -> None:
     t.start()
 
 
+# SSE responses must not be buffered: ``no-cache`` stops the browser caching
+# the stream, ``X-Accel-Buffering: no`` tells nginx-style proxies (relevant
+# once this runs behind a real server) to flush each event immediately.
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Capture the running event loop once at startup. Worker threads use it
+    # (via call_soon_threadsafe) to push status snapshots onto SSE queues.
+    app.state.registry.attach_loop(asyncio.get_running_loop())
+    yield
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="nomusic", version="0.1.0")
+    app = FastAPI(title="nomusic", version="0.2.0", lifespan=lifespan)
 
     # ``allow_private_network=True`` opts into Chrome's Private Network
     # Access flow: a fetch from a public origin (youtube.com) to a private
@@ -225,6 +243,67 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown job_id")
         return status.to_dict()
 
+    @app.get("/events/{job_id}")
+    async def events(job_id: str, request: Request):
+        """Server-Sent Events stream of a job's status.
+
+        Replaces the extension's old /status polling: the client opens one
+        EventSource and receives a snapshot on connect plus a push on every
+        state change, ending with a terminal ``ready``/``error`` event.
+
+        Three response shapes:
+          * 204 No Content for an unknown job — per the SSE spec this tells
+            EventSource to stop reconnecting (vs. a 404, which it would retry).
+          * a single-event stream for a job that's already terminal (e.g. a
+            fully-cached replay) — no subscription, so nothing to leak.
+          * a live subscription for an in-flight job.
+        """
+        initial = registry.get(job_id)
+        if initial is None:
+            return Response(status_code=204)
+
+        if initial.state.value in ("ready", "error"):
+            payload = json.dumps(initial.to_dict())
+
+            async def one_shot():
+                yield f"data: {payload}\n\n"
+
+            return StreamingResponse(
+                one_shot(), media_type="text/event-stream", headers=_SSE_HEADERS
+            )
+
+        queue = registry.subscribe(job_id)
+
+        async def stream():
+            try:
+                # Emit the current state right away so the client paints
+                # without waiting for the next change. Re-read after subscribe
+                # to close the gap where the job finished mid-handshake.
+                cur = registry.get(job_id)
+                if cur is not None:
+                    yield f"data: {json.dumps(cur.to_dict())}\n\n"
+                    if cur.state.value in ("ready", "error"):
+                        return
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    try:
+                        update = await asyncio.wait_for(
+                            queue.get(), timeout=SETTINGS.sse_keepalive_seconds
+                        )
+                    except asyncio.TimeoutError:
+                        yield ":\n\n"  # keep-alive comment; ignored by EventSource
+                        continue
+                    yield f"data: {json.dumps(update)}\n\n"
+                    if update.get("state") in ("ready", "error"):
+                        return
+            finally:
+                registry.unsubscribe(job_id, queue)
+
+        return StreamingResponse(
+            stream(), media_type="text/event-stream", headers=_SSE_HEADERS
+        )
+
     @app.get("/chunk/{job_id}/{chunk_idx}")
     def chunk(job_id: str, chunk_idx: int) -> FileResponse:
         meta = cache.load_meta(job_id)
@@ -257,8 +336,12 @@ def create_app() -> FastAPI:
     def cache_clear() -> dict:
         # Best-effort: also drop in-memory job entries so a freshly cleared
         # cache doesn't surface stale "ready" status on the next /status call.
+        # Drain the SSE bookkeeping too; any open stream blocks harmlessly on
+        # its now-orphaned queue until its next keep-alive write fails.
         with registry._lock:  # internal lock; small API and same process
             registry._jobs.clear()
+            registry._subscribers.clear()
+            registry._last_disconnect_at.clear()
         freed = cache.clear_all()
         return {"deleted_bytes": freed}
 
