@@ -29,16 +29,11 @@
   overflow: visible; /* dismiss × sits slightly outside the pill */
 }
 
-/* Only hover lifts the pill out of its faded state. Focus is deliberately
-   excluded so the button doesn't get stuck at full opacity after a click
-   (some browsers leave the element focused until the next user click). */
+/* The pill stays faded in every state once the mouse leaves; only hover lifts
+   it to full opacity. Focus is deliberately excluded so it doesn't get stuck
+   at full opacity after a click (some browsers leave the element focused until
+   the next user click). */
 .nomusic-btn:hover { opacity: 1; }
-/* States that need the user's attention stay visible at rest. 'active'
-   (nomusic on, all good) does *not* — once it's working there's no
-   reason for the pill to sit loud on top of the video. */
-.nomusic-btn[data-state="working"],
-.nomusic-btn[data-state="paused"],
-.nomusic-btn[data-state="error"] { opacity: 1; }
 
 .nomusic-btn:hover { background: rgba(28, 30, 38, 0.88); }
 .nomusic-btn:active { transform: translateY(1px); }
