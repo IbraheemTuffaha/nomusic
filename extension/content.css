@@ -102,11 +102,14 @@
   transform: scale(1.08);
 }
 
-/* Subtle fill that grows behind the text as work progresses. */
+/* Subtle fill that grows behind the text as work progresses. Inherits the
+   pill's radius so its corners stay inside the rounded shape (we can't clip
+   with overflow:hidden on the pill — that would cut off the dismiss ×). */
 .nomusic-btn__fill {
   position: absolute;
   inset: 0;
   width: 0%;
+  border-radius: inherit;
   background: linear-gradient(
     90deg,
     rgba(255, 255, 255, 0.10),

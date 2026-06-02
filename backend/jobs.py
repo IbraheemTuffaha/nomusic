@@ -503,9 +503,20 @@ class JobRegistry:
             self._controls[key].prioritize(hint)
 
     def _on_download_progress(self, key: str, fraction: float | None) -> None:
-        # yt-dlp emits 1.0 on completion; we stay in DOWNLOADING until the
-        # first separation chunk fires, so the UI doesn't briefly snap to
-        # 0% on the phase boundary.
+        # In progressive mode the download runs concurrently with separation,
+        # so download ticks ("Fetching", download %) and separation ticks
+        # ("Removing", chunk %) interleave. Once separation has started, keep
+        # the UI on "Removing" — flipping back to "Fetching" every download
+        # tick just flickers the label and bounces the percentage between two
+        # different scales. The download still proceeds in the background.
+        with self._lock:
+            status = self._jobs.get(key)
+            if status is not None and status.state in (
+                JobState.PROCESSING,
+                JobState.READY,
+                JobState.ERROR,
+            ):
+                return
         self._update(key, state=JobState.DOWNLOADING, phase="downloading",
                      phase_label=_PHASE_LABELS["downloading"],
                      phase_progress=fraction)
