@@ -392,6 +392,9 @@ class JobRegistry:
                         abort_check=lambda: self._raise_if_abandoned(
                             key, SETTINGS.idle_timeout_seconds
                         ),
+                        on_wait_for_download=lambda frac: self._on_wait_for_download(
+                            key, frac
+                        ),
                     )
                 meta = self.cache.load_meta(key)
                 chunks_ready = len(meta.chunks_ready) if meta else 0
@@ -517,6 +520,17 @@ class JobRegistry:
                 JobState.ERROR,
             ):
                 return
+        self._update(key, state=JobState.DOWNLOADING, phase="downloading",
+                     phase_label=_PHASE_LABELS["downloading"],
+                     phase_progress=fraction)
+
+    def _on_wait_for_download(self, key: str, fraction: float | None) -> None:
+        # Separation is blocked waiting for the download to reach this chunk —
+        # the user seeked past the downloaded point, or the download is slower
+        # than separation. This is the one case where flipping back to
+        # "Fetching" is right: playback is genuinely gated on the download, not
+        # on separation. Unlike _on_download_progress this isn't suppressed
+        # during PROCESSING, because here the download IS the bottleneck.
         self._update(key, state=JobState.DOWNLOADING, phase="downloading",
                      phase_label=_PHASE_LABELS["downloading"],
                      phase_progress=fraction)

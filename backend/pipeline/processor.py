@@ -244,14 +244,31 @@ class _ProgressiveSource:
             raise RuntimeError("progressive download finished without a file")
         return self._final
 
-    def source_for(self, plan, overlap: float, abort_check=None) -> Path:
+    def source_for(self, plan, overlap: float, abort_check=None, on_wait=None) -> Path:
         """Block until ``plan``'s download window is on disk, then return the
-        file to slice (the partial mid-download, or the final file)."""
+        file to slice (the partial mid-download, or the final file).
+
+        While blocked (the chunk's bytes aren't downloaded yet — e.g. the user
+        seeked past the downloaded point), ``on_wait`` is called with the
+        current download fraction so the UI can show "Fetching" instead of a
+        frozen "Removing". Not called when the bytes are already present.
+        """
         needed = plan.end + overlap + _PROGRESSIVE_MARGIN_SECONDS
+        waits = 0
         while not self._done.is_set() and self.available_seconds() < needed:
             self.raise_if_error()
             if abort_check:
                 abort_check()
+            waits += 1
+            # Only flip the UI to "Fetching" once we've actually been blocked a
+            # moment (~0.3s), so a chunk whose bytes are basically already here
+            # doesn't cause a one-frame flash.
+            if on_wait and waits >= 2:
+                on_wait(
+                    self.available_seconds() / self._duration
+                    if self._duration
+                    else None
+                )
             time.sleep(_PROGRESSIVE_POLL_SECONDS)
         self.raise_if_error()
         path = self.current_path()
@@ -370,6 +387,7 @@ class Processor:
         on_download_progress: DownloadProgressCb | None = None,
         next_chunk_provider: NextChunkProvider | None = None,
         abort_check: Callable[[], None] | None = None,
+        on_wait_for_download: Callable[[float | None], None] | None = None,
     ) -> str:
         """Run the full chunked pipeline. Returns the cache key.
 
@@ -423,7 +441,7 @@ class Processor:
             )
             dl.start()
             source_for = lambda plan: dl.source_for(
-                plan, self.chunk_overlap_seconds, abort_check
+                plan, self.chunk_overlap_seconds, abort_check, on_wait_for_download
             )
         elif fetcher is not None:
             # First run: download from the session that already extracted info.
