@@ -171,12 +171,12 @@ You only do this once. The extension stays installed.
 4. Click it.
 5. The first time you click on a video, you'll see status messages
    ticking through:
-   - **Inspecting video** (a couple of seconds)
-   - **Downloading video 45%**
-   - **Removing music 23%**
-6. As soon as the first 10 seconds are processed, the video plays on
-   its own without music. The video pauses briefly any time it's
-   waiting for more audio.
+   - **Preparing** (a couple of seconds)
+   - **Fetching 45%**
+   - **Removing 23%**
+6. As soon as the first chunk is processed, the video plays on its own
+   without music — it doesn't wait for the whole thing to download. The
+   video pauses briefly any time it's waiting for more audio.
 7. Click the button again any time to turn nomusic off and hear the
    original audio.
 
@@ -227,11 +227,12 @@ some music can come through. Uncheck it for stronger removal.
 Click the nomusic button to turn it off, then click it again. It
 resyncs.
 
-**A long video is taking forever to start**
-For a 3-hour video, the helper has to download the full audio (about
-30-60 seconds) before separation begins. After that the audio should
-start playing. You can pause and come back later — nomusic remembers
-where it left off and only does each chunk once.
+**A long video is slow to start**
+The first few seconds go to looking up the video and starting the
+download. Separation then begins on the early part while the rest keeps
+downloading, so playback starts well before the whole file is fetched.
+You can pause and come back later — nomusic remembers where it left off
+and only does each chunk once.
 
 **I closed Terminal by accident**
 That stops the helper. Open Terminal again, run Step 5, and you're
