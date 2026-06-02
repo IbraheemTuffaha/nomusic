@@ -119,13 +119,15 @@ class Settings:
     memory_gc_interval_seconds: float = field(
         default_factory=lambda: _env_float("MEMORY_GC_INTERVAL_SECONDS", 3600.0)
     )
-    # Experimental: start separating early chunks from the partially-downloaded
-    # source instead of waiting for the whole download. Each chunk is sliced
-    # only once enough of the timeline is on disk; if the partial container
-    # isn't decodable it transparently falls back to waiting for the full file.
-    # Off by default while it's validated across sites/formats.
+    # Start separating early chunks from the partially-downloaded source
+    # instead of waiting for the whole download, so playback begins sooner.
+    # Each chunk is sliced only once enough of the timeline is on disk; if the
+    # partial container isn't decodable (some sites/formats) it transparently
+    # falls back to waiting for the full file, so the worst case is just the
+    # old download-once behavior. On by default; set NOMUSIC_PROGRESSIVE=0 to
+    # force download-once.
     progressive_download: bool = field(
-        default_factory=lambda: _env_bool("PROGRESSIVE", False)
+        default_factory=lambda: _env_bool("PROGRESSIVE", True)
     )
 
 

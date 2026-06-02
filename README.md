@@ -314,7 +314,7 @@ All optional, all prefixed `NOMUSIC_`:
 | `NOMUSIC_SSE_KEEPALIVE_SECONDS` | `15` | Gap between SSE keep-alive comments on a quiet status stream |
 | `NOMUSIC_MEMORY_GC_INTERVAL_SECONDS` | `3600` | How often the in-memory job map is reclaimed for jobs whose disk cache is gone (0 disables) |
 | `NOMUSIC_DOWNLOAD_RATELIMIT` | unset | Artificial download cap for testing slow links — raw bytes/sec or `K`/`M` suffix (e.g. `200K`) |
-| `NOMUSIC_PROGRESSIVE` | `false` | Experimental: start separating early chunks from the partial download instead of waiting for the whole file (falls back automatically if the partial isn't decodable) |
+| `NOMUSIC_PROGRESSIVE` | `true` | Start separating early chunks from the partial download instead of waiting for the whole file (falls back automatically if the partial isn't decodable); set `0` to force download-once |
 | `NOMUSIC_RELOAD` | `false` | Dev only: watch `backend/*.py` and auto-restart on save (`1`/`true`) |
 | `NOMUSIC_JS_RUNTIME` | auto-detected | Path to a JS runtime (deno/node/bun) for yt-dlp |
 
