@@ -7,13 +7,13 @@
   z-index: 2147483600;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   padding: 6px 12px 6px 10px;
   border-radius: 999px;
   border: none;
   background: rgba(15, 17, 22, 0.78);
   color: #f5f6f8;
-  font: 600 12px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+  font: 600 11px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
     sans-serif;
   letter-spacing: 0.01em;
   cursor: pointer;
@@ -158,10 +158,11 @@
 }
 
 .nomusic-btn__pct {
+  /* tabular-nums keeps the digits from jiggling as the number changes; no
+     reserved min-width, so the % sits right after the label instead of being
+     pushed to a far right-aligned column. */
   font-variant-numeric: tabular-nums;
   opacity: 0.85;
-  min-width: 2.5em;
-  text-align: right;
 }
 
 .nomusic-btn__pct:empty {
