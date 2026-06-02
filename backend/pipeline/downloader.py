@@ -25,44 +25,11 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
-
-# yt-dlp's metadata extraction runs YouTube's JS challenge (3-6s). probe() and
-# download_source() are otherwise two separate yt-dlp calls that would each pay
-# it. We stash probe()'s raw info dict here so the subsequent download can
-# reuse the already-resolved formats instead of extracting a second time. The
-# entry is consumed once and TTL-bounded well under YouTube's media-URL expiry
-# (~6h), so a download always uses fresh URLs.
-_PROBE_CACHE: dict[str, tuple[float, dict]] = {}
-_PROBE_CACHE_LOCK = threading.Lock()
-_PROBE_CACHE_TTL_SECONDS = 1800.0
-
-
-def _remember_info(url: str, info: dict) -> None:
-    with _PROBE_CACHE_LOCK:
-        now = time.monotonic()
-        stale = [k for k, (t, _) in _PROBE_CACHE.items() if now - t > _PROBE_CACHE_TTL_SECONDS]
-        for k in stale:
-            _PROBE_CACHE.pop(k, None)
-        _PROBE_CACHE[url] = (now, info)
-
-
-def _take_info(url: str) -> dict | None:
-    """Pop the cached probe info for ``url`` if it's still fresh."""
-    with _PROBE_CACHE_LOCK:
-        entry = _PROBE_CACHE.pop(url, None)
-    if entry is None:
-        return None
-    stamped, info = entry
-    if time.monotonic() - stamped > _PROBE_CACHE_TTL_SECONDS:
-        return None
-    return info
 
 # WAV is large but lossless and trivial to load with soundfile. We're operating
 # on short ranges (~30 s) so the size is fine, and any other codec would force
@@ -155,10 +122,6 @@ def probe(url: str) -> VideoMetadata:
             "live streams and unbounded media are not supported yet."
         )
 
-    # Hand the resolved formats to the imminent download so it doesn't extract
-    # (and re-run the JS challenge) all over again.
-    _remember_info(url, info)
-
     return VideoMetadata(
         id=str(info.get("id", "unknown")),
         title=str(info.get("title", "untitled")),
@@ -244,23 +207,8 @@ def download_source(
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
     log.info("Downloading source audio for %s -> %s", url, out_dir)
-    cached_info = _take_info(url)
     with YoutubeDL(opts) as ydl:
-        if cached_info is not None:
-            try:
-                # Reuse probe()'s already-extracted result: format selection +
-                # download without a second JS-challenge extraction.
-                ydl.process_ie_result(dict(cached_info), download=True)
-            except Exception:
-                # Any version/shape mismatch: fall back to a clean extract so a
-                # download never fails just because the reuse path didn't fit.
-                log.warning(
-                    "download: reusing probe info failed; re-extracting",
-                    exc_info=True,
-                )
-                ydl.download([url])
-        else:
-            ydl.download([url])
+        ydl.download([url])
 
     final = _find_source(out_dir)
     if final is None:
