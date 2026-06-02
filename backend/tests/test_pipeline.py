@@ -85,6 +85,35 @@ def _write_tone(path: Path, *, seconds: float, sample_rate: int = 44100) -> None
     sf.write(str(path), stereo, sample_rate, subtype="PCM_16")
 
 
+def _fake_fetcher_class(source_tone: Path, duration: float = 10.0):
+    """A stand-in for downloader.SourceFetcher: extract() returns fixed
+    metadata; download() drops the pre-written tone into out_dir. Patch it onto
+    ``processor.SourceFetcher`` to exercise the first-run path without yt-dlp."""
+    from pipeline.downloader import VideoMetadata
+
+    class _FakeFetcher:
+        def __init__(self, url, out_dir):
+            self.url = url
+            self.out_dir = Path(out_dir)
+
+        def extract(self):
+            return VideoMetadata(
+                id="fake", title="Fake", duration_seconds=duration,
+                extractor="fake", webpage_url=self.url,
+            )
+
+        def download(self, progress_hook=None):
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            dst = self.out_dir / "source.wav"
+            if not dst.exists():
+                dst.write_bytes(source_tone.read_bytes())
+            if progress_hook:
+                progress_hook({"status": "finished", "downloaded_bytes": 1, "total_bytes": 1})
+            return dst
+
+    return _FakeFetcher
+
+
 def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     # Bypass yt-dlp by writing a deterministic source and intercepting
     # probe, download_source, and slice_source. ``download_source`` returns
@@ -93,32 +122,7 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     source = tmp_path / "source.wav"
     _write_tone(source, seconds=10.0)
 
-    from pipeline import downloader as dl
-    from pipeline.downloader import VideoMetadata
-
-    def fake_probe(url: str) -> VideoMetadata:
-        return VideoMetadata(
-            id="fake",
-            title="Fake video",
-            duration_seconds=10.0,
-            extractor="fake",
-            webpage_url=url,
-        )
-
-    def fake_download_source(url, out_dir, *, progress_hook=None):
-        out_dir.mkdir(parents=True, exist_ok=True)
-        dst = out_dir / "source.wav"
-        if not dst.exists():
-            dst.write_bytes(source.read_bytes())
-        if progress_hook:
-            progress_hook(
-                {
-                    "status": "finished",
-                    "downloaded_bytes": dst.stat().st_size,
-                    "total_bytes": dst.stat().st_size,
-                }
-            )
-        return dst
+    from pipeline import processor as proc
 
     def fake_slice_source(src, out_path, *, start, end):
         audio, sr = sf.read(str(src), always_2d=True, dtype="float32")
@@ -126,14 +130,9 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
         sf.write(str(out_path), slice_audio, sr, subtype="PCM_16", format="WAV")
         return out_path
 
-    monkeypatch.setattr(dl, "probe", fake_probe)
-    monkeypatch.setattr(dl, "download_source", fake_download_source)
-    monkeypatch.setattr(dl, "slice_source", fake_slice_source)
-    # Processor imports them by name from pipeline.downloader, so patch there too.
-    from pipeline import processor as proc
-
-    monkeypatch.setattr(proc, "probe", fake_probe)
-    monkeypatch.setattr(proc, "download_source", fake_download_source)
+    # First run goes through SourceFetcher; patch it (and the slicer) so no
+    # yt-dlp is touched.
+    monkeypatch.setattr(proc, "SourceFetcher", _fake_fetcher_class(source))
     monkeypatch.setattr(proc, "slice_source", fake_slice_source)
 
     cache = JobCache(tmp_path / "cache")
@@ -209,24 +208,7 @@ def test_processor_progressive_produces_correct_chunks(tmp_path, monkeypatch):
     source = tmp_path / "source.wav"
     _write_tone(source, seconds=10.0)
 
-    from pipeline import downloader as dl
     from pipeline import processor as proc
-    from pipeline.downloader import VideoMetadata
-
-    def fake_probe(url):
-        return VideoMetadata(
-            id="fake", title="Fake", duration_seconds=10.0,
-            extractor="fake", webpage_url=url,
-        )
-
-    def fake_download_source(url, out_dir, *, progress_hook=None):
-        out_dir.mkdir(parents=True, exist_ok=True)
-        dst = out_dir / "source.wav"
-        if not dst.exists():
-            dst.write_bytes(source.read_bytes())
-        if progress_hook:
-            progress_hook({"status": "finished", "downloaded_bytes": 1, "total_bytes": 1})
-        return dst
 
     def fake_slice_source(src, out_path, *, start, end):
         audio, sr = sf.read(str(src), always_2d=True, dtype="float32")
@@ -234,10 +216,10 @@ def test_processor_progressive_produces_correct_chunks(tmp_path, monkeypatch):
                  subtype="PCM_16", format="WAV")
         return out_path
 
-    for mod in (dl, proc):
-        monkeypatch.setattr(mod, "probe", fake_probe, raising=False)
-        monkeypatch.setattr(mod, "download_source", fake_download_source, raising=False)
-        monkeypatch.setattr(mod, "slice_source", fake_slice_source, raising=False)
+    # Progressive first-run downloads via SourceFetcher on a background thread;
+    # the fake reports "finished" immediately so the duration gate opens at once.
+    monkeypatch.setattr(proc, "SourceFetcher", _fake_fetcher_class(source))
+    monkeypatch.setattr(proc, "slice_source", fake_slice_source)
 
     cache = JobCache(tmp_path / "cache")
     processor = Processor(
@@ -263,10 +245,14 @@ def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
     from pipeline import processor as proc
     from pipeline.cache import CacheMeta
 
-    def boom_probe(url):
-        raise AssertionError("probe must be skipped on resume")
+    class _BoomFetcher:
+        def __init__(self, *a, **k):
+            raise AssertionError("resume must not extract/download — no fetcher")
 
-    monkeypatch.setattr(proc, "probe", boom_probe)
+    # Resume must reuse cached meta: no probe, no SourceFetcher construction.
+    monkeypatch.setattr(proc, "probe", lambda url: (_ for _ in ()).throw(
+        AssertionError("probe must be skipped on resume")))
+    monkeypatch.setattr(proc, "SourceFetcher", _BoomFetcher)
 
     cache = JobCache(tmp_path / "cache")
     processor = Processor(
@@ -299,10 +285,11 @@ def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
         ),
     )
 
-    k, meta, info, returned_plans = processor.prepare(
+    k, meta, info, returned_plans, fetcher = processor.prepare(
         "fake://video", model="fake", keep_stems=["vocals"]
     )
     assert k == key
+    assert fetcher is None  # resume path: no extraction session
     assert meta.chunks_ready == [0, 1, 2]  # not wiped
     assert info.duration_seconds == 120.0  # reused, not re-probed
     assert len(returned_plans) == len(plans)

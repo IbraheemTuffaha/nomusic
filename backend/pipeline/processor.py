@@ -36,6 +36,7 @@ from engines.base import Engine
 
 from .cache import CacheMeta, JobCache
 from .downloader import (
+    SourceFetcher,
     VideoMetadata,
     download_source,
     probe,
@@ -141,11 +142,16 @@ class _ProgressiveSource:
     caller catches the slice error and falls back to ``wait_complete``.
     """
 
-    def __init__(self, url: str, out_dir: Path, duration: float, ui_hook) -> None:
+    def __init__(
+        self, url: str, out_dir: Path, duration: float, ui_hook, fetcher=None
+    ) -> None:
         self._url = url
         self._out_dir = out_dir
         self._duration = duration
         self._ui_hook = ui_hook
+        # When set, the worker already extracted metadata in this session; the
+        # background download reuses it (no second extraction). None on resume.
+        self._fetcher = fetcher
         self._lock = threading.Lock()
         self._available = 0.0
         self._tmpfile: Optional[str] = None
@@ -199,7 +205,12 @@ class _ProgressiveSource:
 
     def _run(self) -> None:
         try:
-            final = download_source(self._url, self._out_dir, progress_hook=self._hook)
+            if self._fetcher is not None:
+                final = self._fetcher.download(progress_hook=self._hook)
+            else:
+                final = download_source(
+                    self._url, self._out_dir, progress_hook=self._hook
+                )
             with self._lock:
                 self._final = final
                 self._available = self._duration
@@ -274,8 +285,15 @@ class Processor:
         *,
         model: str,
         keep_stems: list[str],
-    ) -> tuple[str, CacheMeta, VideoMetadata, list[ChunkPlan]]:
-        """Probe the video, build/refresh the cache meta, and plan the chunks."""
+    ) -> tuple[str, CacheMeta, VideoMetadata, list[ChunkPlan], Optional[SourceFetcher]]:
+        """Probe the video, build/refresh the cache meta, and plan the chunks.
+
+        Returns ``(key, meta, info, plans, fetcher)``. ``fetcher`` is a
+        :class:`SourceFetcher` holding an open yt-dlp session that already
+        extracted ``info`` — the caller downloads from it (same session, no
+        second extraction). It's ``None`` on the resume fast-path, where the
+        duration comes from the cached meta and no extraction happened.
+        """
         key = self.cache.key(
             url,
             model,
@@ -306,9 +324,13 @@ class Processor:
                     webpage_url=url,
                 )
                 self.cache.save_meta(key, existing)
-                return key, existing, info, plans
+                return key, existing, info, plans, None
 
-        info = probe(url)
+        # First run: extract metadata in a session we'll also download from, so
+        # the JS-challenge extraction is paid once, not once here + again at
+        # download time.
+        fetcher = SourceFetcher(url, self.cache.source_dir(url))
+        info = fetcher.extract()
         plans = plan_chunks(
             info.duration_seconds,
             self.chunk_seconds,
@@ -333,7 +355,7 @@ class Processor:
                 extractor=info.extractor,
             )
         self.cache.save_meta(key, meta)
-        return key, meta, info, plans
+        return key, meta, info, plans, fetcher
 
     # -- execution -----------------------------------------------------------
 
@@ -363,7 +385,7 @@ class Processor:
         run. The provider raising is the normal abort path between chunks, but
         a long download has no chunk boundary, so this gives one there too.
         """
-        key, meta, info, plans = self.prepare(
+        key, meta, info, plans, fetcher = self.prepare(
             url, model=model, keep_stems=keep_stems
         )
         if on_probed:
@@ -397,14 +419,19 @@ class Processor:
             # Download on a background thread; ``source_for`` blocks per chunk
             # until enough of the timeline is on disk to slice it.
             dl = _ProgressiveSource(
-                url, source_dir, info.duration_seconds, _yt_hook
+                url, source_dir, info.duration_seconds, _yt_hook, fetcher=fetcher
             )
             dl.start()
             source_for = lambda plan: dl.source_for(
                 plan, self.chunk_overlap_seconds, abort_check
             )
+        elif fetcher is not None:
+            # First run: download from the session that already extracted info.
+            full = fetcher.download(progress_hook=_yt_hook)
+            source_for = lambda plan: full
         else:
-            # Download the full source up front; every chunk slices from it.
+            # Resume: download the full source up front (cached source returns
+            # immediately); every chunk slices from it.
             full = download_source(url, source_dir, progress_hook=_yt_hook)
             source_for = lambda plan: full
 
