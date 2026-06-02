@@ -895,8 +895,14 @@
       this.el.className = "nomusic-btn";
       this.el.type = "button";
       this.el.title = "Strip music (nomusic)";
+      // Progress fill lives inside a clip wrapper so it's clipped to the
+      // pill's rounded shape (the dismiss × stays outside the wrapper, so it
+      // isn't clipped).
+      this.fillClip = document.createElement("span");
+      this.fillClip.className = "nomusic-btn__clip";
       this.fill = document.createElement("span");
       this.fill.className = "nomusic-btn__fill";
+      this.fillClip.appendChild(this.fill);
       // Brand icon replaces the old colored dot as the leading visual.
       // It picks up the same pulse animation while the backend is working.
       this.icon = document.createElement("img");
@@ -925,7 +931,7 @@
         this.dismiss();
       });
       this.el.append(
-        this.fill,
+        this.fillClip,
         this.icon,
         this.label,
         this.pct,

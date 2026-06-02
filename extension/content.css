@@ -102,22 +102,34 @@
   transform: scale(1.08);
 }
 
-/* Subtle fill that grows behind the text as work progresses. Inherits the
-   pill's radius so its corners stay inside the rounded shape (we can't clip
-   with overflow:hidden on the pill — that would cut off the dismiss ×). */
-.nomusic-btn__fill {
+/* Clip wrapper for the progress fill: matches the pill's rounding and hides
+   overflow, so the fill reads as a straight-edged bar clipped to the pill
+   shape (not a rounded blob at low %). It's a separate element from the pill
+   so overflow:hidden here doesn't clip the dismiss × that sits outside. */
+.nomusic-btn__clip {
   position: absolute;
   inset: 0;
-  width: 0%;
   border-radius: inherit;
+  overflow: hidden;
+  z-index: 0;
+  pointer-events: none;
+}
+
+/* Subtle fill that grows behind the text as work progresses. Plain rectangle
+   with a straight right (progress) edge; its left/top/bottom corners are
+   clipped to the pill by .nomusic-btn__clip. */
+.nomusic-btn__fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0%;
   background: linear-gradient(
     90deg,
     rgba(255, 255, 255, 0.10),
     rgba(255, 255, 255, 0.18)
   );
   transition: width 200ms ease;
-  pointer-events: none;
-  z-index: 0;
 }
 
 .nomusic-btn__icon,
