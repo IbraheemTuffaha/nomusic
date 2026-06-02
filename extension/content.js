@@ -25,11 +25,10 @@
   const SYNC_TOLERANCE_S = 0.08;
   const SYNC_CHECK_MS = 250;
 
-  // Debug logging for seek/buffer/prioritize state transitions. Flip to
-  // ``false`` (or remove the calls) once the seek-backwards investigation
-  // is done. Browser DevTools' console filter is the easiest way to scan;
-  // every line is prefixed with [nomusic].
-  const DEBUG = true;
+  // Debug logging for seek/buffer/prioritize state transitions. Off in
+  // shipped builds; flip to ``true`` locally to trace state in DevTools
+  // (every line is prefixed with [nomusic]).
+  const DEBUG = false;
   const dlog = DEBUG
     ? (...args) => console.log("[nomusic]", ...args)
     : () => {};
@@ -86,6 +85,10 @@
       // SSE stream of backend status (replaces /status polling). Opened in
       // start(); closed in dispose() and when a terminal state arrives.
       this.eventSource = null;
+      // True when we closed the stream because the user paused (not a buffer
+      // pause). While closed, the backend sees no subscriber and starts its
+      // idle-abandon clock; we re-establish the worker + stream on play.
+      this._streamPausedClosed = false;
       this.syncTimer = null;
       this.bufferTimer = null;
       this.disposed = false;
@@ -103,8 +106,14 @@
       // timeline doesn't fire one request per intermediate frame.
       this._prioritizeTimer = null;
       this._boundHandlers = {
-        play: () => this.reschedule(),
-        pause: () => this.stopAll(),
+        play: () => {
+          this.reschedule();
+          this._onUserPlay();
+        },
+        pause: () => {
+          this.stopAll();
+          this._onUserPause();
+        },
         seeking: () => this.stopAll(),
         seeked: () => {
           dlog("seeked", {
@@ -248,6 +257,46 @@
       };
     }
 
+    /** User paused the video (not a buffer pause). Close the status stream so
+     *  the backend sees no subscriber and starts its idle-abandon countdown —
+     *  if the user stays away, the worker releases the GPU. Re-established on
+     *  play. No-op during a buffer pause: we still need chunk-ready events to
+     *  know when to resume, and a fully-processed job has no worker to idle. */
+    _onUserPause() {
+      if (this.disposed || this._pausedByUs || this._streamEnded) return;
+      if (this.eventSource) {
+        this.eventSource.close();
+        this.eventSource = null;
+      }
+      this._streamPausedClosed = true;
+      // Replace the frozen live label (e.g. "Removing music 41%") with a
+      // "Paused" signal so it's clear we've stopped, not stalled.
+      this.button.setPaused();
+    }
+
+    /** User resumed after a pause that closed the stream. Re-ensure a worker
+     *  exists (it may have been abandoned while paused; /process respawns it
+     *  from disk-cached progress) and reopen the status stream. */
+    _onUserPlay() {
+      if (this.disposed || this._streamEnded || !this._streamPausedClosed) return;
+      this._streamPausedClosed = false;
+      this._resumeProcessing();
+    }
+
+    async _resumeProcessing() {
+      try {
+        await this.requestJob();
+      } catch (_err) {
+        // Backend unreachable on resume; reopening the stream below will
+        // surface the failure (204/CLOSED) without crashing playback.
+      }
+      if (this.disposed) return;
+      if (!this.eventSource) this._openEventStream();
+      // Re-point the worker at where the user actually is, in case it was
+      // abandoned and respawned with a from-scratch chunk order.
+      this._sendPrioritizeHint();
+    }
+
     /** Apply one status snapshot (initial or pushed). Mirrors what the old
      *  poll loop did per tick: repaint the label, fetch any newly-ready
      *  chunks, and tear down on a terminal state. */
@@ -301,7 +350,9 @@
           { cache: "default" },
         );
         if (!resp.ok) {
-          this.fetchedIdx.delete(idx); // allow retry on next poll
+          // Drop the dedup mark so the next SSE snapshot that re-lists this
+          // chunk in ready_chunks re-attempts the fetch.
+          this.fetchedIdx.delete(idx);
           return;
         }
         const buf = await resp.arrayBuffer();
@@ -944,6 +995,16 @@
       this.label.textContent = "Buffering";
       this.pct.textContent = "";
       this.fill.style.width = "0%";
+    }
+
+    /** User paused while the backend was still working. Distinct from
+     *  "Buffering" (which auto-resumes): this means we've let the worker go
+     *  idle. Keeps the current % + fill so the frozen progress is visible,
+     *  and the non-"working" state stops the icon pulse. */
+    setPaused() {
+      this._clearErrorRevert();
+      this.el.dataset.state = "paused";
+      this.label.textContent = "Paused";
     }
 
     setError(label) {

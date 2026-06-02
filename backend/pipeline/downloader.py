@@ -71,6 +71,27 @@ def _common_opts() -> dict[str, Any]:
     return opts
 
 
+def _download_ratelimit() -> float | None:
+    """Optional artificial download cap (bytes/sec) for testing slow links.
+
+    ``NOMUSIC_DOWNLOAD_RATELIMIT`` accepts a raw byte/sec number or a
+    ``K``/``M`` suffix (e.g. ``200K``, ``1.5M``). Unset/invalid → no cap. Maps
+    straight to yt-dlp's ``ratelimit``."""
+    raw = os.environ.get("NOMUSIC_DOWNLOAD_RATELIMIT")
+    if not raw:
+        return None
+    raw = raw.strip().upper()
+    mult = 1
+    if raw.endswith("K"):
+        mult, raw = 1024, raw[:-1]
+    elif raw.endswith("M"):
+        mult, raw = 1024 * 1024, raw[:-1]
+    try:
+        return float(raw) * mult
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True)
 class VideoMetadata:
     id: str
@@ -164,10 +185,25 @@ def download_source(
     template = str(out_dir / f"{_SOURCE_STEM}.%(ext)s")
     opts: dict[str, Any] = {
         **_common_opts(),
-        "format": "bestaudio/best",
+        # Cap at ~128 kbps audio: it's effectively transparent for source
+        # separation (demucs works on the decoded waveform) and trims download
+        # time on long videos / slow links. Falls back to the best available
+        # audio, then to best overall, for sources without a 128k rendition.
+        "format": "bestaudio[abr<=128]/bestaudio/best",
         "outtmpl": template,
         "overwrites": True,
+        # Self-heal transient network hiccups instead of failing the whole job
+        # on a single timeout (the worker would otherwise drop to ERROR and the
+        # user would have to re-click). yt-dlp retries the request/fragments
+        # internally; socket_timeout bounds a stalled read.
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
     }
+    ratelimit = _download_ratelimit()
+    if ratelimit:
+        log.info("Throttling download to %.0f bytes/sec (test mode)", ratelimit)
+        opts["ratelimit"] = ratelimit
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
     log.info("Downloading source audio for %s -> %s", url, out_dir)

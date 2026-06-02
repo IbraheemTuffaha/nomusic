@@ -128,10 +128,37 @@ def _start_memory_gc(registry: JobRegistry) -> None:
     t.start()
 
 
+def _start_engine_warmup(engine) -> None:
+    """Load the default model weights on a background thread at startup.
+
+    The first separation otherwise pays a one-off model-load cost (weights
+    fetch + MPS init, several seconds) on the user's first chunk. Warming up
+    in the background means that cost is usually already paid by the time the
+    first job reaches its separation phase, so first-chunk latency matches
+    steady state. Best-effort: a failure here just falls back to lazy loading.
+    """
+
+    def _loop() -> None:
+        try:
+            engine.warmup()
+            log.info("Engine warmup complete")
+        except Exception:
+            log.exception("Engine warmup failed; will load lazily on first job")
+
+    t = threading.Thread(target=_loop, name="nomusic-engine-warmup", daemon=True)
+    t.start()
+
+
 # SSE responses must not be buffered: ``no-cache`` stops the browser caching
 # the stream, ``X-Accel-Buffering: no`` tells nginx-style proxies (relevant
 # once this runs behind a real server) to flush each event immediately.
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+# How often a quiet stream wakes to check whether the client has disconnected.
+# Kept well below the keep-alive gap so unsubscribe() — which starts the
+# idle-abandon clock — fires within ~1s of a pause/tab-close, rather than
+# lagging up to a full keep-alive interval.
+_SSE_DISCONNECT_POLL_SECONDS = 1.0
 
 
 @asynccontextmanager
@@ -178,6 +205,7 @@ def create_app() -> FastAPI:
 
     _start_cache_ttl_sweeper(cache)
     _start_memory_gc(registry)
+    _start_engine_warmup(engine)
 
     @app.get("/healthz")
     def healthz() -> dict:
@@ -284,16 +312,31 @@ def create_app() -> FastAPI:
                     yield f"data: {json.dumps(cur.to_dict())}\n\n"
                     if cur.state.value in ("ready", "error"):
                         return
+                # Poll for disconnect every _SSE_DISCONNECT_POLL_SECONDS but
+                # only emit a keep-alive comment every sse_keepalive_seconds, so
+                # a paused/closed client is noticed promptly (starting the idle
+                # clock) without spamming the wire with keep-alives.
+                polls_per_keepalive = max(
+                    1,
+                    round(
+                        SETTINGS.sse_keepalive_seconds / _SSE_DISCONNECT_POLL_SECONDS
+                    ),
+                )
+                idle_polls = 0
                 while True:
                     if await request.is_disconnected():
                         return
                     try:
                         update = await asyncio.wait_for(
-                            queue.get(), timeout=SETTINGS.sse_keepalive_seconds
+                            queue.get(), timeout=_SSE_DISCONNECT_POLL_SECONDS
                         )
                     except asyncio.TimeoutError:
-                        yield ":\n\n"  # keep-alive comment; ignored by EventSource
+                        idle_polls += 1
+                        if idle_polls >= polls_per_keepalive:
+                            idle_polls = 0
+                            yield ":\n\n"  # keep-alive comment; ignored by EventSource
                         continue
+                    idle_polls = 0
                     yield f"data: {json.dumps(update)}\n\n"
                     if update.get("state") in ("ready", "error"):
                         return
@@ -334,14 +377,13 @@ def create_app() -> FastAPI:
 
     @app.post("/cache/clear")
     def cache_clear() -> dict:
-        # Best-effort: also drop in-memory job entries so a freshly cleared
-        # cache doesn't surface stale "ready" status on the next /status call.
-        # Drain the SSE bookkeeping too; any open stream blocks harmlessly on
-        # its now-orphaned queue until its next keep-alive write fails.
-        with registry._lock:  # internal lock; small API and same process
-            registry._jobs.clear()
-            registry._subscribers.clear()
-            registry._last_disconnect_at.clear()
+        # Ask any in-flight workers to abandon at their next chunk boundary
+        # (releases the GPU lock + runs their own cleanup) and drop the
+        # in-memory status map so a freshly cleared cache doesn't surface stale
+        # "ready" status. Doing this before clear_all() means a live worker
+        # unwinds cleanly instead of crashing on a chunk write into a
+        # just-deleted directory.
+        registry.abandon_all()
         freed = cache.clear_all()
         return {"deleted_bytes": freed}
 
@@ -395,21 +437,52 @@ app = create_app()
 
 
 def main() -> None:
+    import os
+
     import uvicorn
 
+    # Dev convenience: NOMUSIC_RELOAD=1 watches backend/*.py and restarts on
+    # save, so you don't re-run the server by hand on every change. Off by
+    # default (the reloader spawns a watcher subprocess + re-imports the app,
+    # which reloads the model — fine for dev, wasteful for normal use).
+    reload = os.environ.get("NOMUSIC_RELOAD", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     log.info(
-        "Starting nomusic backend on http://%s:%d (engine=%s)",
+        "Starting nomusic backend on http://%s:%d (engine=%s%s)",
         SETTINGS.host,
         SETTINGS.port,
         SETTINGS.engine_name,
+        " · auto-reload" if reload else "",
     )
-    uvicorn.run(
-        app,
-        host=SETTINGS.host,
-        port=SETTINGS.port,
-        log_level="info",
-        access_log=False,
-    )
+    if reload:
+        # uvicorn's reloader needs an import string (not the app object) so its
+        # watcher subprocess can re-import on change. Put the backend dir on
+        # PYTHONPATH so that subprocess resolves "server" no matter which cwd
+        # the script was launched from (the README runs it from the repo root).
+        os.environ["PYTHONPATH"] = (
+            str(_BACKEND_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        )
+        uvicorn.run(
+            "server:app",
+            host=SETTINGS.host,
+            port=SETTINGS.port,
+            reload=True,
+            reload_dirs=[str(_BACKEND_DIR)],
+            log_level="info",
+            access_log=False,
+        )
+    else:
+        uvicorn.run(
+            app,
+            host=SETTINGS.host,
+            port=SETTINGS.port,
+            log_level="info",
+            access_log=False,
+        )
 
 
 if __name__ == "__main__":

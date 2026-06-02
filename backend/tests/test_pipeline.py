@@ -199,3 +199,109 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     # Re-running is a no-op: cache hit short-circuits the pipeline.
     key2 = processor.run("fake://video", model="fake", keep_stems=["vocals", "other"])
     assert key2 == key
+
+
+def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
+    # A prior run already probed this job and processed some chunks; a resume
+    # (after idle-abandon or a page refresh) must NOT pay the yt-dlp probe
+    # again, and must preserve the already-completed chunks.
+    from pipeline import processor as proc
+    from pipeline.cache import CacheMeta
+
+    def boom_probe(url):
+        raise AssertionError("probe must be skipped on resume")
+
+    monkeypatch.setattr(proc, "probe", boom_probe)
+
+    cache = JobCache(tmp_path / "cache")
+    processor = Processor(
+        engine=_FakeEngine(),
+        cache=cache,
+        chunk_seconds=10.0,
+        chunk_overlap_seconds=0.5,
+    )
+    key = cache.key(
+        "fake://video",
+        "fake",
+        ["vocals"],
+        chunk_seconds=10.0,
+        chunk_overlap_seconds=0.5,
+    )
+    plans = plan_chunks(120.0, 10.0, 0.5)
+    cache.save_meta(
+        key,
+        CacheMeta(
+            url="fake://video",
+            model="fake",
+            keep_stems=["vocals"],
+            duration_seconds=120.0,
+            chunk_seconds=10.0,
+            chunk_overlap_seconds=0.5,
+            total_chunks=len(plans),
+            title="Cached",
+            extractor="fake",
+            chunks_ready=[0, 1, 2],
+        ),
+    )
+
+    k, meta, info, returned_plans = processor.prepare(
+        "fake://video", model="fake", keep_stems=["vocals"]
+    )
+    assert k == key
+    assert meta.chunks_ready == [0, 1, 2]  # not wiped
+    assert info.duration_seconds == 120.0  # reused, not re-probed
+    assert len(returned_plans) == len(plans)
+
+
+def test_abandon_all_signals_workers_and_clears_state():
+    # /cache/clear must tell live workers to stop (so they unwind cleanly
+    # instead of writing into deleted dirs) and wipe the in-memory maps.
+    from jobs import JobRegistry, JobState, JobStatus
+
+    registry = JobRegistry(processor=None, cache=None)
+    registry._jobs["k1"] = JobStatus(job_id="k1", state=JobState.PROCESSING)
+    registry._jobs["k2"] = JobStatus(job_id="k2", state=JobState.DOWNLOADING)
+    registry._subscribers["k1"] = []
+    registry._last_disconnect_at["k1"] = 123.0
+
+    registry.abandon_all()
+
+    assert registry._jobs == {}
+    assert registry._subscribers == {}
+    assert registry._last_disconnect_at == {}
+    assert registry._abandoning == {"k1", "k2"}
+
+
+def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):
+    # The C7 race: a /process landing during a job's abandon-unwind must NOT
+    # hand back the dying job (which would leave it stuck with no worker); it
+    # must spawn a fresh worker instead.
+    from jobs import JobRegistry, JobState, JobStatus
+
+    class _StubCache:
+        def key(self, *a, **k):
+            return "k1"
+
+        def load_meta(self, key):
+            return None
+
+    class _StubProcessor:
+        chunk_seconds = 10.0
+        chunk_overlap_seconds = 0.5
+
+    registry = JobRegistry(processor=_StubProcessor(), cache=_StubCache())
+    old = JobStatus(job_id="k1", state=JobState.PROCESSING)
+    registry._jobs["k1"] = old
+    registry._abandoning.add("k1")
+
+    # Don't run the real worker; just let submit register a thread.
+    monkeypatch.setattr(registry, "_run", lambda key, url, model, keep_stems: None)
+
+    status = registry.submit("fake://video", model="fake", keep_stems=["vocals"])
+    # Submit refused to adopt the dying job: it created a fresh QUEUED status,
+    # registered a new worker thread, and cleared the stale abandon mark — all
+    # synchronously under the lock, so these checks aren't racing the thread.
+    assert status is not old
+    assert status.state is JobState.QUEUED
+    assert "k1" in registry._threads
+    assert "k1" not in registry._abandoning

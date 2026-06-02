@@ -94,15 +94,16 @@ class Settings:
         default_factory=lambda: _env_bool("KEEP_SOURCE_AFTER_COMPLETE", False)
     )
 
-    # How long a worker keeps running after its last SSE subscriber drops.
-    # When no client has been streaming status for this long, the worker
-    # abandons the job between chunks — releasing the GPU lock — so an idle
-    # server (user closed the tab, walked away) stops burning the GPU. The
-    # client re-spawns the worker from disk-cached progress on its next click,
-    # so abandoning is cheap. ``0`` disables idle-abandon (workers always run
-    # to completion regardless of who's watching).
+    # How long a worker keeps running after its last status subscriber drops.
+    # The extension closes its /events stream when you close the tab OR pause
+    # the video, so "no subscriber for this long" means "not actively
+    # watching". When it elapses, the worker abandons the job between chunks —
+    # releasing the GPU lock — so an idle server stops burning the GPU. Resume
+    # is cheap (re-spawn from disk-cached progress, no re-probe), so we keep
+    # this short. ``0`` disables idle-abandon (workers always run to completion
+    # regardless of who's watching).
     idle_timeout_seconds: float = field(
-        default_factory=lambda: _env_float("IDLE_TIMEOUT_SECONDS", 30.0)
+        default_factory=lambda: _env_float("IDLE_TIMEOUT_SECONDS", 10.0)
     )
     # Gap between SSE keep-alive comments on an otherwise-quiet stream. Keeps
     # proxies and the browser from treating a long processing pause (e.g. a

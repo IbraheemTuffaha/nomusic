@@ -310,6 +310,11 @@ All optional, all prefixed `NOMUSIC_`:
 | `NOMUSIC_KEEP_SOURCE_AFTER_COMPLETE` | `false` | Keep yt-dlp source audio after processing (faster stem switching, more disk) |
 | `NOMUSIC_CHUNK_SECONDS` | `10` | Chunk size |
 | `NOMUSIC_CHUNK_OVERLAP_SECONDS` | `0.5` | Per-chunk overlap for separator context |
+| `NOMUSIC_IDLE_TIMEOUT_SECONDS` | `10` | How long a worker keeps running after you pause or close the tab before it abandons the job and releases the GPU; resume re-spawns from cache (0 disables) |
+| `NOMUSIC_SSE_KEEPALIVE_SECONDS` | `15` | Gap between SSE keep-alive comments on a quiet status stream |
+| `NOMUSIC_MEMORY_GC_INTERVAL_SECONDS` | `3600` | How often the in-memory job map is reclaimed for jobs whose disk cache is gone (0 disables) |
+| `NOMUSIC_DOWNLOAD_RATELIMIT` | unset | Artificial download cap for testing slow links — raw bytes/sec or `K`/`M` suffix (e.g. `200K`) |
+| `NOMUSIC_RELOAD` | `false` | Dev only: watch `backend/*.py` and auto-restart on save (`1`/`true`) |
 | `NOMUSIC_JS_RUNTIME` | auto-detected | Path to a JS runtime (deno/node/bun) for yt-dlp |
 
 ### API contract
@@ -319,7 +324,9 @@ All optional, all prefixed `NOMUSIC_`:
 | GET | `/healthz` | `{ok: true}` |
 | GET | `/capabilities` | Engine info, defaults, cache settings |
 | POST | `/process` | `{url, model?, keep_stems?}` → `JobStatus` |
+| POST | `/process/{job_id}/prioritize` | `{from_chunk}` → `{applied}`; reorder pending chunks around a seek |
 | GET | `/status/{job_id}` | `JobStatus` |
+| GET | `/events/{job_id}` | `text/event-stream` of `JobStatus` updates (204 if unknown); replaces polling |
 | GET | `/chunk/{job_id}/{idx}` | OGG/Opus bytes (425 if not yet ready) |
 | GET | `/audio/{job_id}` | Streams concatenated OGG/Opus (425 if not complete) |
 | GET | `/cache` | Cache stats |

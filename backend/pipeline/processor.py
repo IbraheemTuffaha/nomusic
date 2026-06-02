@@ -149,7 +149,6 @@ class Processor:
         keep_stems: list[str],
     ) -> tuple[str, CacheMeta, VideoMetadata, list[ChunkPlan]]:
         """Probe the video, build/refresh the cache meta, and plan the chunks."""
-        info = probe(url)
         key = self.cache.key(
             url,
             model,
@@ -157,13 +156,38 @@ class Processor:
             chunk_seconds=self.chunk_seconds,
             chunk_overlap_seconds=self.chunk_overlap_seconds,
         )
+        existing = self.cache.load_meta(key)
+
+        # Fast resume: a prior run already probed this exact (url, model, stems,
+        # chunk plan) and persisted the duration. The yt-dlp probe costs 3-6s on
+        # YouTube (JS challenge), so on a resume — e.g. after an idle-abandon or
+        # a page refresh — we skip it entirely and rebuild VideoMetadata from
+        # the cached meta. The URL is part of the cache key, so the cached
+        # duration can't belong to a different video.
+        if existing and existing.total_chunks > 0 and existing.duration_seconds > 0:
+            plans = plan_chunks(
+                existing.duration_seconds,
+                self.chunk_seconds,
+                self.chunk_overlap_seconds,
+            )
+            if existing.total_chunks == len(plans):
+                info = VideoMetadata(
+                    id="",
+                    title=existing.title,
+                    duration_seconds=existing.duration_seconds,
+                    extractor=existing.extractor,
+                    webpage_url=url,
+                )
+                self.cache.save_meta(key, existing)
+                return key, existing, info, plans
+
+        info = probe(url)
         plans = plan_chunks(
             info.duration_seconds,
             self.chunk_seconds,
             self.chunk_overlap_seconds,
         )
 
-        existing = self.cache.load_meta(key)
         # Reuse the existing meta only if it matches; otherwise rebuild.
         if existing and existing.total_chunks == len(plans):
             meta = existing

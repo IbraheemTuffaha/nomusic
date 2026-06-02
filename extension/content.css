@@ -37,6 +37,7 @@
    (nomusic on, all good) does *not* — once it's working there's no
    reason for the pill to sit loud on top of the video. */
 .nomusic-btn[data-state="working"],
+.nomusic-btn[data-state="paused"],
 .nomusic-btn[data-state="error"] { opacity: 1; }
 
 .nomusic-btn:hover { background: rgba(28, 30, 38, 0.88); }
@@ -46,6 +47,12 @@
 }
 .nomusic-btn[data-state="working"] {
   background: rgba(70, 95, 160, 0.92);
+}
+/* Paused: the same working blue but dimmed, and the icon doesn't pulse (the
+   pulse rule targets "working" only) — signals "we stopped, not stalled".
+   The % fill stays frozen so the user sees progress was preserved. */
+.nomusic-btn[data-state="paused"] {
+  background: rgba(70, 95, 160, 0.5);
 }
 .nomusic-btn[data-state="error"] {
   background: rgba(170, 60, 60, 0.92);
