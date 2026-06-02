@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -255,7 +256,9 @@ class SourceFetcher:
 
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._ydl = YoutubeDL(_source_download_opts(self.out_dir))
+        t0 = time.monotonic()
         info = self._ydl.extract_info(self.url, download=False)
+        log.info("SourceFetcher: metadata extracted in %.1fs", time.monotonic() - t0)
         if info is None:
             raise RuntimeError(f"yt-dlp returned no metadata for {self.url}")
         if "entries" in info and info["entries"]:
@@ -296,6 +299,7 @@ class SourceFetcher:
             return download_source(self.url, self.out_dir, progress_hook=progress_hook)
 
         log.info("Downloading source audio for %s -> %s", self.url, self.out_dir)
+        t0 = time.monotonic()
         try:
             if progress_hook:
                 self._ydl.add_progress_hook(progress_hook)
@@ -303,6 +307,10 @@ class SourceFetcher:
             # exactly what extract_info(download=True) does internally, split
             # in two — no second extraction, no cross-session 403.
             self._ydl.process_ie_result(self._info, download=True)
+            log.info(
+                "SourceFetcher: same-session download OK (no re-extract), %.1fs",
+                time.monotonic() - t0,
+            )
         except Exception:
             log.warning(
                 "SourceFetcher: same-session download failed; retrying clean",
