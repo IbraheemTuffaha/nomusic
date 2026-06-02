@@ -389,6 +389,9 @@ class JobRegistry:
                             key, p
                         ),
                         next_chunk_provider=self._make_chunk_provider(key),
+                        abort_check=lambda: self._raise_if_abandoned(
+                            key, SETTINGS.idle_timeout_seconds
+                        ),
                     )
                 meta = self.cache.load_meta(key)
                 chunks_ready = len(meta.chunks_ready) if meta else 0
@@ -548,32 +551,41 @@ class JobRegistry:
         idle_timeout = SETTINGS.idle_timeout_seconds
 
         def provider() -> Optional[int]:
+            self._raise_if_abandoned(key, idle_timeout)
             with self._lock:
-                # Already flagged (idle decision on a prior call, or a cache
-                # clear)? Stop now — and re-raise under the lock so the flag
-                # set and the unwind can't interleave with a submit().
-                if key in self._abandoning:
-                    raise WorkerAbandoned
-                has_sub = bool(self._subscribers.get(key))
-                last_disc = self._last_disconnect_at.get(key)
-                status = self._jobs.get(key)
-                created_at = status.created_at if status else time.time()
                 control = self._controls.get(key)
-                if idle_timeout > 0 and not has_sub:
-                    # No subscriber: count from the last disconnect, or from job
-                    # creation if nobody ever connected (covers a /process whose
-                    # client never opened /events). Mark _abandoning before we
-                    # release the lock so a concurrent submit() sees a job that
-                    # has committed to dying and respawns instead of adopting it.
-                    ref = last_disc if last_disc is not None else created_at
-                    if time.time() - ref >= idle_timeout:
-                        self._abandoning.add(key)
-                        raise WorkerAbandoned
             if control is None:
                 return None
             return control.next_chunk()
 
         return provider
+
+    def _raise_if_abandoned(self, key: str, idle_timeout: float) -> None:
+        """Raise ``WorkerAbandoned`` if the job has been flagged (idle decision
+        on a prior call, or a cache clear) or has now gone idle. The whole
+        check + flag-set happens under the lock so it can't interleave with a
+        submit() deciding whether to adopt the job. Shared by the chunk
+        provider and the progressive-download abort hook so a pause that lands
+        mid-download still releases the GPU promptly."""
+        with self._lock:
+            if key in self._abandoning:
+                raise WorkerAbandoned
+            if idle_timeout <= 0:
+                return
+            if self._subscribers.get(key):
+                return
+            # No subscriber: count from the last disconnect, or from job
+            # creation if nobody ever connected (covers a /process whose client
+            # never opened /events). Mark _abandoning before releasing the lock
+            # so a concurrent submit() sees a job that has committed to dying
+            # and respawns instead of adopting it.
+            last_disc = self._last_disconnect_at.get(key)
+            status = self._jobs.get(key)
+            created_at = status.created_at if status else time.time()
+            ref = last_disc if last_disc is not None else created_at
+            if time.time() - ref >= idle_timeout:
+                self._abandoning.add(key)
+                raise WorkerAbandoned
 
     def prioritize(self, key: str, from_chunk: int) -> bool:
         """Rotate the job's pending-chunk order so ``from_chunk`` is next.

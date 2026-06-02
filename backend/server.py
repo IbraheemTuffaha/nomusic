@@ -195,6 +195,7 @@ def create_app() -> FastAPI:
         chunk_seconds=SETTINGS.chunk_seconds,
         chunk_overlap_seconds=SETTINGS.chunk_overlap_seconds,
         keep_source_after_complete=SETTINGS.keep_source_after_complete,
+        progressive=SETTINGS.progressive_download,
     )
     registry = JobRegistry(processor=processor, cache=cache)
 

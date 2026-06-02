@@ -119,6 +119,14 @@ class Settings:
     memory_gc_interval_seconds: float = field(
         default_factory=lambda: _env_float("MEMORY_GC_INTERVAL_SECONDS", 3600.0)
     )
+    # Experimental: start separating early chunks from the partially-downloaded
+    # source instead of waiting for the whole download. Each chunk is sliced
+    # only once enough of the timeline is on disk; if the partial container
+    # isn't decodable it transparently falls back to waiting for the full file.
+    # Off by default while it's validated across sites/formats.
+    progressive_download: bool = field(
+        default_factory=lambda: _env_bool("PROGRESSIVE", False)
+    )
 
 
 SETTINGS = Settings()

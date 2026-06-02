@@ -22,6 +22,7 @@ import math
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -123,6 +124,112 @@ def plan_chunks(
     return plans
 
 
+# Progressive download tuning. The margin absorbs the bytes->seconds estimate
+# being approximate (VBR), so we never slice a chunk whose tail hasn't landed.
+_PROGRESSIVE_MARGIN_SECONDS = 3.0
+_PROGRESSIVE_POLL_SECONDS = 0.15
+
+
+class _ProgressiveSource:
+    """Runs ``download_source`` on a background thread and tells the caller how
+    much of the timeline is safely on disk, so chunk separation can start
+    before the whole file has arrived.
+
+    ``available_seconds`` is estimated from the download's byte fraction times
+    the known duration — approximate for VBR, which is why ``source_for``
+    applies a margin. If the partial container can't be decoded at all, the
+    caller catches the slice error and falls back to ``wait_complete``.
+    """
+
+    def __init__(self, url: str, out_dir: Path, duration: float, ui_hook) -> None:
+        self._url = url
+        self._out_dir = out_dir
+        self._duration = duration
+        self._ui_hook = ui_hook
+        self._lock = threading.Lock()
+        self._available = 0.0
+        self._tmpfile: Optional[str] = None
+        self._final: Optional[Path] = None
+        self._error: Optional[BaseException] = None
+        self._done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="nomusic-progressive-dl", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _hook(self, d: dict) -> None:
+        try:
+            if self._ui_hook:
+                self._ui_hook(d)
+        except Exception:  # never let a UI hook break the download
+            pass
+        status = d.get("status")
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            done = d.get("downloaded_bytes", 0)
+            with self._lock:
+                tmp = d.get("tmpfilename")
+                if tmp:
+                    self._tmpfile = tmp
+                if total and self._duration:
+                    self._available = (done / total) * self._duration
+        elif status == "finished":
+            with self._lock:
+                self._available = self._duration
+
+    def _run(self) -> None:
+        try:
+            final = download_source(self._url, self._out_dir, progress_hook=self._hook)
+            with self._lock:
+                self._final = final
+                self._available = self._duration
+        except BaseException as exc:  # surfaced to the worker via raise_if_error
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def available_seconds(self) -> float:
+        with self._lock:
+            return self._available
+
+    def raise_if_error(self) -> None:
+        if self._error is not None:
+            raise self._error
+
+    def current_path(self) -> Optional[Path]:
+        with self._lock:
+            if self._final is not None:
+                return self._final
+            if self._tmpfile is not None:
+                p = Path(self._tmpfile)
+                if p.exists():
+                    return p
+        return None
+
+    def wait_complete(self) -> Path:
+        self._done.wait()
+        self.raise_if_error()
+        if self._final is None:
+            raise RuntimeError("progressive download finished without a file")
+        return self._final
+
+    def source_for(self, plan, overlap: float, abort_check=None) -> Path:
+        """Block until ``plan``'s download window is on disk, then return the
+        file to slice (the partial mid-download, or the final file)."""
+        needed = plan.end + overlap + _PROGRESSIVE_MARGIN_SECONDS
+        while not self._done.is_set() and self.available_seconds() < needed:
+            self.raise_if_error()
+            if abort_check:
+                abort_check()
+            time.sleep(_PROGRESSIVE_POLL_SECONDS)
+        self.raise_if_error()
+        path = self.current_path()
+        # No partial visible yet (rare timing gap) — wait for the full file.
+        return path if path is not None else self.wait_complete()
+
+
 class Processor:
     def __init__(
         self,
@@ -132,12 +239,14 @@ class Processor:
         chunk_seconds: float,
         chunk_overlap_seconds: float,
         keep_source_after_complete: bool = False,
+        progressive: bool = False,
     ) -> None:
         self.engine = engine
         self.cache = cache
         self.chunk_seconds = chunk_seconds
         self.chunk_overlap_seconds = chunk_overlap_seconds
         self.keep_source_after_complete = keep_source_after_complete
+        self.progressive = progressive
 
     # -- planning ------------------------------------------------------------
 
@@ -220,6 +329,7 @@ class Processor:
         on_progress: ProgressCb | None = None,
         on_download_progress: DownloadProgressCb | None = None,
         next_chunk_provider: NextChunkProvider | None = None,
+        abort_check: Callable[[], None] | None = None,
     ) -> str:
         """Run the full chunked pipeline. Returns the cache key.
 
@@ -229,6 +339,11 @@ class Processor:
         ``next_chunk_provider`` lets the caller drive chunk order (e.g.
         prioritize chunks near the user's seek position); when None the
         processor falls back to a simple FIFO over remaining chunks.
+
+        ``abort_check``, when supplied, is called periodically during any wait
+        (notably the progressive-download gate); it should raise to abort the
+        run. The provider raising is the normal abort path between chunks, but
+        a long download has no chunk boundary, so this gives one there too.
         """
         key, meta, info, plans = self.prepare(
             url, model=model, keep_stems=keep_stems
@@ -258,9 +373,22 @@ class Processor:
             except Exception:  # never let a UI hook break the pipeline
                 log.debug("download progress hook raised", exc_info=True)
 
-        source_path = download_source(
-            url, self.cache.source_dir(url), progress_hook=_yt_hook
-        )
+        source_dir = self.cache.source_dir(url)
+        dl: _ProgressiveSource | None = None
+        if self.progressive:
+            # Download on a background thread; ``source_for`` blocks per chunk
+            # until enough of the timeline is on disk to slice it.
+            dl = _ProgressiveSource(
+                url, source_dir, info.duration_seconds, _yt_hook
+            )
+            dl.start()
+            source_for = lambda plan: dl.source_for(
+                plan, self.chunk_overlap_seconds, abort_check
+            )
+        else:
+            # Download the full source up front; every chunk slices from it.
+            full = download_source(url, source_dir, progress_hook=_yt_hook)
+            source_for = lambda plan: full
 
         plans_by_index = {p.index: p for p in plans}
         # Default provider: simple FIFO over remaining chunks. Used by the
@@ -288,14 +416,37 @@ class Processor:
                 and self.cache.chunk_path(key, plan.index).exists()
             ):
                 continue
-            self._process_one(
-                source_path,
-                key,
-                plan,
-                model=model,
-                keep_stems=keep_stems,
-                on_progress=on_progress,
-            )
+            try:
+                self._process_one(
+                    source_for(plan),
+                    key,
+                    plan,
+                    model=model,
+                    keep_stems=keep_stems,
+                    on_progress=on_progress,
+                )
+            except Exception:
+                # Non-progressive failures are real. In progressive mode a slice
+                # can fail because the partial container isn't decodable yet
+                # (e.g. a non-streamable mp4) — degrade: wait for the full
+                # download and slice from it. Once it's complete, every later
+                # source_for() returns the final file, so this self-heals.
+                if dl is None:
+                    raise
+                log.warning(
+                    "progressive: chunk %d slice failed; waiting for full download",
+                    plan.index,
+                    exc_info=True,
+                )
+                full = dl.wait_complete()
+                self._process_one(
+                    full,
+                    key,
+                    plan,
+                    model=model,
+                    keep_stems=keep_stems,
+                    on_progress=on_progress,
+                )
             self.cache.record_chunk(key, plan.index)
             if on_progress:
                 refreshed = self.cache.load_meta(key)

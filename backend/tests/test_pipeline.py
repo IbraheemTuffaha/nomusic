@@ -201,6 +201,61 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     assert key2 == key
 
 
+def test_processor_progressive_produces_correct_chunks(tmp_path, monkeypatch):
+    # Progressive mode must produce the same correct, sample-accurate chunks as
+    # the download-once path. The fake download reports "finished" immediately,
+    # so the duration gate opens at once and we exercise the _ProgressiveSource
+    # plumbing + the gated loop without timing flakiness.
+    source = tmp_path / "source.wav"
+    _write_tone(source, seconds=10.0)
+
+    from pipeline import downloader as dl
+    from pipeline import processor as proc
+    from pipeline.downloader import VideoMetadata
+
+    def fake_probe(url):
+        return VideoMetadata(
+            id="fake", title="Fake", duration_seconds=10.0,
+            extractor="fake", webpage_url=url,
+        )
+
+    def fake_download_source(url, out_dir, *, progress_hook=None):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dst = out_dir / "source.wav"
+        if not dst.exists():
+            dst.write_bytes(source.read_bytes())
+        if progress_hook:
+            progress_hook({"status": "finished", "downloaded_bytes": 1, "total_bytes": 1})
+        return dst
+
+    def fake_slice_source(src, out_path, *, start, end):
+        audio, sr = sf.read(str(src), always_2d=True, dtype="float32")
+        sf.write(str(out_path), audio[int(start * sr) : int(end * sr)], sr,
+                 subtype="PCM_16", format="WAV")
+        return out_path
+
+    for mod in (dl, proc):
+        monkeypatch.setattr(mod, "probe", fake_probe, raising=False)
+        monkeypatch.setattr(mod, "download_source", fake_download_source, raising=False)
+        monkeypatch.setattr(mod, "slice_source", fake_slice_source, raising=False)
+
+    cache = JobCache(tmp_path / "cache")
+    processor = Processor(
+        engine=_FakeEngine(), cache=cache,
+        chunk_seconds=4.0, chunk_overlap_seconds=0.5, progressive=True,
+    )
+    key = processor.run("fake://video", model="fake", keep_stems=["vocals"])
+
+    meta = cache.load_meta(key)
+    assert meta is not None and meta.complete and meta.total_chunks > 1
+    plans = plan_chunks(meta.duration_seconds, meta.chunk_seconds, meta.chunk_overlap_seconds)
+    for plan in plans:
+        path = cache.chunk_path(key, plan.index)
+        assert path.exists()
+        info = sf.info(str(path))
+        assert abs(info.duration - (plan.play_end - plan.play_start)) < 0.05
+
+
 def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
     # A prior run already probed this job and processed some chunks; a resume
     # (after idle-abandon or a page refresh) must NOT pay the yt-dlp probe
