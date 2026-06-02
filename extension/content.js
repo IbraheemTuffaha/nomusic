@@ -1056,9 +1056,12 @@
     position(host) {
       // Anchor inside the nearest positioned ancestor of the video. The host
       // page often wraps the <video> in a player container; we live inside it.
+      // Top-right keeps us clear of the bottom control bar / scrubber, which
+      // otherwise overlaps the pill (badly at the end of a video when the
+      // progress bar is full).
       host.appendChild(this.el);
       this.el.style.right = "12px";
-      this.el.style.bottom = "60px";
+      this.el.style.top = "12px";
     }
   }
 
