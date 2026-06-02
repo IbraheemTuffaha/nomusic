@@ -158,7 +158,7 @@ class _ProgressiveSource:
         )
 
     def start(self) -> None:
-        log.info(
+        log.debug(
             "progressive: streaming download + separate (duration=%.0fs)",
             self._duration,
         )
@@ -182,7 +182,7 @@ class _ProgressiveSource:
                 # The make-or-break signal for byte-gating: if yt-dlp can't
                 # report a total size, available_seconds stays 0 and we can only
                 # release chunks once the whole file lands (no early start).
-                log.info(
+                log.debug(
                     "progressive: download size %s",
                     "known" if total else "UNKNOWN — byte-gate disabled, "
                     "will wait for full file",
@@ -441,7 +441,7 @@ class Processor:
                 # The headline progressive signal: if the download is still
                 # running here, separation genuinely overlapped it (early
                 # start). If it's already complete, we ran sequentially.
-                log.info(
+                log.debug(
                     "progressive: first chunk %d released with download %s "
                     "(%.0f/%.0fs on disk)",
                     plan.index,

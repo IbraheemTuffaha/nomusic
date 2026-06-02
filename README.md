@@ -316,6 +316,7 @@ All optional, all prefixed `NOMUSIC_`:
 | `NOMUSIC_DOWNLOAD_RATELIMIT` | unset | Artificial download cap for testing slow links — raw bytes/sec or `K`/`M` suffix (e.g. `200K`) |
 | `NOMUSIC_PROGRESSIVE` | `true` | Start separating early chunks from the partial download instead of waiting for the whole file (falls back automatically if the partial isn't decodable); set `0` to force download-once |
 | `NOMUSIC_RELOAD` | `false` | Dev only: watch `backend/*.py` and auto-restart on save (`1`/`true`) |
+| `NOMUSIC_DEBUG` | `false` | Raise backend logging to DEBUG (progressive download/gate diagnostics, etc.) |
 | `NOMUSIC_JS_RUNTIME` | auto-detected | Path to a JS runtime (deno/node/bun) for yt-dlp |
 
 ### API contract

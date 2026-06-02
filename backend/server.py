@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -40,8 +41,11 @@ from jobs import JobRegistry  # noqa: E402
 from pipeline.cache import CHUNK_MEDIA_TYPE, JobCache  # noqa: E402
 from pipeline.processor import Processor  # noqa: E402
 
+# NOMUSIC_DEBUG=1 raises the level to DEBUG, surfacing the verbose diagnostics
+# (e.g. the progressive download/gate logs) that are otherwise hidden.
+_DEBUG = os.environ.get("NOMUSIC_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if _DEBUG else logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("nomusic.server")
