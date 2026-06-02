@@ -152,12 +152,20 @@ class _ProgressiveSource:
         self._final: Optional[Path] = None
         self._error: Optional[BaseException] = None
         self._done = threading.Event()
+        self._logged_size = False
         self._thread = threading.Thread(
             target=self._run, name="nomusic-progressive-dl", daemon=True
         )
 
     def start(self) -> None:
+        log.info(
+            "progressive: streaming download + separate (duration=%.0fs)",
+            self._duration,
+        )
         self._thread.start()
+
+    def is_done(self) -> bool:
+        return self._done.is_set()
 
     def _hook(self, d: dict) -> None:
         try:
@@ -169,6 +177,16 @@ class _ProgressiveSource:
         if status == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             done = d.get("downloaded_bytes", 0)
+            if not self._logged_size:
+                self._logged_size = True
+                # The make-or-break signal for byte-gating: if yt-dlp can't
+                # report a total size, available_seconds stays 0 and we can only
+                # release chunks once the whole file lands (no early start).
+                log.info(
+                    "progressive: download size %s",
+                    "known" if total else "UNKNOWN — byte-gate disabled, "
+                    "will wait for full file",
+                )
             with self._lock:
                 tmp = d.get("tmpfilename")
                 if tmp:
@@ -399,6 +417,7 @@ class Processor:
             )
             next_chunk_provider = lambda: fallback.popleft() if fallback else None
 
+        logged_first = False
         while True:
             idx = next_chunk_provider()
             if idx is None:
@@ -416,9 +435,23 @@ class Processor:
                 and self.cache.chunk_path(key, plan.index).exists()
             ):
                 continue
+            source_path = source_for(plan)
+            if dl is not None and not logged_first:
+                logged_first = True
+                # The headline progressive signal: if the download is still
+                # running here, separation genuinely overlapped it (early
+                # start). If it's already complete, we ran sequentially.
+                log.info(
+                    "progressive: first chunk %d released with download %s "
+                    "(%.0f/%.0fs on disk)",
+                    plan.index,
+                    "still running" if not dl.is_done() else "already complete",
+                    dl.available_seconds(),
+                    info.duration_seconds,
+                )
             try:
                 self._process_one(
-                    source_for(plan),
+                    source_path,
                     key,
                     plan,
                     model=model,
