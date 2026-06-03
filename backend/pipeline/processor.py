@@ -22,6 +22,7 @@ import math
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from engines.base import Engine
 
 from .cache import CacheMeta, JobCache
 from .downloader import (
+    SourceFetcher,
     VideoMetadata,
     download_source,
     probe,
@@ -123,6 +125,157 @@ def plan_chunks(
     return plans
 
 
+# Progressive download tuning. The margin absorbs the bytes->seconds estimate
+# being approximate (VBR), so we never slice a chunk whose tail hasn't landed.
+_PROGRESSIVE_MARGIN_SECONDS = 3.0
+_PROGRESSIVE_POLL_SECONDS = 0.15
+
+
+class _ProgressiveSource:
+    """Runs ``download_source`` on a background thread and tells the caller how
+    much of the timeline is safely on disk, so chunk separation can start
+    before the whole file has arrived.
+
+    ``available_seconds`` is estimated from the download's byte fraction times
+    the known duration — approximate for VBR, which is why ``source_for``
+    applies a margin. If the partial container can't be decoded at all, the
+    caller catches the slice error and falls back to ``wait_complete``.
+    """
+
+    def __init__(
+        self, url: str, out_dir: Path, duration: float, ui_hook, fetcher=None
+    ) -> None:
+        self._url = url
+        self._out_dir = out_dir
+        self._duration = duration
+        self._ui_hook = ui_hook
+        # When set, the worker already extracted metadata in this session; the
+        # background download reuses it (no second extraction). None on resume.
+        self._fetcher = fetcher
+        self._lock = threading.Lock()
+        self._available = 0.0
+        self._tmpfile: Optional[str] = None
+        self._final: Optional[Path] = None
+        self._error: Optional[BaseException] = None
+        self._done = threading.Event()
+        self._logged_size = False
+        self._thread = threading.Thread(
+            target=self._run, name="nomusic-progressive-dl", daemon=True
+        )
+
+    def start(self) -> None:
+        log.debug(
+            "progressive: streaming download + separate (duration=%.0fs)",
+            self._duration,
+        )
+        self._thread.start()
+
+    def is_done(self) -> bool:
+        return self._done.is_set()
+
+    def _hook(self, d: dict) -> None:
+        try:
+            if self._ui_hook:
+                self._ui_hook(d)
+        except Exception:  # never let a UI hook break the download
+            pass
+        status = d.get("status")
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            done = d.get("downloaded_bytes", 0)
+            if not self._logged_size:
+                self._logged_size = True
+                # The make-or-break signal for byte-gating: if yt-dlp can't
+                # report a total size, available_seconds stays 0 and we can only
+                # release chunks once the whole file lands (no early start).
+                log.debug(
+                    "progressive: download size %s",
+                    "known" if total else "UNKNOWN — byte-gate disabled, "
+                    "will wait for full file",
+                )
+            with self._lock:
+                tmp = d.get("tmpfilename")
+                if tmp:
+                    self._tmpfile = tmp
+                if total and self._duration:
+                    self._available = (done / total) * self._duration
+        elif status == "finished":
+            with self._lock:
+                self._available = self._duration
+
+    def _run(self) -> None:
+        try:
+            if self._fetcher is not None:
+                final = self._fetcher.download(progress_hook=self._hook)
+            else:
+                final = download_source(
+                    self._url, self._out_dir, progress_hook=self._hook
+                )
+            with self._lock:
+                self._final = final
+                self._available = self._duration
+        except BaseException as exc:  # surfaced to the worker via raise_if_error
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def available_seconds(self) -> float:
+        with self._lock:
+            return self._available
+
+    def raise_if_error(self) -> None:
+        if self._error is not None:
+            raise self._error
+
+    def current_path(self) -> Optional[Path]:
+        with self._lock:
+            if self._final is not None:
+                return self._final
+            if self._tmpfile is not None:
+                p = Path(self._tmpfile)
+                if p.exists():
+                    return p
+        return None
+
+    def wait_complete(self) -> Path:
+        self._done.wait()
+        self.raise_if_error()
+        if self._final is None:
+            raise RuntimeError("progressive download finished without a file")
+        return self._final
+
+    def source_for(self, plan, overlap: float, abort_check=None, on_wait=None) -> Path:
+        """Block until ``plan``'s download window is on disk, then return the
+        file to slice (the partial mid-download, or the final file).
+
+        While blocked (the chunk's bytes aren't downloaded yet — e.g. the user
+        seeked past the downloaded point), ``on_wait`` is called with the
+        current download fraction so the UI can show "Fetching" instead of a
+        frozen "Removing". Not called when the bytes are already present.
+        """
+        needed = plan.end + overlap + _PROGRESSIVE_MARGIN_SECONDS
+        waits = 0
+        while not self._done.is_set() and self.available_seconds() < needed:
+            self.raise_if_error()
+            if abort_check:
+                abort_check()
+            waits += 1
+            # Only flip the UI to "Fetching" once we've actually been blocked a
+            # moment (~0.3s), so a chunk whose bytes are basically already here
+            # doesn't cause a one-frame flash.
+            if on_wait and waits >= 2:
+                on_wait(
+                    self.available_seconds() / self._duration
+                    if self._duration
+                    else None
+                )
+            time.sleep(_PROGRESSIVE_POLL_SECONDS)
+        self.raise_if_error()
+        path = self.current_path()
+        # No partial visible yet (rare timing gap) — wait for the full file.
+        return path if path is not None else self.wait_complete()
+
+
 class Processor:
     def __init__(
         self,
@@ -132,12 +285,14 @@ class Processor:
         chunk_seconds: float,
         chunk_overlap_seconds: float,
         keep_source_after_complete: bool = False,
+        progressive: bool = False,
     ) -> None:
         self.engine = engine
         self.cache = cache
         self.chunk_seconds = chunk_seconds
         self.chunk_overlap_seconds = chunk_overlap_seconds
         self.keep_source_after_complete = keep_source_after_complete
+        self.progressive = progressive
 
     # -- planning ------------------------------------------------------------
 
@@ -147,9 +302,15 @@ class Processor:
         *,
         model: str,
         keep_stems: list[str],
-    ) -> tuple[str, CacheMeta, VideoMetadata, list[ChunkPlan]]:
-        """Probe the video, build/refresh the cache meta, and plan the chunks."""
-        info = probe(url)
+    ) -> tuple[str, CacheMeta, VideoMetadata, list[ChunkPlan], Optional[SourceFetcher]]:
+        """Probe the video, build/refresh the cache meta, and plan the chunks.
+
+        Returns ``(key, meta, info, plans, fetcher)``. ``fetcher`` is a
+        :class:`SourceFetcher` holding an open yt-dlp session that already
+        extracted ``info`` — the caller downloads from it (same session, no
+        second extraction). It's ``None`` on the resume fast-path, where the
+        duration comes from the cached meta and no extraction happened.
+        """
         key = self.cache.key(
             url,
             model,
@@ -157,13 +318,42 @@ class Processor:
             chunk_seconds=self.chunk_seconds,
             chunk_overlap_seconds=self.chunk_overlap_seconds,
         )
+        existing = self.cache.load_meta(key)
+
+        # Fast resume: a prior run already probed this exact (url, model, stems,
+        # chunk plan) and persisted the duration. The yt-dlp probe costs 3-6s on
+        # YouTube (JS challenge), so on a resume — e.g. after an idle-abandon or
+        # a page refresh — we skip it entirely and rebuild VideoMetadata from
+        # the cached meta. The URL is part of the cache key, so the cached
+        # duration can't belong to a different video.
+        if existing and existing.total_chunks > 0 and existing.duration_seconds > 0:
+            plans = plan_chunks(
+                existing.duration_seconds,
+                self.chunk_seconds,
+                self.chunk_overlap_seconds,
+            )
+            if existing.total_chunks == len(plans):
+                info = VideoMetadata(
+                    id="",
+                    title=existing.title,
+                    duration_seconds=existing.duration_seconds,
+                    extractor=existing.extractor,
+                    webpage_url=url,
+                )
+                self.cache.save_meta(key, existing)
+                return key, existing, info, plans, None
+
+        # First run: extract metadata in a session we'll also download from, so
+        # the JS-challenge extraction is paid once, not once here + again at
+        # download time.
+        fetcher = SourceFetcher(url, self.cache.source_dir(url))
+        info = fetcher.extract()
         plans = plan_chunks(
             info.duration_seconds,
             self.chunk_seconds,
             self.chunk_overlap_seconds,
         )
 
-        existing = self.cache.load_meta(key)
         # Reuse the existing meta only if it matches; otherwise rebuild.
         if existing and existing.total_chunks == len(plans):
             meta = existing
@@ -182,7 +372,7 @@ class Processor:
                 extractor=info.extractor,
             )
         self.cache.save_meta(key, meta)
-        return key, meta, info, plans
+        return key, meta, info, plans, fetcher
 
     # -- execution -----------------------------------------------------------
 
@@ -196,6 +386,8 @@ class Processor:
         on_progress: ProgressCb | None = None,
         on_download_progress: DownloadProgressCb | None = None,
         next_chunk_provider: NextChunkProvider | None = None,
+        abort_check: Callable[[], None] | None = None,
+        on_wait_for_download: Callable[[float | None], None] | None = None,
     ) -> str:
         """Run the full chunked pipeline. Returns the cache key.
 
@@ -205,8 +397,13 @@ class Processor:
         ``next_chunk_provider`` lets the caller drive chunk order (e.g.
         prioritize chunks near the user's seek position); when None the
         processor falls back to a simple FIFO over remaining chunks.
+
+        ``abort_check``, when supplied, is called periodically during any wait
+        (notably the progressive-download gate); it should raise to abort the
+        run. The provider raising is the normal abort path between chunks, but
+        a long download has no chunk boundary, so this gives one there too.
         """
-        key, meta, info, plans = self.prepare(
+        key, meta, info, plans, fetcher = self.prepare(
             url, model=model, keep_stems=keep_stems
         )
         if on_probed:
@@ -234,9 +431,27 @@ class Processor:
             except Exception:  # never let a UI hook break the pipeline
                 log.debug("download progress hook raised", exc_info=True)
 
-        source_path = download_source(
-            url, self.cache.source_dir(url), progress_hook=_yt_hook
-        )
+        source_dir = self.cache.source_dir(url)
+        dl: _ProgressiveSource | None = None
+        if self.progressive:
+            # Download on a background thread; ``source_for`` blocks per chunk
+            # until enough of the timeline is on disk to slice it.
+            dl = _ProgressiveSource(
+                url, source_dir, info.duration_seconds, _yt_hook, fetcher=fetcher
+            )
+            dl.start()
+            source_for = lambda plan: dl.source_for(
+                plan, self.chunk_overlap_seconds, abort_check, on_wait_for_download
+            )
+        elif fetcher is not None:
+            # First run: download from the session that already extracted info.
+            full = fetcher.download(progress_hook=_yt_hook)
+            source_for = lambda plan: full
+        else:
+            # Resume: download the full source up front (cached source returns
+            # immediately); every chunk slices from it.
+            full = download_source(url, source_dir, progress_hook=_yt_hook)
+            source_for = lambda plan: full
 
         plans_by_index = {p.index: p for p in plans}
         # Default provider: simple FIFO over remaining chunks. Used by the
@@ -247,6 +462,7 @@ class Processor:
             )
             next_chunk_provider = lambda: fallback.popleft() if fallback else None
 
+        logged_first = False
         while True:
             idx = next_chunk_provider()
             if idx is None:
@@ -264,14 +480,51 @@ class Processor:
                 and self.cache.chunk_path(key, plan.index).exists()
             ):
                 continue
-            self._process_one(
-                source_path,
-                key,
-                plan,
-                model=model,
-                keep_stems=keep_stems,
-                on_progress=on_progress,
-            )
+            source_path = source_for(plan)
+            if dl is not None and not logged_first:
+                logged_first = True
+                # The headline progressive signal: if the download is still
+                # running here, separation genuinely overlapped it (early
+                # start). If it's already complete, we ran sequentially.
+                log.debug(
+                    "progressive: first chunk %d released with download %s "
+                    "(%.0f/%.0fs on disk)",
+                    plan.index,
+                    "still running" if not dl.is_done() else "already complete",
+                    dl.available_seconds(),
+                    info.duration_seconds,
+                )
+            try:
+                self._process_one(
+                    source_path,
+                    key,
+                    plan,
+                    model=model,
+                    keep_stems=keep_stems,
+                    on_progress=on_progress,
+                )
+            except Exception:
+                # Non-progressive failures are real. In progressive mode a slice
+                # can fail because the partial container isn't decodable yet
+                # (e.g. a non-streamable mp4) — degrade: wait for the full
+                # download and slice from it. Once it's complete, every later
+                # source_for() returns the final file, so this self-heals.
+                if dl is None:
+                    raise
+                log.warning(
+                    "progressive: chunk %d slice failed; waiting for full download",
+                    plan.index,
+                    exc_info=True,
+                )
+                full = dl.wait_complete()
+                self._process_one(
+                    full,
+                    key,
+                    plan,
+                    model=model,
+                    keep_stems=keep_stems,
+                    on_progress=on_progress,
+                )
             self.cache.record_chunk(key, plan.index)
             if on_progress:
                 refreshed = self.cache.load_meta(key)

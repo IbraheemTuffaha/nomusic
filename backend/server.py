@@ -7,15 +7,20 @@ Endpoints:
   GET  /capabilities
   POST /process              {url, model?, keep_stems?} -> {job_id, ...}
   GET  /status/{job_id}      -> JobStatus
+  GET  /events/{job_id}      -> text/event-stream (SSE status updates)
   GET  /chunk/{job_id}/{idx} -> audio/wav (404 if not yet ready)
   GET  /audio/{job_id}       -> audio/wav (the concatenated full track)
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import os
 import sys
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -24,9 +29,9 @@ _BACKEND_DIR = Path(__file__).resolve().parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from fastapi import FastAPI, HTTPException  # noqa: E402
+from fastapi import FastAPI, HTTPException, Request, Response  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import FileResponse  # noqa: E402
+from fastapi.responses import FileResponse, StreamingResponse  # noqa: E402
 from pydantic import BaseModel, Field, field_validator  # noqa: E402
 
 from config import SETTINGS  # noqa: E402
@@ -36,8 +41,11 @@ from jobs import JobRegistry  # noqa: E402
 from pipeline.cache import CHUNK_MEDIA_TYPE, JobCache  # noqa: E402
 from pipeline.processor import Processor  # noqa: E402
 
+# NOMUSIC_DEBUG=1 raises the level to DEBUG, surfacing the verbose diagnostics
+# (e.g. the progressive download/gate logs) that are otherwise hidden.
+_DEBUG = os.environ.get("NOMUSIC_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if _DEBUG else logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("nomusic.server")
@@ -96,8 +104,77 @@ def _start_cache_ttl_sweeper(cache: JobCache) -> None:
     t.start()
 
 
+def _start_memory_gc(registry: JobRegistry) -> None:
+    """Periodically reclaim in-memory job entries whose disk cache is gone.
+
+    Runs alongside the disk TTL sweeper on its own daemon thread, so the
+    in-memory JobStatus map can't grow without bound on a long-lived server.
+    Keyed to its own interval so a hosted deployment can GC aggressively
+    without touching the disk-sweep cadence. ``0`` disables it."""
+    interval = SETTINGS.memory_gc_interval_seconds
+    if interval <= 0:
+        log.info("Memory GC disabled (interval=%s)", interval)
+        return
+
+    def _loop() -> None:
+        import time
+
+        while True:
+            time.sleep(interval)
+            try:
+                dropped = registry.memory_gc()
+                if dropped:
+                    log.info("Memory GC dropped %d stale in-memory job(s)", dropped)
+            except Exception:
+                log.exception("Memory GC failed")
+
+    t = threading.Thread(target=_loop, name="nomusic-memory-gc", daemon=True)
+    t.start()
+
+
+def _start_engine_warmup(engine) -> None:
+    """Load the default model weights on a background thread at startup.
+
+    The first separation otherwise pays a one-off model-load cost (weights
+    fetch + MPS init, several seconds) on the user's first chunk. Warming up
+    in the background means that cost is usually already paid by the time the
+    first job reaches its separation phase, so first-chunk latency matches
+    steady state. Best-effort: a failure here just falls back to lazy loading.
+    """
+
+    def _loop() -> None:
+        try:
+            engine.warmup()
+            log.info("Engine warmup complete")
+        except Exception:
+            log.exception("Engine warmup failed; will load lazily on first job")
+
+    t = threading.Thread(target=_loop, name="nomusic-engine-warmup", daemon=True)
+    t.start()
+
+
+# SSE responses must not be buffered: ``no-cache`` stops the browser caching
+# the stream, ``X-Accel-Buffering: no`` tells nginx-style proxies (relevant
+# once this runs behind a real server) to flush each event immediately.
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+# How often a quiet stream wakes to check whether the client has disconnected.
+# Kept well below the keep-alive gap so unsubscribe() — which starts the
+# idle-abandon clock — fires within ~1s of a pause/tab-close, rather than
+# lagging up to a full keep-alive interval.
+_SSE_DISCONNECT_POLL_SECONDS = 1.0
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Capture the running event loop once at startup. Worker threads use it
+    # (via call_soon_threadsafe) to push status snapshots onto SSE queues.
+    app.state.registry.attach_loop(asyncio.get_running_loop())
+    yield
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="nomusic", version="0.1.0")
+    app = FastAPI(title="nomusic", version="0.2.0", lifespan=lifespan)
 
     # ``allow_private_network=True`` opts into Chrome's Private Network
     # Access flow: a fetch from a public origin (youtube.com) to a private
@@ -122,6 +199,7 @@ def create_app() -> FastAPI:
         chunk_seconds=SETTINGS.chunk_seconds,
         chunk_overlap_seconds=SETTINGS.chunk_overlap_seconds,
         keep_source_after_complete=SETTINGS.keep_source_after_complete,
+        progressive=SETTINGS.progressive_download,
     )
     registry = JobRegistry(processor=processor, cache=cache)
 
@@ -131,6 +209,8 @@ def create_app() -> FastAPI:
     app.state.registry = registry
 
     _start_cache_ttl_sweeper(cache)
+    _start_memory_gc(registry)
+    _start_engine_warmup(engine)
 
     @app.get("/healthz")
     def healthz() -> dict:
@@ -196,6 +276,82 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown job_id")
         return status.to_dict()
 
+    @app.get("/events/{job_id}")
+    async def events(job_id: str, request: Request):
+        """Server-Sent Events stream of a job's status.
+
+        Replaces the extension's old /status polling: the client opens one
+        EventSource and receives a snapshot on connect plus a push on every
+        state change, ending with a terminal ``ready``/``error`` event.
+
+        Three response shapes:
+          * 204 No Content for an unknown job — per the SSE spec this tells
+            EventSource to stop reconnecting (vs. a 404, which it would retry).
+          * a single-event stream for a job that's already terminal (e.g. a
+            fully-cached replay) — no subscription, so nothing to leak.
+          * a live subscription for an in-flight job.
+        """
+        initial = registry.get(job_id)
+        if initial is None:
+            return Response(status_code=204)
+
+        if initial.state.value in ("ready", "error"):
+            payload = json.dumps(initial.to_dict())
+
+            async def one_shot():
+                yield f"data: {payload}\n\n"
+
+            return StreamingResponse(
+                one_shot(), media_type="text/event-stream", headers=_SSE_HEADERS
+            )
+
+        queue = registry.subscribe(job_id)
+
+        async def stream():
+            try:
+                # Emit the current state right away so the client paints
+                # without waiting for the next change. Re-read after subscribe
+                # to close the gap where the job finished mid-handshake.
+                cur = registry.get(job_id)
+                if cur is not None:
+                    yield f"data: {json.dumps(cur.to_dict())}\n\n"
+                    if cur.state.value in ("ready", "error"):
+                        return
+                # Poll for disconnect every _SSE_DISCONNECT_POLL_SECONDS but
+                # only emit a keep-alive comment every sse_keepalive_seconds, so
+                # a paused/closed client is noticed promptly (starting the idle
+                # clock) without spamming the wire with keep-alives.
+                polls_per_keepalive = max(
+                    1,
+                    round(
+                        SETTINGS.sse_keepalive_seconds / _SSE_DISCONNECT_POLL_SECONDS
+                    ),
+                )
+                idle_polls = 0
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    try:
+                        update = await asyncio.wait_for(
+                            queue.get(), timeout=_SSE_DISCONNECT_POLL_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        idle_polls += 1
+                        if idle_polls >= polls_per_keepalive:
+                            idle_polls = 0
+                            yield ":\n\n"  # keep-alive comment; ignored by EventSource
+                        continue
+                    idle_polls = 0
+                    yield f"data: {json.dumps(update)}\n\n"
+                    if update.get("state") in ("ready", "error"):
+                        return
+            finally:
+                registry.unsubscribe(job_id, queue)
+
+        return StreamingResponse(
+            stream(), media_type="text/event-stream", headers=_SSE_HEADERS
+        )
+
     @app.get("/chunk/{job_id}/{chunk_idx}")
     def chunk(job_id: str, chunk_idx: int) -> FileResponse:
         meta = cache.load_meta(job_id)
@@ -226,10 +382,13 @@ def create_app() -> FastAPI:
 
     @app.post("/cache/clear")
     def cache_clear() -> dict:
-        # Best-effort: also drop in-memory job entries so a freshly cleared
-        # cache doesn't surface stale "ready" status on the next /status call.
-        with registry._lock:  # internal lock; small API and same process
-            registry._jobs.clear()
+        # Ask any in-flight workers to abandon at their next chunk boundary
+        # (releases the GPU lock + runs their own cleanup) and drop the
+        # in-memory status map so a freshly cleared cache doesn't surface stale
+        # "ready" status. Doing this before clear_all() means a live worker
+        # unwinds cleanly instead of crashing on a chunk write into a
+        # just-deleted directory.
+        registry.abandon_all()
         freed = cache.clear_all()
         return {"deleted_bytes": freed}
 
@@ -283,21 +442,52 @@ app = create_app()
 
 
 def main() -> None:
+    import os
+
     import uvicorn
 
+    # Dev convenience: NOMUSIC_RELOAD=1 watches backend/*.py and restarts on
+    # save, so you don't re-run the server by hand on every change. Off by
+    # default (the reloader spawns a watcher subprocess + re-imports the app,
+    # which reloads the model — fine for dev, wasteful for normal use).
+    reload = os.environ.get("NOMUSIC_RELOAD", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     log.info(
-        "Starting nomusic backend on http://%s:%d (engine=%s)",
+        "Starting nomusic backend on http://%s:%d (engine=%s%s)",
         SETTINGS.host,
         SETTINGS.port,
         SETTINGS.engine_name,
+        " · auto-reload" if reload else "",
     )
-    uvicorn.run(
-        app,
-        host=SETTINGS.host,
-        port=SETTINGS.port,
-        log_level="info",
-        access_log=False,
-    )
+    if reload:
+        # uvicorn's reloader needs an import string (not the app object) so its
+        # watcher subprocess can re-import on change. Put the backend dir on
+        # PYTHONPATH so that subprocess resolves "server" no matter which cwd
+        # the script was launched from (the README runs it from the repo root).
+        os.environ["PYTHONPATH"] = (
+            str(_BACKEND_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        )
+        uvicorn.run(
+            "server:app",
+            host=SETTINGS.host,
+            port=SETTINGS.port,
+            reload=True,
+            reload_dirs=[str(_BACKEND_DIR)],
+            log_level="info",
+            access_log=False,
+        )
+    else:
+        uvicorn.run(
+            app,
+            host=SETTINGS.host,
+            port=SETTINGS.port,
+            log_level="info",
+            access_log=False,
+        )
 
 
 if __name__ == "__main__":

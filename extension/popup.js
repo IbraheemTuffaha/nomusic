@@ -9,6 +9,17 @@ const ALL_STEMS = [
   { name: "other", desc: "ambient + melodic instruments" },
 ];
 
+// Plain-language hints for the model dropdown, keyed by the backend model
+// name. Non-experts shouldn't need to know what "htdemucs_ft" means; the
+// bracket explains the speed/quality tradeoff. Unknown models fall back to
+// the bare name.
+const MODEL_HINTS = {
+  htdemucs: "fast, balanced",
+  htdemucs_ft: "best quality, ~4× slower",
+  mdx_extra: "alternative model, slower",
+  mdx_extra_q: "alternative, compact & faster",
+};
+
 async function load() {
   const stored = await chrome.storage.sync.get([
     "backendUrl",
@@ -39,7 +50,11 @@ async function load() {
     for (const m of models) {
       const opt = document.createElement("option");
       opt.value = m;
-      opt.textContent = m + (m === defaultModel ? " (default)" : "");
+      // "name (hint — default)": keep the technical name for transparency,
+      // add a plain-language hint, fold the default marker into the bracket.
+      let hint = MODEL_HINTS[m] || "";
+      if (m === defaultModel) hint = hint ? `${hint} — default` : "default";
+      opt.textContent = hint ? `${m} (${hint})` : m;
       select.appendChild(opt);
     }
     select.value = stored.model || defaultModel || models[0] || "";

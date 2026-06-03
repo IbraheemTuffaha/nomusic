@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,27 @@ def _common_opts() -> dict[str, Any]:
             opts["js_runtimes"] = {name: {"path": path}}
             break
     return opts
+
+
+def _download_ratelimit() -> float | None:
+    """Optional artificial download cap (bytes/sec) for testing slow links.
+
+    ``NOMUSIC_DOWNLOAD_RATELIMIT`` accepts a raw byte/sec number or a
+    ``K``/``M`` suffix (e.g. ``200K``, ``1.5M``). Unset/invalid → no cap. Maps
+    straight to yt-dlp's ``ratelimit``."""
+    raw = os.environ.get("NOMUSIC_DOWNLOAD_RATELIMIT")
+    if not raw:
+        return None
+    raw = raw.strip().upper()
+    mult = 1
+    if raw.endswith("K"):
+        mult, raw = 1024, raw[:-1]
+    elif raw.endswith("M"):
+        mult, raw = 1024 * 1024, raw[:-1]
+    try:
+        return float(raw) * mult
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -161,13 +183,7 @@ def download_source(
 
     from yt_dlp import YoutubeDL
 
-    template = str(out_dir / f"{_SOURCE_STEM}.%(ext)s")
-    opts: dict[str, Any] = {
-        **_common_opts(),
-        "format": "bestaudio/best",
-        "outtmpl": template,
-        "overwrites": True,
-    }
+    opts = _source_download_opts(out_dir)
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
     log.info("Downloading source audio for %s -> %s", url, out_dir)
@@ -181,6 +197,144 @@ def download_source(
             "supported extensions: " + ", ".join(_SOURCE_EXTS)
         )
     return final
+
+
+def _source_download_opts(out_dir: Path) -> dict[str, Any]:
+    """yt-dlp options for pulling the source audio (shared by download_source
+    and SourceFetcher), minus the per-call progress hook."""
+    opts: dict[str, Any] = {
+        **_common_opts(),
+        # Cap at ~128 kbps audio: it's effectively transparent for source
+        # separation (demucs works on the decoded waveform) and trims download
+        # time on long videos / slow links. Falls back to the best available
+        # audio, then to best overall, for sources without a 128k rendition.
+        "format": "bestaudio[abr<=128]/bestaudio/best",
+        "outtmpl": str(out_dir / f"{_SOURCE_STEM}.%(ext)s"),
+        "overwrites": True,
+        # Self-heal transient network hiccups instead of failing the whole job
+        # on a single timeout. yt-dlp retries the request/fragments internally;
+        # socket_timeout bounds a stalled read.
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
+    }
+    ratelimit = _download_ratelimit()
+    if ratelimit:
+        log.info("Throttling download to %.0f bytes/sec (test mode)", ratelimit)
+        opts["ratelimit"] = ratelimit
+    return opts
+
+
+class SourceFetcher:
+    """One yt-dlp session that extracts metadata once and then downloads from
+    the *same* session.
+
+    The naive optimization — extract in :func:`probe`, then reuse that info in a
+    separate download session — fails on YouTube with HTTP 403, because the
+    media URLs are bound to the extracting session (signature / po_token). Doing
+    both in one session avoids the second JS-challenge extraction *and* the 403.
+
+    Usage::
+
+        f = SourceFetcher(url, out_dir)
+        meta = f.extract()           # one extraction; metadata for planning
+        path = f.download(hook)      # download from the same session
+
+    ``download`` falls back to a clean :func:`download_source` if the same-
+    session download raises, so the optimization can never fail a job outright.
+    """
+
+    def __init__(self, url: str, out_dir: Path) -> None:
+        self.url = url
+        self.out_dir = out_dir
+        self._ydl = None
+        self._info: dict | None = None
+        self._cached: Path | None = None
+
+    def extract(self) -> VideoMetadata:
+        from yt_dlp import YoutubeDL
+
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self._ydl = YoutubeDL(_source_download_opts(self.out_dir))
+        t0 = time.monotonic()
+        info = self._ydl.extract_info(self.url, download=False)
+        log.info("SourceFetcher: metadata extracted in %.1fs", time.monotonic() - t0)
+        if info is None:
+            raise RuntimeError(f"yt-dlp returned no metadata for {self.url}")
+        if "entries" in info and info["entries"]:
+            info = info["entries"][0]
+        duration = info.get("duration")
+        if duration is None:
+            raise RuntimeError(
+                f"yt-dlp could not determine duration for {self.url}; "
+                "live streams and unbounded media are not supported yet."
+            )
+        self._info = info
+        # If the source is already on disk, the download step short-circuits.
+        self._cached = _find_source(self.out_dir)
+        return VideoMetadata(
+            id=str(info.get("id", "unknown")),
+            title=str(info.get("title", "untitled")),
+            duration_seconds=float(duration),
+            extractor=str(info.get("extractor", "unknown")),
+            webpage_url=str(info.get("webpage_url", self.url)),
+        )
+
+    def download(self, progress_hook=None) -> Path:
+        if self._cached is not None:
+            log.info("Using cached source audio: %s", self._cached.name)
+            if progress_hook:
+                try:
+                    size = self._cached.stat().st_size
+                    progress_hook(
+                        {"status": "finished", "downloaded_bytes": size, "total_bytes": size}
+                    )
+                except Exception:
+                    pass
+            self._close()
+            return self._cached
+
+        if self._ydl is None or self._info is None:
+            # extract() wasn't called (shouldn't happen) — just do a clean run.
+            return download_source(self.url, self.out_dir, progress_hook=progress_hook)
+
+        log.info("Downloading source audio for %s -> %s", self.url, self.out_dir)
+        t0 = time.monotonic()
+        try:
+            if progress_hook:
+                self._ydl.add_progress_hook(progress_hook)
+            # Same-session download of the already-extracted result: this is
+            # exactly what extract_info(download=True) does internally, split
+            # in two — no second extraction, no cross-session 403.
+            self._ydl.process_ie_result(self._info, download=True)
+            log.info(
+                "SourceFetcher: same-session download OK (no re-extract), %.1fs",
+                time.monotonic() - t0,
+            )
+        except Exception:
+            log.warning(
+                "SourceFetcher: same-session download failed; retrying clean",
+                exc_info=True,
+            )
+            self._close()
+            return download_source(self.url, self.out_dir, progress_hook=progress_hook)
+        self._close()
+
+        final = _find_source(self.out_dir)
+        if final is None:
+            raise RuntimeError(
+                f"yt-dlp didn't produce a source file in {self.out_dir}; "
+                "supported extensions: " + ", ".join(_SOURCE_EXTS)
+            )
+        return final
+
+    def _close(self) -> None:
+        if self._ydl is not None:
+            try:
+                self._ydl.close()
+            except Exception:
+                pass
+            self._ydl = None
 
 
 def slice_source(

@@ -85,6 +85,35 @@ def _write_tone(path: Path, *, seconds: float, sample_rate: int = 44100) -> None
     sf.write(str(path), stereo, sample_rate, subtype="PCM_16")
 
 
+def _fake_fetcher_class(source_tone: Path, duration: float = 10.0):
+    """A stand-in for downloader.SourceFetcher: extract() returns fixed
+    metadata; download() drops the pre-written tone into out_dir. Patch it onto
+    ``processor.SourceFetcher`` to exercise the first-run path without yt-dlp."""
+    from pipeline.downloader import VideoMetadata
+
+    class _FakeFetcher:
+        def __init__(self, url, out_dir):
+            self.url = url
+            self.out_dir = Path(out_dir)
+
+        def extract(self):
+            return VideoMetadata(
+                id="fake", title="Fake", duration_seconds=duration,
+                extractor="fake", webpage_url=self.url,
+            )
+
+        def download(self, progress_hook=None):
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            dst = self.out_dir / "source.wav"
+            if not dst.exists():
+                dst.write_bytes(source_tone.read_bytes())
+            if progress_hook:
+                progress_hook({"status": "finished", "downloaded_bytes": 1, "total_bytes": 1})
+            return dst
+
+    return _FakeFetcher
+
+
 def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     # Bypass yt-dlp by writing a deterministic source and intercepting
     # probe, download_source, and slice_source. ``download_source`` returns
@@ -93,32 +122,7 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     source = tmp_path / "source.wav"
     _write_tone(source, seconds=10.0)
 
-    from pipeline import downloader as dl
-    from pipeline.downloader import VideoMetadata
-
-    def fake_probe(url: str) -> VideoMetadata:
-        return VideoMetadata(
-            id="fake",
-            title="Fake video",
-            duration_seconds=10.0,
-            extractor="fake",
-            webpage_url=url,
-        )
-
-    def fake_download_source(url, out_dir, *, progress_hook=None):
-        out_dir.mkdir(parents=True, exist_ok=True)
-        dst = out_dir / "source.wav"
-        if not dst.exists():
-            dst.write_bytes(source.read_bytes())
-        if progress_hook:
-            progress_hook(
-                {
-                    "status": "finished",
-                    "downloaded_bytes": dst.stat().st_size,
-                    "total_bytes": dst.stat().st_size,
-                }
-            )
-        return dst
+    from pipeline import processor as proc
 
     def fake_slice_source(src, out_path, *, start, end):
         audio, sr = sf.read(str(src), always_2d=True, dtype="float32")
@@ -126,14 +130,9 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
         sf.write(str(out_path), slice_audio, sr, subtype="PCM_16", format="WAV")
         return out_path
 
-    monkeypatch.setattr(dl, "probe", fake_probe)
-    monkeypatch.setattr(dl, "download_source", fake_download_source)
-    monkeypatch.setattr(dl, "slice_source", fake_slice_source)
-    # Processor imports them by name from pipeline.downloader, so patch there too.
-    from pipeline import processor as proc
-
-    monkeypatch.setattr(proc, "probe", fake_probe)
-    monkeypatch.setattr(proc, "download_source", fake_download_source)
+    # First run goes through SourceFetcher; patch it (and the slicer) so no
+    # yt-dlp is touched.
+    monkeypatch.setattr(proc, "SourceFetcher", _fake_fetcher_class(source))
     monkeypatch.setattr(proc, "slice_source", fake_slice_source)
 
     cache = JobCache(tmp_path / "cache")
@@ -199,3 +198,152 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     # Re-running is a no-op: cache hit short-circuits the pipeline.
     key2 = processor.run("fake://video", model="fake", keep_stems=["vocals", "other"])
     assert key2 == key
+
+
+def test_processor_progressive_produces_correct_chunks(tmp_path, monkeypatch):
+    # Progressive mode must produce the same correct, sample-accurate chunks as
+    # the download-once path. The fake download reports "finished" immediately,
+    # so the duration gate opens at once and we exercise the _ProgressiveSource
+    # plumbing + the gated loop without timing flakiness.
+    source = tmp_path / "source.wav"
+    _write_tone(source, seconds=10.0)
+
+    from pipeline import processor as proc
+
+    def fake_slice_source(src, out_path, *, start, end):
+        audio, sr = sf.read(str(src), always_2d=True, dtype="float32")
+        sf.write(str(out_path), audio[int(start * sr) : int(end * sr)], sr,
+                 subtype="PCM_16", format="WAV")
+        return out_path
+
+    # Progressive first-run downloads via SourceFetcher on a background thread;
+    # the fake reports "finished" immediately so the duration gate opens at once.
+    monkeypatch.setattr(proc, "SourceFetcher", _fake_fetcher_class(source))
+    monkeypatch.setattr(proc, "slice_source", fake_slice_source)
+
+    cache = JobCache(tmp_path / "cache")
+    processor = Processor(
+        engine=_FakeEngine(), cache=cache,
+        chunk_seconds=4.0, chunk_overlap_seconds=0.5, progressive=True,
+    )
+    key = processor.run("fake://video", model="fake", keep_stems=["vocals"])
+
+    meta = cache.load_meta(key)
+    assert meta is not None and meta.complete and meta.total_chunks > 1
+    plans = plan_chunks(meta.duration_seconds, meta.chunk_seconds, meta.chunk_overlap_seconds)
+    for plan in plans:
+        path = cache.chunk_path(key, plan.index)
+        assert path.exists()
+        info = sf.info(str(path))
+        assert abs(info.duration - (plan.play_end - plan.play_start)) < 0.05
+
+
+def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
+    # A prior run already probed this job and processed some chunks; a resume
+    # (after idle-abandon or a page refresh) must NOT pay the yt-dlp probe
+    # again, and must preserve the already-completed chunks.
+    from pipeline import processor as proc
+    from pipeline.cache import CacheMeta
+
+    class _BoomFetcher:
+        def __init__(self, *a, **k):
+            raise AssertionError("resume must not extract/download — no fetcher")
+
+    # Resume must reuse cached meta: no probe, no SourceFetcher construction.
+    monkeypatch.setattr(proc, "probe", lambda url: (_ for _ in ()).throw(
+        AssertionError("probe must be skipped on resume")))
+    monkeypatch.setattr(proc, "SourceFetcher", _BoomFetcher)
+
+    cache = JobCache(tmp_path / "cache")
+    processor = Processor(
+        engine=_FakeEngine(),
+        cache=cache,
+        chunk_seconds=10.0,
+        chunk_overlap_seconds=0.5,
+    )
+    key = cache.key(
+        "fake://video",
+        "fake",
+        ["vocals"],
+        chunk_seconds=10.0,
+        chunk_overlap_seconds=0.5,
+    )
+    plans = plan_chunks(120.0, 10.0, 0.5)
+    cache.save_meta(
+        key,
+        CacheMeta(
+            url="fake://video",
+            model="fake",
+            keep_stems=["vocals"],
+            duration_seconds=120.0,
+            chunk_seconds=10.0,
+            chunk_overlap_seconds=0.5,
+            total_chunks=len(plans),
+            title="Cached",
+            extractor="fake",
+            chunks_ready=[0, 1, 2],
+        ),
+    )
+
+    k, meta, info, returned_plans, fetcher = processor.prepare(
+        "fake://video", model="fake", keep_stems=["vocals"]
+    )
+    assert k == key
+    assert fetcher is None  # resume path: no extraction session
+    assert meta.chunks_ready == [0, 1, 2]  # not wiped
+    assert info.duration_seconds == 120.0  # reused, not re-probed
+    assert len(returned_plans) == len(plans)
+
+
+def test_abandon_all_signals_workers_and_clears_state():
+    # /cache/clear must tell live workers to stop (so they unwind cleanly
+    # instead of writing into deleted dirs) and wipe the in-memory maps.
+    from jobs import JobRegistry, JobState, JobStatus
+
+    registry = JobRegistry(processor=None, cache=None)
+    registry._jobs["k1"] = JobStatus(job_id="k1", state=JobState.PROCESSING)
+    registry._jobs["k2"] = JobStatus(job_id="k2", state=JobState.DOWNLOADING)
+    registry._subscribers["k1"] = []
+    registry._last_disconnect_at["k1"] = 123.0
+
+    registry.abandon_all()
+
+    assert registry._jobs == {}
+    assert registry._subscribers == {}
+    assert registry._last_disconnect_at == {}
+    assert registry._abandoning == {"k1", "k2"}
+
+
+def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):
+    # The C7 race: a /process landing during a job's abandon-unwind must NOT
+    # hand back the dying job (which would leave it stuck with no worker); it
+    # must spawn a fresh worker instead.
+    from jobs import JobRegistry, JobState, JobStatus
+
+    class _StubCache:
+        def key(self, *a, **k):
+            return "k1"
+
+        def load_meta(self, key):
+            return None
+
+    class _StubProcessor:
+        chunk_seconds = 10.0
+        chunk_overlap_seconds = 0.5
+
+    registry = JobRegistry(processor=_StubProcessor(), cache=_StubCache())
+    old = JobStatus(job_id="k1", state=JobState.PROCESSING)
+    registry._jobs["k1"] = old
+    registry._abandoning.add("k1")
+
+    # Don't run the real worker; just let submit register a thread.
+    monkeypatch.setattr(registry, "_run", lambda key, url, model, keep_stems: None)
+
+    status = registry.submit("fake://video", model="fake", keep_stems=["vocals"])
+    # Submit refused to adopt the dying job: it created a fresh QUEUED status,
+    # registered a new worker thread, and cleared the stale abandon mark — all
+    # synchronously under the lock, so these checks aren't racing the thread.
+    assert status is not old
+    assert status.state is JobState.QUEUED
+    assert "k1" in registry._threads
+    assert "k1" not in registry._abandoning

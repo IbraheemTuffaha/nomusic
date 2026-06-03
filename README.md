@@ -171,12 +171,12 @@ You only do this once. The extension stays installed.
 4. Click it.
 5. The first time you click on a video, you'll see status messages
    ticking through:
-   - **Inspecting video** (a couple of seconds)
-   - **Downloading video 45%**
-   - **Removing music 23%**
-6. As soon as the first 10 seconds are processed, the video plays on
-   its own without music. The video pauses briefly any time it's
-   waiting for more audio.
+   - **Preparing** (a couple of seconds)
+   - **Fetching 45%**
+   - **Removing 23%**
+6. As soon as the first chunk is processed, the video plays on its own
+   without music — it doesn't wait for the whole thing to download. The
+   video pauses briefly any time it's waiting for more audio.
 7. Click the button again any time to turn nomusic off and hear the
    original audio.
 
@@ -227,11 +227,12 @@ some music can come through. Uncheck it for stronger removal.
 Click the nomusic button to turn it off, then click it again. It
 resyncs.
 
-**A long video is taking forever to start**
-For a 3-hour video, the helper has to download the full audio (about
-30-60 seconds) before separation begins. After that the audio should
-start playing. You can pause and come back later — nomusic remembers
-where it left off and only does each chunk once.
+**A long video is slow to start**
+The first few seconds go to looking up the video and starting the
+download. Separation then begins on the early part while the rest keeps
+downloading, so playback starts well before the whole file is fetched.
+You can pause and come back later — nomusic remembers where it left off
+and only does each chunk once.
 
 **I closed Terminal by accident**
 That stops the helper. Open Terminal again, run Step 5, and you're
@@ -310,6 +311,13 @@ All optional, all prefixed `NOMUSIC_`:
 | `NOMUSIC_KEEP_SOURCE_AFTER_COMPLETE` | `false` | Keep yt-dlp source audio after processing (faster stem switching, more disk) |
 | `NOMUSIC_CHUNK_SECONDS` | `10` | Chunk size |
 | `NOMUSIC_CHUNK_OVERLAP_SECONDS` | `0.5` | Per-chunk overlap for separator context |
+| `NOMUSIC_IDLE_TIMEOUT_SECONDS` | `10` | How long a worker keeps running after you pause or close the tab before it abandons the job and releases the GPU; resume re-spawns from cache (0 disables) |
+| `NOMUSIC_SSE_KEEPALIVE_SECONDS` | `15` | Gap between SSE keep-alive comments on a quiet status stream |
+| `NOMUSIC_MEMORY_GC_INTERVAL_SECONDS` | `3600` | How often the in-memory job map is reclaimed for jobs whose disk cache is gone (0 disables) |
+| `NOMUSIC_DOWNLOAD_RATELIMIT` | unset | Artificial download cap for testing slow links — raw bytes/sec or `K`/`M` suffix (e.g. `200K`) |
+| `NOMUSIC_PROGRESSIVE` | `true` | Start separating early chunks from the partial download instead of waiting for the whole file (falls back automatically if the partial isn't decodable); set `0` to force download-once |
+| `NOMUSIC_RELOAD` | `false` | Dev only: watch `backend/*.py` and auto-restart on save (`1`/`true`) |
+| `NOMUSIC_DEBUG` | `false` | Raise backend logging to DEBUG (progressive download/gate diagnostics, etc.) |
 | `NOMUSIC_JS_RUNTIME` | auto-detected | Path to a JS runtime (deno/node/bun) for yt-dlp |
 
 ### API contract
@@ -319,7 +327,9 @@ All optional, all prefixed `NOMUSIC_`:
 | GET | `/healthz` | `{ok: true}` |
 | GET | `/capabilities` | Engine info, defaults, cache settings |
 | POST | `/process` | `{url, model?, keep_stems?}` → `JobStatus` |
+| POST | `/process/{job_id}/prioritize` | `{from_chunk}` → `{applied}`; reorder pending chunks around a seek |
 | GET | `/status/{job_id}` | `JobStatus` |
+| GET | `/events/{job_id}` | `text/event-stream` of `JobStatus` updates (204 if unknown); replaces polling |
 | GET | `/chunk/{job_id}/{idx}` | OGG/Opus bytes (425 if not yet ready) |
 | GET | `/audio/{job_id}` | Streams concatenated OGG/Opus (425 if not complete) |
 | GET | `/cache` | Cache stats |

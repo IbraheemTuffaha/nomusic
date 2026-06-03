@@ -12,6 +12,7 @@ rather than fighting for the GPU.
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import logging
 import threading
@@ -21,10 +22,19 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Callable, Optional
 
+from config import SETTINGS
 from pipeline.cache import CacheMeta, JobCache
 from pipeline.processor import Processor
 
 log = logging.getLogger(__name__)
+
+
+class WorkerAbandoned(Exception):
+    """Raised from the chunk provider when a job has had no SSE subscriber for
+    longer than ``idle_timeout_seconds``. It propagates up through
+    ``Processor.run`` and out of ``with self._gpu_lock:``, so the GPU lock is
+    released naturally on the way out and the worker thread exits. The client
+    re-spawns the job from disk-cached progress on its next click."""
 
 
 class JobState(str, Enum):
@@ -36,11 +46,16 @@ class JobState(str, Enum):
     ERROR = "error"
 
 
+# Button labels. Kept to a single word each and device-neutral: the audio is
+# fetched to the *server*, not the browser, and it's audio not video, so we
+# avoid "Downloading video". "Fetching" covers the yt-dlp pull without implying
+# where the bytes land; "Preparing" covers the metadata probe + planning;
+# "Removing" is the separation phase (music removal).
 _PHASE_LABELS: dict[str, str] = {
     "queued": "Queued",
-    "probing": "Inspecting video",
-    "downloading": "Downloading video",
-    "processing": "Removing music",
+    "probing": "Preparing",
+    "downloading": "Fetching",
+    "processing": "Removing",
     "ready": "Ready",
     "error": "Error",
 }
@@ -130,9 +145,56 @@ class JobRegistry:
         # If /prioritize arrives before the control exists (job is still
         # probing/downloading), stash the hint here and apply on creation.
         self._pending_priority: dict[str, int] = {}
+        # SSE bookkeeping. ``_subscribers`` maps a job key to the live
+        # asyncio.Queues feeding each open /events stream; the worker thread
+        # pushes status snapshots onto them via the event loop.
+        # ``_last_disconnect_at`` records when a job's last subscriber dropped
+        # off, which the idle-abandon timer reads. ``_loop`` is the running
+        # asyncio loop, captured at startup so a worker thread can hand work
+        # back to it safely.
+        self._subscribers: dict[str, list[asyncio.Queue]] = {}
+        self._last_disconnect_at: dict[str, float] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # Keys whose worker should stop at its next chunk boundary. Set either
+        # by the idle-abandon decision (atomically, under _lock, so a racing
+        # submit() can't reuse a job that's already given up) or by
+        # ``abandon_all`` (cache clear). The provider checks it first thing.
+        self._abandoning: set[str] = set()
         self._lock = threading.Lock()
         # One job runs at a time on the engine; further jobs block here.
         self._gpu_lock = threading.Lock()
+
+    # -- SSE subscription ----------------------------------------------------
+
+    def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Capture the server's event loop so worker threads can schedule
+        queue writes onto it. Called once from the FastAPI lifespan startup."""
+        self._loop = loop
+
+    def subscribe(self, key: str) -> asyncio.Queue:
+        """Register an /events stream for ``key`` and return its queue.
+
+        Clearing ``_last_disconnect_at`` here means a returning viewer resets
+        the idle clock the instant their stream opens."""
+        q: asyncio.Queue = asyncio.Queue()
+        with self._lock:
+            self._subscribers.setdefault(key, []).append(q)
+            self._last_disconnect_at.pop(key, None)
+        return q
+
+    def unsubscribe(self, key: str, q: asyncio.Queue) -> None:
+        """Drop one stream's queue. When the last subscriber for a still-live
+        job leaves, stamp the disconnect time so the idle timer can start
+        counting. We only stamp when the job is still in ``_jobs`` — there's
+        no point timing out a job that already finished."""
+        with self._lock:
+            subs = self._subscribers.get(key)
+            if not subs:
+                return
+            if q in subs:
+                subs.remove(q)
+            if not subs and key in self._jobs:
+                self._last_disconnect_at[key] = time.time()
 
     # -- public --------------------------------------------------------------
 
@@ -159,13 +221,30 @@ class JobRegistry:
 
         with self._lock:
             existing = self._jobs.get(key)
-            if existing and existing.state in (
-                JobState.QUEUED,
-                JobState.PROBING,
-                JobState.DOWNLOADING,
-                JobState.PROCESSING,
+            if (
+                existing
+                and existing.state
+                in (
+                    JobState.QUEUED,
+                    JobState.PROBING,
+                    JobState.DOWNLOADING,
+                    JobState.PROCESSING,
+                )
+                and key not in self._abandoning
             ):
+                # A returning/duplicate client. Restart the idle clock so the
+                # worker doesn't abandon the job in the window before this
+                # client's /events stream (re)connects, then hand back the
+                # live job. Skipped when the job is mid-abandon (``_abandoning``)
+                # so a /process landing during the unwind respawns a fresh
+                # worker instead of adopting one that's about to vanish.
+                self._last_disconnect_at[key] = time.time()
                 return existing
+
+            # New job, or one superseding an abandoning predecessor: clear any
+            # stale abandon mark so the fresh worker isn't killed on its first
+            # chunk boundary.
+            self._abandoning.discard(key)
 
             if existing_meta and existing_meta.complete:
                 initial_state = JobState.READY
@@ -230,6 +309,47 @@ class JobRegistry:
             title=meta.title,
         )
 
+    def memory_gc(self) -> int:
+        """Drop in-memory JobStatus entries whose disk cache is already gone.
+
+        Completed and errored jobs are intentionally kept in ``_jobs`` after
+        their worker exits so ``/status`` keeps reporting the final state.
+        This bounds that retention: once the disk TTL sweep has reaped a job's
+        cache directory (or it never had one), the in-memory entry is dead
+        weight, so we reclaim it. Jobs with a live worker thread are never
+        touched. Returns the number of entries dropped.
+        """
+        with self._lock:
+            candidates = [k for k in self._jobs if k not in self._threads]
+        dropped = 0
+        for key in candidates:
+            # Disk check is I/O; do it outside the lock.
+            if self.cache.load_meta(key) is not None:
+                continue
+            with self._lock:
+                if key in self._threads:
+                    continue  # a fresh submit spawned a worker since we looked
+                if self._jobs.pop(key, None) is not None:
+                    self._subscribers.pop(key, None)
+                    self._last_disconnect_at.pop(key, None)
+                    dropped += 1
+        return dropped
+
+    def abandon_all(self) -> None:
+        """Signal every running worker to abandon at its next chunk boundary
+        and drop all in-memory job state. Used by /cache/clear so wiping the
+        cache out from under live workers doesn't leave them mid-pipeline
+        writing into directories that no longer exist — instead each worker
+        unwinds cleanly out of the GPU lock via ``WorkerAbandoned`` and runs
+        its own ``finally`` cleanup.
+        """
+        with self._lock:
+            for key in self._jobs:
+                self._abandoning.add(key)
+            self._jobs.clear()
+            self._subscribers.clear()
+            self._last_disconnect_at.clear()
+
     # -- worker --------------------------------------------------------------
 
     def _run(
@@ -239,6 +359,14 @@ class JobRegistry:
         model: str,
         keep_stems: list[str],
     ) -> None:
+        # Capture our own identity so the finally cleanup only retracts state
+        # we still own. A submit() racing our abandon-unwind may have already
+        # replaced _jobs[key]/_threads[key] with a fresh worker; we must not
+        # clobber that one's bookkeeping.
+        my_thread = threading.current_thread()
+        with self._lock:
+            my_status = self._jobs.get(key)
+        abandoned = False
         try:
             try:
                 with self._gpu_lock:
@@ -261,6 +389,12 @@ class JobRegistry:
                             key, p
                         ),
                         next_chunk_provider=self._make_chunk_provider(key),
+                        abort_check=lambda: self._raise_if_abandoned(
+                            key, SETTINGS.idle_timeout_seconds
+                        ),
+                        on_wait_for_download=lambda frac: self._on_wait_for_download(
+                            key, frac
+                        ),
                     )
                 meta = self.cache.load_meta(key)
                 chunks_ready = len(meta.chunks_ready) if meta else 0
@@ -275,6 +409,18 @@ class JobRegistry:
                     total_chunks=total,
                 )
                 log.info("Job %s ready", key)
+            except WorkerAbandoned:
+                # Listed before the generic handler so an idle-abandon isn't
+                # mistaken for a failure. The GPU lock has already released via
+                # the with-block unwind; just flag it for finally to clean up.
+                abandoned = True
+                # ``%gs`` renders 30.0 as "30s" (not "30.0s") so the value
+                # matches the grep documented in the verification steps.
+                log.info(
+                    "Job %s abandoned: idle > %gs",
+                    key,
+                    SETTINGS.idle_timeout_seconds,
+                )
             except Exception as exc:
                 log.exception("Job %s failed", key)
                 self._enter_phase(
@@ -285,10 +431,32 @@ class JobRegistry:
                 )
         finally:
             # The control + any orphaned priority hint are only meaningful
-            # while a worker is consuming chunks; drop both unconditionally.
+            # while a worker is consuming chunks; drop them unconditionally.
             with self._lock:
                 self._controls.pop(key, None)
                 self._pending_priority.pop(key, None)
+                # Only retract the shared bookkeeping if we're still the
+                # registered worker for this key. If a submit() raced our
+                # unwind and installed a fresh worker, _threads[key] now points
+                # at that thread, not us — leave its _threads/_subscribers/
+                # _jobs entries alone. Dropping our own handle marks the job as
+                # having no live worker, which is what ``memory_gc`` keys off.
+                if self._threads.get(key) is my_thread:
+                    self._threads.pop(key, None)
+                    self._subscribers.pop(key, None)
+                    self._last_disconnect_at.pop(key, None)
+                    self._abandoning.discard(key)
+                    # The terminal _update(READY/ERROR) above already enqueued
+                    # its snapshot to every open stream, so dropping
+                    # _subscribers here loses nothing; each stream still drains
+                    # and closes itself. A stream that opens after this sees the
+                    # terminal state from disk and short-circuits.
+                    if abandoned and self._jobs.get(key) is my_status:
+                        # Drop the JobStatus so a later /process spawns a fresh
+                        # worker (resuming from disk-cached chunks) rather than
+                        # finding a stale entry. Completed/errored jobs are kept
+                        # for /status until memory_gc reclaims them.
+                        self._jobs.pop(key, None)
 
     def _enter_phase(
         self,
@@ -338,9 +506,31 @@ class JobRegistry:
             self._controls[key].prioritize(hint)
 
     def _on_download_progress(self, key: str, fraction: float | None) -> None:
-        # yt-dlp emits 1.0 on completion; we stay in DOWNLOADING until the
-        # first separation chunk fires, so the UI doesn't briefly snap to
-        # 0% on the phase boundary.
+        # In progressive mode the download runs concurrently with separation,
+        # so download ticks ("Fetching", download %) and separation ticks
+        # ("Removing", chunk %) interleave. Once separation has started, keep
+        # the UI on "Removing" — flipping back to "Fetching" every download
+        # tick just flickers the label and bounces the percentage between two
+        # different scales. The download still proceeds in the background.
+        with self._lock:
+            status = self._jobs.get(key)
+            if status is not None and status.state in (
+                JobState.PROCESSING,
+                JobState.READY,
+                JobState.ERROR,
+            ):
+                return
+        self._update(key, state=JobState.DOWNLOADING, phase="downloading",
+                     phase_label=_PHASE_LABELS["downloading"],
+                     phase_progress=fraction)
+
+    def _on_wait_for_download(self, key: str, fraction: float | None) -> None:
+        # Separation is blocked waiting for the download to reach this chunk —
+        # the user seeked past the downloaded point, or the download is slower
+        # than separation. This is the one case where flipping back to
+        # "Fetching" is right: playback is genuinely gated on the download, not
+        # on separation. Unlike _on_download_progress this isn't suppressed
+        # during PROCESSING, because here the download IS the bottleneck.
         self._update(key, state=JobState.DOWNLOADING, phase="downloading",
                      phase_label=_PHASE_LABELS["downloading"],
                      phase_progress=fraction)
@@ -375,15 +565,52 @@ class JobRegistry:
     # -- prioritization ------------------------------------------------------
 
     def _make_chunk_provider(self, key: str) -> Callable[[], Optional[int]]:
-        """Build the callable that ``Processor.run`` calls between chunks."""
+        """Build the callable that ``Processor.run`` calls between chunks.
+
+        Returns the next chunk index, ``None`` when the queue is exhausted, or
+        raises ``WorkerAbandoned`` when nobody has been streaming status for
+        longer than ``idle_timeout_seconds``. The idle check runs here — at the
+        chunk boundary — so abandoning costs at most one in-flight chunk and
+        unwinds cleanly out of the GPU lock.
+        """
+        idle_timeout = SETTINGS.idle_timeout_seconds
 
         def provider() -> Optional[int]:
-            control = self._controls.get(key)
+            self._raise_if_abandoned(key, idle_timeout)
+            with self._lock:
+                control = self._controls.get(key)
             if control is None:
                 return None
             return control.next_chunk()
 
         return provider
+
+    def _raise_if_abandoned(self, key: str, idle_timeout: float) -> None:
+        """Raise ``WorkerAbandoned`` if the job has been flagged (idle decision
+        on a prior call, or a cache clear) or has now gone idle. The whole
+        check + flag-set happens under the lock so it can't interleave with a
+        submit() deciding whether to adopt the job. Shared by the chunk
+        provider and the progressive-download abort hook so a pause that lands
+        mid-download still releases the GPU promptly."""
+        with self._lock:
+            if key in self._abandoning:
+                raise WorkerAbandoned
+            if idle_timeout <= 0:
+                return
+            if self._subscribers.get(key):
+                return
+            # No subscriber: count from the last disconnect, or from job
+            # creation if nobody ever connected (covers a /process whose client
+            # never opened /events). Mark _abandoning before releasing the lock
+            # so a concurrent submit() sees a job that has committed to dying
+            # and respawns instead of adopting it.
+            last_disc = self._last_disconnect_at.get(key)
+            status = self._jobs.get(key)
+            created_at = status.created_at if status else time.time()
+            ref = last_disc if last_disc is not None else created_at
+            if time.time() - ref >= idle_timeout:
+                self._abandoning.add(key)
+                raise WorkerAbandoned
 
     def prioritize(self, key: str, from_chunk: int) -> bool:
         """Rotate the job's pending-chunk order so ``from_chunk`` is next.
@@ -417,6 +644,8 @@ class JobRegistry:
     # -- internals -----------------------------------------------------------
 
     def _update(self, key: str, **fields) -> None:
+        snapshot: dict | None = None
+        subs: list[asyncio.Queue] = []
         with self._lock:
             status = self._jobs.get(key)
             if status is None:
@@ -424,3 +653,22 @@ class JobRegistry:
             for name, value in fields.items():
                 setattr(status, name, value)
             status.updated_at = time.time()
+            # Snapshot inside the lock and hand the immutable dict — not the
+            # live JobStatus — to subscribers, so the worker can keep mutating
+            # status while an SSE coroutine serializes a past state.
+            subs = list(self._subscribers.get(key, []))
+            if subs:
+                snapshot = status.to_dict()
+        # call_soon_threadsafe hops from this worker thread to the event loop,
+        # which is the only safe way to touch an asyncio.Queue from off-loop.
+        # Guard against a loop that's closing during shutdown/teardown: a
+        # daemon worker mid-_update would otherwise raise RuntimeError("Event
+        # loop is closed") into the separation callbacks and mislabel the job
+        # ERROR. Dropping the snapshot is correct — the process is going away.
+        loop = self._loop
+        if snapshot is not None and loop is not None and not loop.is_closed():
+            for q in subs:
+                try:
+                    loop.call_soon_threadsafe(q.put_nowait, snapshot)
+                except RuntimeError:
+                    break

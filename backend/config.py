@@ -94,5 +94,41 @@ class Settings:
         default_factory=lambda: _env_bool("KEEP_SOURCE_AFTER_COMPLETE", False)
     )
 
+    # How long a worker keeps running after its last status subscriber drops.
+    # The extension closes its /events stream when you close the tab OR pause
+    # the video, so "no subscriber for this long" means "not actively
+    # watching". When it elapses, the worker abandons the job between chunks —
+    # releasing the GPU lock — so an idle server stops burning the GPU. Resume
+    # is cheap (re-spawn from disk-cached progress, no re-probe), so we keep
+    # this short. ``0`` disables idle-abandon (workers always run to completion
+    # regardless of who's watching).
+    idle_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("IDLE_TIMEOUT_SECONDS", 10.0)
+    )
+    # Gap between SSE keep-alive comments on an otherwise-quiet stream. Keeps
+    # proxies and the browser from treating a long processing pause (e.g. a
+    # slow probe + download with no chunk events) as a dead connection.
+    sse_keepalive_seconds: float = field(
+        default_factory=lambda: _env_float("SSE_KEEPALIVE_SECONDS", 15.0)
+    )
+    # Interval for the in-memory GC pass that drops JobStatus entries whose
+    # disk cache has already been swept away. Runs on its own daemon thread
+    # alongside the disk TTL sweep, keying in-memory lifetime to the on-disk
+    # TTL so server memory never outlives the files it describes. ``0``
+    # disables it.
+    memory_gc_interval_seconds: float = field(
+        default_factory=lambda: _env_float("MEMORY_GC_INTERVAL_SECONDS", 3600.0)
+    )
+    # Start separating early chunks from the partially-downloaded source
+    # instead of waiting for the whole download, so playback begins sooner.
+    # Each chunk is sliced only once enough of the timeline is on disk; if the
+    # partial container isn't decodable (some sites/formats) it transparently
+    # falls back to waiting for the full file, so the worst case is just the
+    # old download-once behavior. On by default; set NOMUSIC_PROGRESSIVE=0 to
+    # force download-once.
+    progressive_download: bool = field(
+        default_factory=lambda: _env_bool("PROGRESSIVE", True)
+    )
+
 
 SETTINGS = Settings()
