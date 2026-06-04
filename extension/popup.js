@@ -15,9 +15,7 @@ const ALL_STEMS = [
 // the bare name.
 const MODEL_HINTS = {
   htdemucs: "fast, balanced",
-  htdemucs_ft: "best quality, ~4× slower",
-  mdx_extra: "alternative model, slower",
-  mdx_extra_q: "alternative, compact & faster",
+  htdemucs_ft: "slower, best",
 };
 
 async function load() {
@@ -57,7 +55,12 @@ async function load() {
       opt.textContent = hint ? `${m} (${hint})` : m;
       select.appendChild(opt);
     }
-    select.value = stored.model || defaultModel || models[0] || "";
+    // Heal a stale saved model (e.g. one we've since removed): fall back to the
+    // default and rewrite storage so content.js stops sending the dead value.
+    const valid =
+      models.includes(stored.model) ? stored.model
+        : (defaultModel || models[0] || "");
+    select.value = valid;
 
     const defaultKeep = caps.defaults?.keep_stems || ["vocals"];
     const keep = stored.keepStems || defaultKeep;
@@ -77,6 +80,13 @@ async function load() {
       row.append(cb, text);
       stemsEl.appendChild(row);
     }
+
+    // Heal a stale saved model (e.g. one we've since removed): fall back to the
+    // default and rewrite storage so content.js stops sending the dead value.
+    // Done here, AFTER the stem checkboxes are rebuilt, so persist() reads the
+    // real keep-stems instead of wiping them from a still-empty #stems; awaited
+    // so a storage rejection surfaces instead of being silently dropped.
+    if (stored.model && stored.model !== valid) await persist();
   } else {
     $("status").classList.add("bad");
     $("statusText").textContent = "backend not reachable";
@@ -108,11 +118,16 @@ async function refreshCacheSize() {
     const total = data.total_bytes || 0;
     const jobs = data.job_count || 0;
     const sources = data.source_count || 0;
+    const videos = data.video_count || 0;
+    // videos/ can dwarf the rest (cached multi-GB exports), so surface it in
+    // the breakdown rather than letting the total jump unexplained. Omit the
+    // segment when there are none, to keep the common case uncluttered.
+    const videoSeg = videos ? `, ${videos} video${videos === 1 ? "" : "s"}` : "";
     $("cacheSize").textContent =
       total === 0
         ? "empty"
         : `${fmtBytes(total)} (${jobs} job${jobs === 1 ? "" : "s"}, ` +
-          `${sources} source${sources === 1 ? "" : "s"})`;
+          `${sources} source${sources === 1 ? "" : "s"}${videoSeg})`;
     // Keep the button enabled even when empty so a stale "empty" reading
     // (e.g. backend just restarted) isn't a dead-end. The server treats
     // clearing an empty cache as a no-op.
@@ -193,7 +208,17 @@ async function clearCache() {
   await refreshCacheSize();
 }
 
-async function save() {
+let savedTimer = null;
+function flashSaved() {
+  const el = $("saved");
+  el.textContent = "✓ saved";
+  if (savedTimer) clearTimeout(savedTimer);
+  savedTimer = setTimeout(() => (el.textContent = ""), 1200);
+}
+
+// Persist the current form state. Called on every change — there's no Save
+// button; the popup auto-saves.
+async function persist() {
   const backendUrl = $("backend").value.trim() || "http://127.0.0.1:8723";
   const model = $("model").value || null;
   const checkboxes = $("stems").querySelectorAll('input[type="checkbox"]');
@@ -205,13 +230,22 @@ async function save() {
     model,
     keepStems: keepStems.length ? keepStems : null,
   });
-  $("err").textContent = "saved";
-  setTimeout(() => ($("err").textContent = ""), 1200);
+  flashSaved();
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
   await load();
-  $("save").addEventListener("click", save);
+  // Auto-save on any change.
+  $("model").addEventListener("change", persist);
+  // Stems are recreated by load(); a delegated listener on the container
+  // survives those rebuilds, so we bind it once here.
+  $("stems").addEventListener("change", persist);
+  // Backend URL commits on blur/Enter (not per keystroke), then we re-check
+  // health and reload the model list for the new backend.
+  $("backend").addEventListener("change", async () => {
+    await persist();
+    await load();
+  });
   $("clearCache").addEventListener("click", clearCache);
   refreshCacheSize();
   refreshCacheTtl();
