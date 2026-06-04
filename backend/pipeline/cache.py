@@ -36,6 +36,10 @@ SCHEMA_VERSION = 3
 CHUNK_EXT = ".opus"
 CHUNK_MEDIA_TYPE = "audio/ogg"
 
+# Top-level dirs under the cache root that hold url-keyed caches, not jobs.
+# The job-dir scans (stats, TTL sweep) skip these and handle them separately.
+_RESERVED_DIRS = frozenset({"sources", "videos"})
+
 
 @dataclass
 class CacheMeta:
@@ -118,6 +122,22 @@ class JobCache:
         shutil.rmtree(path, ignore_errors=True)
         log.info("Dropped source cache for %s (%d bytes)", url, freed)
         return freed
+
+    def video_dir(self, url: str, max_height: int | None = None) -> Path:
+        """Dir for a cached *video* download backing the MP4 export.
+
+        The pipeline only ever fetches audio, so the video stream is pulled
+        on demand by ``GET /video/{job_id}``. We cache it here so repeat
+        exports of the same video don't re-download a multi-GB stream. The key
+        includes the requested ``max_height`` so switching the download-quality
+        setting fetches the new resolution instead of reusing the old one.
+        Reaped by the TTL sweep and the "Clear cache" button just like
+        ``sources/``."""
+        tag = str(max_height) if max_height else "best"
+        key = hashlib.sha256(f"{url}\x00{tag}".encode()).hexdigest()[:16]
+        path = self.root / "videos" / key
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     # -- meta ----------------------------------------------------------------
 
@@ -205,19 +225,30 @@ class JobCache:
                     source_count += 1
                     source_bytes += _dir_bytes(p)
 
+        videos_root = self.root / "videos"
+        video_count = 0
+        video_bytes = 0
+        if videos_root.exists():
+            for p in videos_root.glob("*"):
+                if p.is_dir():
+                    video_count += 1
+                    video_bytes += _dir_bytes(p)
+
         job_count = 0
         job_bytes = 0
         for p in self.root.iterdir():
-            if not p.is_dir() or p.name == "sources":
+            if not p.is_dir() or p.name in _RESERVED_DIRS:
                 continue
             job_count += 1
             job_bytes += _dir_bytes(p)
 
         return {
-            "total_bytes": source_bytes + job_bytes,
+            "total_bytes": source_bytes + video_bytes + job_bytes,
             "source_bytes": source_bytes,
+            "video_bytes": video_bytes,
             "job_bytes": job_bytes,
             "source_count": source_count,
+            "video_count": video_count,
             "job_count": job_count,
         }
 
@@ -263,17 +294,21 @@ class JobCache:
 
         # Jobs: ~/.cache/nomusic/<key>
         for child in list(self.root.iterdir()):
-            if not child.is_dir() or child.name == "sources":
+            if not child.is_dir() or child.name in _RESERVED_DIRS:
                 continue
             if _dir_newest_mtime(child) < now - ttl_seconds:
                 freed += _dir_bytes(child)
                 shutil.rmtree(child, ignore_errors=True)
                 removed += 1
 
-        # Sources: ~/.cache/nomusic/sources/<url_hash>
-        sources_root = self.root / "sources"
-        if sources_root.exists():
-            for child in list(sources_root.iterdir()):
+        # Sources + videos: ~/.cache/nomusic/{sources,videos}/<url_hash>. Both
+        # are url-keyed caches swept per-entry (a single old dir doesn't drag
+        # the whole tree down with it).
+        for tree in ("sources", "videos"):
+            tree_root = self.root / tree
+            if not tree_root.exists():
+                continue
+            for child in list(tree_root.iterdir()):
                 if not child.is_dir():
                     continue
                 if _dir_newest_mtime(child) < now - ttl_seconds:
