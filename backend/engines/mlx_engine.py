@@ -22,14 +22,14 @@ from .base import DEMUCS_STEMS, Engine, EngineCapabilities, SeparationResult
 
 log = logging.getLogger(__name__)
 
-# Models known to demucs. ``htdemucs`` is the project default: ~80 MB, 9.0 dB
-# SDR, and the fastest of the four-source models on M-series silicon.
-# ``htdemucs_ft`` is more accurate but ~4x slower; never selected by default.
+# Models we expose. ``htdemucs`` is the project default: ~80 MB, 9.0 dB SDR,
+# and the fastest of the four-source models on M-series silicon. ``htdemucs_ft``
+# is more accurate but ~4x slower; never selected by default. The ``mdx_extra``
+# models are dropped — they're slower (or merely compact), not better, and the
+# quantized one needed an extra ``diffq`` dependency.
 _SUPPORTED_MODELS: tuple[str, ...] = (
     "htdemucs",
     "htdemucs_ft",
-    "mdx_extra",
-    "mdx_extra_q",
 )
 _DEFAULT_MODEL = "htdemucs"
 

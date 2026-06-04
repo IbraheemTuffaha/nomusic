@@ -244,11 +244,14 @@ def create_app() -> FastAPI:
         caps = engine.capabilities()
         model = req.model or caps.default_model
         if model not in caps.supported_models:
-            raise HTTPException(
-                status_code=400,
-                detail=f"unsupported model {model!r}; "
-                f"supported: {list(caps.supported_models)}",
+            # Fall back instead of erroring: a client may carry a stale model in
+            # its saved settings (e.g. one we've since dropped). Log it and use
+            # the default rather than failing the job.
+            log.warning(
+                "unknown model %r requested; falling back to default %r",
+                model, caps.default_model,
             )
+            model = caps.default_model
         keep_stems = list(req.keep_stems or SETTINGS.default_keep_stems)
         try:
             status = registry.submit(req.url, model=model, keep_stems=keep_stems)
