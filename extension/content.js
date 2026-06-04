@@ -886,6 +886,17 @@
     proto._nomusicInstrumented = true;
   })();
 
+  // Strip characters that are illegal in filenames across Windows/macOS/Linux
+  // (plus control chars), collapse whitespace, and bound the length so a very
+  // long video title can't produce an unwieldy filename.
+  function sanitizeFilename(name) {
+    return (name || "")
+      .replace(/[/\\:*?"<>|\x00-\x1f]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120);
+  }
+
   // ---------------------------------------------------------------------------
   // Button + per-video attachment
   // ---------------------------------------------------------------------------
@@ -918,6 +929,36 @@
       this.label.textContent = "nomusic";
       this.pct = document.createElement("span");
       this.pct.className = "nomusic-btn__pct";
+      // Latest video title from the backend status stream; used to name the
+      // downloaded file. Populated in showStatus().
+      this.title = "";
+      // Download control: a chevron that opens a dropdown menu (MP3 + MP4 at
+      // several resolutions). Only visible once the job is ready (CSS keys it
+      // off [data-state="active"]). A <span role="button"> avoids nested-button
+      // HTML inside the pill; the menu itself lives on document.body (see
+      // _buildMenu) so its <button> items aren't nested in the pill <button>.
+      this.dlBtn = document.createElement("span");
+      this.dlBtn.className = "nomusic-btn__dl";
+      this.dlBtn.setAttribute("role", "button");
+      this.dlBtn.setAttribute("aria-haspopup", "menu");
+      this.dlBtn.setAttribute("aria-label", "Download…");
+      this.dlBtn.title = "Download…";
+      this.dlBtn.textContent = "⤵"; // ⤵ download-ish chevron
+      this.dlBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        this.toggleMenu();
+      });
+      this._menuOpen = false;
+      this._downloading = false;
+      this.menu = this._buildMenu();
+      // Close the menu on an outside click / scroll / resize. Capture phase so
+      // we see the event even if the host page stops propagation.
+      this._onDocClick = (e) => {
+        if (this._menuOpen && !this.menu.contains(e.target) && e.target !== this.dlBtn)
+          this.closeMenu();
+      };
+      this._onReposition = () => this.closeMenu();
       // <span role="button"> rather than nested <button> — nested buttons
       // are invalid HTML and some browsers (older Safari) misroute clicks
       // when they appear.
@@ -939,6 +980,7 @@
         this.icon,
         this.label,
         this.pct,
+        this.dlBtn,
         this.dismissBtn,
       );
       this.el.addEventListener("click", (e) => {
@@ -959,6 +1001,8 @@
         this.session.dispose();
         this.session = null;
       }
+      this.closeMenu();
+      this.menu.remove(); // it lives on document.body, so clean it up
       this.el.style.display = "none";
     }
 
@@ -972,6 +1016,9 @@
 
     /** ``status`` is the raw JobStatus from the backend. */
     showStatus(status) {
+      // Remember the title for the download filename; it arrives on every
+      // snapshot but isn't otherwise displayed.
+      if (status.title) this.title = status.title;
       const state = status.state;
       if (state === "ready") {
         this._clearErrorRevert();
@@ -1000,6 +1047,10 @@
     }
 
     setBuffering() {
+      // An in-flight export owns the pill (Preparing/Encoding N%); a playback
+      // buffer event must not clobber it. _showExportProgress has the inverse
+      // guard, so the export display is fully isolated while _downloading.
+      if (this._downloading) return;
       this._clearErrorRevert();
       this.el.dataset.state = "working";
       this.label.textContent = "Buffering";
@@ -1012,6 +1063,7 @@
      *  idle. Keeps the current % + fill so the frozen progress is visible,
      *  and the non-"working" state stops the icon pulse. */
     setPaused() {
+      if (this._downloading) return; // export owns the pill — see setBuffering
       this._clearErrorRevert();
       this.el.dataset.state = "paused";
       this.label.textContent = "Paused";
@@ -1054,7 +1106,211 @@
     }
 
     dispose() {
+      // Drop the body-level menu node and its open-state listeners. Without
+      // this, a button torn down on SPA navigation (video emptied) leaves its
+      // hidden menu orphaned on document.body, one per navigation. openMenu()
+      // re-appends it if this same button is later reused.
+      this.closeMenu();
+      this.menu.remove();
       this.setIdle();
+    }
+
+    // The download menu. MP3 (audio only) plus MP4 at a few resolution caps.
+    // Resolution is a ceiling — the backend grabs the best stream up to it and
+    // falls back when a video doesn't offer that height.
+    static MENU_ITEMS = [
+      { section: "Audio" },
+      { label: "MP3 — audio only", format: "mp3", height: 0 },
+      { section: "Video (MP4)" },
+      { label: "Best available", format: "mp4", height: 0 },
+      { label: "2160p · 4K", format: "mp4", height: 2160 },
+      { label: "1440p", format: "mp4", height: 1440 },
+      { label: "1080p", format: "mp4", height: 1080 },
+      { label: "720p", format: "mp4", height: 720 },
+      { label: "480p", format: "mp4", height: 480 },
+    ];
+
+    _buildMenu() {
+      const menu = document.createElement("div");
+      menu.className = "nomusic-menu";
+      menu.setAttribute("role", "menu");
+      menu.hidden = true;
+      for (const it of Button.MENU_ITEMS) {
+        if (it.section) {
+          const h = document.createElement("div");
+          h.className = "nomusic-menu__section";
+          h.textContent = it.section;
+          menu.appendChild(h);
+          continue;
+        }
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "nomusic-menu__item";
+        b.textContent = it.label;
+        b.addEventListener("click", (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          this.closeMenu();
+          this.download(it.format, it.height);
+        });
+        menu.appendChild(b);
+      }
+      // Lives on body (not inside the pill <button>) to avoid nested buttons
+      // and host-page overflow clipping; positioned on open via openMenu().
+      document.body.appendChild(menu);
+      return menu;
+    }
+
+    toggleMenu() {
+      this._menuOpen ? this.closeMenu() : this.openMenu();
+    }
+
+    openMenu() {
+      if (this._downloading) return; // no menu while a download is in flight
+      // The menu lives on document.body and is removed on dispose() (so a
+      // torn-down button doesn't orphan it). The button itself is reusable
+      // after dispose() → setIdle(), so re-attach before measuring/positioning.
+      if (!this.menu.isConnected) document.body.appendChild(this.menu);
+      const r = this.el.getBoundingClientRect();
+      this.menu.hidden = false; // unhide first so offsetWidth/Height are real
+      const mw = this.menu.offsetWidth;
+      const mh = this.menu.offsetHeight;
+      let left = Math.max(8, r.right - mw); // right-align to the pill
+      let top = r.bottom + 6;
+      if (top + mh > window.innerHeight - 8) top = r.top - 6 - mh; // flip up
+      this.menu.style.left = `${Math.round(left)}px`;
+      this.menu.style.top = `${Math.round(Math.max(8, top))}px`;
+      this._menuOpen = true;
+      document.addEventListener("click", this._onDocClick, true);
+      window.addEventListener("scroll", this._onReposition, true);
+      window.addEventListener("resize", this._onReposition, true);
+    }
+
+    closeMenu() {
+      if (!this._menuOpen) return;
+      this.menu.hidden = true;
+      this._menuOpen = false;
+      document.removeEventListener("click", this._onDocClick, true);
+      window.removeEventListener("scroll", this._onReposition, true);
+      window.removeEventListener("resize", this._onReposition, true);
+    }
+
+    /** Fetch the finished export from the backend and save it to disk.
+     *  ``format`` is "mp3" (stripped audio) or "mp4" (video + stripped audio);
+     *  ``height`` caps the MP4 resolution (0 = best available). We fetch the
+     *  bytes and save via a blob: URL because a direct cross-origin
+     *  <a download> to the backend would have its filename ignored. */
+    async download(format, height = 0) {
+      const jobId = this.session?.jobId;
+      if (!jobId) return;
+      if (this._downloading) return; // ignore double-clicks mid-download
+      this._downloading = true;
+
+      const ext = format === "mp4" ? "mp4" : "mp3";
+      const q = height ? `?max_height=${height}` : "";
+      const url =
+        format === "mp4"
+          ? `${settings.backendUrl}/video/${jobId}${q}`
+          : `${settings.backendUrl}/audio/${jobId}?format=mp3`;
+
+      // Busy feedback — freeze the pill while preparing.
+      this._clearErrorRevert();
+      this.el.dataset.state = "working";
+      this.label.textContent = format === "mp4" ? "Preparing…" : "Saving…";
+      this.pct.textContent = "";
+      this.fill.style.width = "0%";
+
+      // MP4 prep can take a while (download + mux/re-encode); poll the backend
+      // so the pill shows real "Fetching N%" / "Encoding N%" progress.
+      let pollTimer = null;
+      if (format === "mp4") {
+        const progUrl = `${settings.backendUrl}/video/${jobId}/progress${q}`;
+        const poll = async () => {
+          try {
+            const r = await fetch(progUrl, { cache: "no-store" });
+            if (r.ok) this._showExportProgress(await r.json());
+          } catch (_e) {
+            /* transient; keep polling */
+          }
+        };
+        pollTimer = setInterval(poll, 600);
+        poll();
+      }
+
+      let objUrl = null;
+      try {
+        // no-store: never reuse a cached response. Older backends served raw
+        // Opus at the ?format=mp3 URL with a 24h cache header, which the
+        // browser would otherwise keep handing back instead of the real MP3.
+        const resp = await fetch(url, { cache: "no-store" });
+        if (!resp.ok) {
+          throw new Error(
+            resp.status === 425 ? "not ready" : `HTTP ${resp.status}`,
+          );
+        }
+        const blob = await resp.blob();
+        // Stop progress polling the moment the bytes arrive, before we restore
+        // the label, so a late poll can't overwrite it.
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+        objUrl = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = objUrl;
+        a.download = `${sanitizeFilename(this.title) || "nomusic"}.${ext}`;
+        a.rel = "noopener";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        this._restoreAfterDownload();
+      } catch (err) {
+        console.warn("[nomusic] download failed", err);
+        this._flashDownloadError();
+      } finally {
+        if (pollTimer) clearInterval(pollTimer);
+        this._downloading = false;
+        // Revoke after the click-initiated download has had time to start;
+        // revoking immediately can cancel it in some browsers.
+        if (objUrl) setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
+      }
+    }
+
+    /** Render a polled export-progress snapshot onto the pill. */
+    _showExportProgress(p) {
+      if (!this._downloading || !p) return;
+      if (p.phase === "idle" || p.phase === "done") return;
+      const label = p.phase === "downloading" ? "Fetching" : "Encoding";
+      const pct = Math.max(0, Math.min(100, Math.round(p.percent || 0)));
+      this.el.dataset.state = "working";
+      this.label.textContent = label;
+      this.pct.textContent = `${pct}%`;
+      this.fill.style.width = `${pct}%`;
+    }
+
+    /** Return the pill to its post-download resting visual: "nomusic on" if the
+     *  session is still live, otherwise idle. */
+    _restoreAfterDownload() {
+      if (this.session && !this.session.disposed) {
+        this.el.dataset.state = "active";
+        this.label.textContent = "nomusic on";
+        this.pct.textContent = "";
+        this.fill.style.width = "0%";
+      } else {
+        this.setIdle();
+      }
+    }
+
+    _flashDownloadError() {
+      this.el.dataset.state = "error";
+      this.label.textContent = "Download failed";
+      this.pct.textContent = "";
+      this.fill.style.width = "0%";
+      this._clearErrorRevert();
+      this._errorRevertTimer = setTimeout(() => {
+        this._errorRevertTimer = null;
+        if (this.el.dataset.state === "error") this._restoreAfterDownload();
+      }, 2500);
     }
 
     position(host) {

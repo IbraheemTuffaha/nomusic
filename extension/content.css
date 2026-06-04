@@ -97,6 +97,82 @@
   transform: scale(1.08);
 }
 
+/* Download control: a small chevron that opens the download menu. Only
+   meaningful once the job is ready, so it appears only in the active (green)
+   state and stays out of the layout otherwise. Sits above the progress fill
+   like the rest of the content. */
+.nomusic-btn__dl {
+  position: relative;
+  z-index: 1;
+  display: none;
+  /* Match the icon's height (14px) so the chevron is never the tallest flex
+     item — otherwise it stretches the pill taller whenever it appears. */
+  width: 14px;
+  height: 14px;
+  line-height: 14px;
+  text-align: center;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.28);
+  color: #f5f6f8;
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 120ms ease, transform 120ms ease;
+}
+.nomusic-btn[data-state="active"] .nomusic-btn__dl {
+  display: inline-block;
+}
+.nomusic-btn__dl:hover {
+  background: rgba(0, 0, 0, 0.45);
+  transform: translateY(-1px);
+}
+
+/* Download menu. Lives on document.body (fixed-positioned by JS on open) so it
+   isn't clipped by the host player and doesn't nest <button>s inside the pill
+   <button>. z-index sits just above the pill. */
+.nomusic-menu {
+  position: fixed;
+  z-index: 2147483601;
+  min-width: 168px;
+  padding: 5px;
+  border-radius: 10px;
+  background: rgba(20, 22, 28, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  backdrop-filter: saturate(140%) blur(8px);
+  -webkit-backdrop-filter: saturate(140%) blur(8px);
+  color: #f5f6f8;
+  font: 500 12px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    sans-serif;
+  user-select: none;
+}
+.nomusic-menu[hidden] {
+  display: none;
+}
+.nomusic-menu__section {
+  padding: 6px 9px 3px;
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: #8a92a0;
+}
+.nomusic-menu__item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 9px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.nomusic-menu__item:hover {
+  background: rgba(70, 95, 160, 0.55);
+}
+
 /* Clip wrapper for the progress fill: matches the pill's rounding and hides
    overflow, so the fill reads as a straight-edged bar clipped to the pill
    shape (not a rounded blob at low %). It's a separate element from the pill
