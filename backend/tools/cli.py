@@ -67,11 +67,20 @@ def main() -> int:
         args.url, model=model, keep_stems=keep_stems, on_progress=on_progress
     )
     meta = cache.load_meta(key)
-    full = cache.full_path(key)
     print(f"\ncache key:  {key}")
-    print(f"complete:   {meta.complete if meta else False}")
-    print(f"full audio: {full if full.exists() else '(not yet written)'}")
-    print(f"elapsed:    {time.time() - t0:.1f}s for {meta.duration_seconds:.1f}s of source")
+    print(f"cache dir:  {cache.dir_for(key)}")
+    if meta is None:
+        print("complete:   (no meta written)")
+        print(f"elapsed:    {time.time() - t0:.1f}s")
+    else:
+        print(
+            f"complete:   {meta.complete} "
+            f"({len(meta.chunks_ready)}/{meta.total_chunks} chunks)"
+        )
+        print(
+            f"elapsed:    {time.time() - t0:.1f}s "
+            f"for {meta.duration_seconds:.1f}s of source"
+        )
     return 0
 
 

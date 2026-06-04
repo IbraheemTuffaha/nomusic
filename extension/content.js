@@ -75,8 +75,12 @@
       this.muteAsserter = null;
       this.jobId = null;
       this.totalChunks = 0;
-      this.chunkSeconds = 30;
-      this.chunkOverlapSeconds = 1;
+      // Must mirror the backend defaults (config.py: chunk_seconds=10,
+      // chunk_overlap_seconds=0.5). fetchCapabilities() overwrites these, but
+      // it is best-effort — if it fails these stay in force, and a wrong value
+      // throws stride/playStart ~3x off and desyncs every chunk after the first.
+      this.chunkSeconds = 10;
+      this.chunkOverlapSeconds = 0.5;
       this.duration = 0;
       // idx -> { buffer: AudioBuffer, playStart: number }
       this.chunks = new Map();

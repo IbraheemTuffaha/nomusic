@@ -23,7 +23,7 @@ import hashlib
 import json
 import logging
 import shutil
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -97,6 +97,13 @@ class JobCache:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def _key_dir(self, key: str) -> Path:
+        """Resolve a job dir WITHOUT creating it. Read paths must not mkdir, or
+        any request with an unknown ``job_id`` (GET /status, /chunk, /audio,
+        the GC re-checking swept keys) leaves a phantom empty dir behind that
+        then inflates ``stats().job_count`` until the TTL sweep reclaims it."""
+        return self.root / key
+
     def source_dir(self, url: str) -> Path:
         path = self.root / "sources" / self.url_key(url)
         path.mkdir(parents=True, exist_ok=True)
@@ -115,7 +122,7 @@ class JobCache:
     # -- meta ----------------------------------------------------------------
 
     def load_meta(self, key: str) -> CacheMeta | None:
-        meta_path = self.dir_for(key) / "meta.json"
+        meta_path = self._key_dir(key) / "meta.json"
         if not meta_path.exists():
             return None
         try:
@@ -123,7 +130,18 @@ class JobCache:
         except json.JSONDecodeError:
             log.warning("Corrupt cache meta at %s; ignoring", meta_path)
             return None
-        return CacheMeta(**data)
+        if not isinstance(data, dict):
+            log.warning("Cache meta at %s is not an object; ignoring", meta_path)
+            return None
+        # Drop unknown fields so a meta.json written by a newer schema (or hand
+        # edited) is read as a cache miss instead of a 500. Missing required
+        # fields still raise TypeError below, which we also treat as a miss.
+        known = {f.name for f in fields(CacheMeta)}
+        try:
+            return CacheMeta(**{k: v for k, v in data.items() if k in known})
+        except TypeError as exc:
+            log.warning("Incompatible cache meta at %s (%s); ignoring", meta_path, exc)
+            return None
 
     def save_meta(self, key: str, meta: CacheMeta) -> None:
         meta_path = self.dir_for(key) / "meta.json"
@@ -132,7 +150,9 @@ class JobCache:
     # -- chunks --------------------------------------------------------------
 
     def chunk_path(self, key: str, idx: int) -> Path:
-        return self.dir_for(key) / f"chunk_{idx:03d}{CHUNK_EXT}"
+        # Read-safe: writers (processor) call save_meta first, which creates the
+        # dir, so resolving the path here must not mkdir on its own.
+        return self._key_dir(key) / f"chunk_{idx:03d}{CHUNK_EXT}"
 
     def record_chunk(self, key: str, idx: int) -> None:
         meta = self.load_meta(key)

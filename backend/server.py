@@ -402,7 +402,6 @@ def create_app() -> FastAPI:
         writing one file's bytes after another produces a valid combined
         stream that Web Audio, VLC, and ffplay all decode as one track.
         """
-        import os
         from fastapi.responses import StreamingResponse
 
         meta = cache.load_meta(job_id)
@@ -411,23 +410,34 @@ def create_app() -> FastAPI:
         if not meta.complete:
             raise HTTPException(status_code=425, detail="full audio not ready")
 
+        # Snapshot the contiguous run of chunk files ONCE. The advertised
+        # Content-Length and the streamed body must come from the same view of
+        # disk; computing them in two passes lets a gap (or a concurrent TTL
+        # sweep / cache clear) advertise more bytes than _gen actually yields,
+        # which clients read as a truncated/hung response.
+        chunk_files = []
+        for idx in range(meta.total_chunks):
+            p = cache.chunk_path(job_id, idx)
+            try:
+                size = p.stat().st_size
+            except FileNotFoundError:
+                break  # serve only the contiguous prefix that exists
+            chunk_files.append((p, size))
+
         def _gen():
-            for idx in range(meta.total_chunks):
-                p = cache.chunk_path(job_id, idx)
-                if not p.exists():
-                    return  # cache truncated mid-stream; stop short
-                with open(p, "rb") as f:
+            for p, _ in chunk_files:
+                try:
+                    f = open(p, "rb")
+                except FileNotFoundError:
+                    return  # deleted after the snapshot; stop short
+                with f:
                     while True:
                         block = f.read(64 * 1024)
                         if not block:
                             break
                         yield block
 
-        total = sum(
-            os.path.getsize(cache.chunk_path(job_id, i))
-            for i in range(meta.total_chunks)
-            if cache.chunk_path(job_id, i).exists()
-        )
+        total = sum(size for _, size in chunk_files)
         headers = {"Cache-Control": "public, max-age=86400"}
         if total:
             headers["Content-Length"] = str(total)

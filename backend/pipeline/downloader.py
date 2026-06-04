@@ -390,7 +390,13 @@ def slice_source(
         "wav",
         str(tmp_path),
     ]
-    subprocess.run(cmd, check=True)
+    # Capture stderr so a failure (e.g. a not-yet-decodable partial progressive
+    # download) carries ffmpeg's actual error instead of leaking it to the
+    # server's inherited stderr and logging a bare "return code 1".
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip() or "(no stderr)"
+        raise RuntimeError(f"ffmpeg slice failed (exit {proc.returncode}): {detail}")
     tmp_path.replace(out_path)
     return out_path
 
