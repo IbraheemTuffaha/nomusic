@@ -97,10 +97,10 @@
   transform: scale(1.08);
 }
 
-/* Download control: a small chevron that opens the download menu. Only
-   meaningful once the job is ready, so it appears only in the active (green)
-   state and stays out of the layout otherwise. Sits above the progress fill
-   like the rest of the content. */
+/* Download control: a small chevron that opens the download menu. Available
+   for any live job — active (ready), working (still processing), or paused — so
+   the user can queue a download mid-process; picking one finishes the track and
+   saves automatically. Hidden in idle/error. Sits above the progress fill. */
 .nomusic-btn__dl {
   position: relative;
   z-index: 1;
@@ -119,7 +119,9 @@
   user-select: none;
   transition: background 120ms ease, transform 120ms ease;
 }
-.nomusic-btn[data-state="active"] .nomusic-btn__dl {
+.nomusic-btn[data-state="active"] .nomusic-btn__dl,
+.nomusic-btn[data-state="working"] .nomusic-btn__dl,
+.nomusic-btn[data-state="paused"] .nomusic-btn__dl {
   display: inline-block;
 }
 .nomusic-btn__dl:hover {

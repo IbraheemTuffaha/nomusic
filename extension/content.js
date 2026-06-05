@@ -268,6 +268,10 @@
      *  know when to resume, and a fully-processed job has no worker to idle. */
     _onUserPause() {
       if (this.disposed || this._pausedByUs || this._streamEnded) return;
+      // A queued download pins the worker: keep the stream open on pause so the
+      // track finishes processing and the file is delivered even though the user
+      // stopped watching. The pill keeps showing "Preparing N%".
+      if (this.button && this.button._pendingDownload) return;
       if (this.eventSource) {
         this.eventSource.close();
         this.eventSource = null;
@@ -276,6 +280,17 @@
       // Replace the frozen live label (e.g. "Removing music 41%") with a
       // "Paused" signal so it's clear we've stopped, not stalled.
       this.button.setPaused();
+    }
+
+    /** A download was requested before the track finished. Make sure the worker
+     *  is running and the stream is open so processing continues to completion,
+     *  even if the user had already paused (which would normally let it idle). */
+    ensureLiveForDownload() {
+      if (this.disposed || this._streamEnded) return;
+      if (!this.eventSource) {
+        this._streamPausedClosed = false;
+        this._resumeProcessing(); // respawn the worker + reopen the stream
+      }
     }
 
     /** User resumed after a pause that closed the stream. Re-ensure a worker
@@ -966,6 +981,12 @@
       });
       this._menuOpen = false;
       this._downloading = false;
+      // A download requested before the track finished processing: {format,
+      // height}. Held until the job reaches "ready", then saved automatically.
+      this._pendingDownload = null;
+      // Latest backend readiness, tracked from showStatus so download() knows
+      // whether it can fetch now or must queue and wait.
+      this._ready = false;
       this.menu = this._buildMenu();
       // Close the menu on an outside click / scroll / resize. Capture phase so
       // we see the event even if the host page stops propagation.
@@ -1019,6 +1040,7 @@
       this.closeMenu();
       this.menu.remove(); // it lives on document.body, so clean it up
       this._dismissed = true;
+      this._pendingDownload = null; // user is leaving — drop any queued download
       this.el.style.display = "none";
     }
 
@@ -1035,8 +1057,20 @@
       // Remember the title for the download filename; it arrives on every
       // snapshot but isn't otherwise displayed.
       if (status.title) this.title = status.title;
+      // While a file fetch is in flight the export progress owns the pill
+      // (_showExportProgress); ignore late status snapshots so they don't fight.
+      if (this._downloading) return;
+
       const state = status.state;
+      this._ready = state === "ready";
       if (state === "ready") {
+        // A download queued mid-processing fires the instant the track is done.
+        if (this._pendingDownload) {
+          const pd = this._pendingDownload;
+          this._pendingDownload = null;
+          this._startDownload(pd.format, pd.height);
+          return;
+        }
         this._clearErrorRevert();
         this.el.dataset.state = "active";
         this.label.textContent = "nomusic on";
@@ -1045,12 +1079,17 @@
         return;
       }
       if (state === "error") {
+        this._pendingDownload = null; // can't deliver a file from a failed job
         this.setError(status.phase_label || "Error");
         return;
       }
       this._clearErrorRevert();
       this.el.dataset.state = "working";
-      this.label.textContent = status.phase_label || "Working";
+      // Relabel the processing phase while a download is queued so it's clear
+      // we're finishing the track for the file (and it keeps going on pause).
+      this.label.textContent = this._pendingDownload
+        ? "Preparing"
+        : status.phase_label || "Working";
       const p = status.phase_progress;
       if (typeof p === "number" && isFinite(p)) {
         const pct = Math.max(0, Math.min(100, Math.round(p * 100)));
@@ -1211,12 +1250,30 @@
       window.removeEventListener("resize", this._onReposition, true);
     }
 
-    /** Fetch the finished export from the backend and save it to disk.
-     *  ``format`` is "mp3" (stripped audio) or "mp4" (video + stripped audio);
-     *  ``height`` caps the MP4 resolution (0 = best available). We fetch the
-     *  bytes and save via a blob: URL because a direct cross-origin
+    /** Entry point for a download menu pick. If the track is fully processed we
+     *  fetch + save immediately; otherwise we queue it and keep the worker alive
+     *  to completion (the user can pause / stop watching), saving automatically
+     *  when it's ready. ``format`` is "mp3" or "mp4"; ``height`` caps MP4 res. */
+    download(format, height = 0) {
+      if (!this.session?.jobId) return;
+      if (this._downloading) return; // a fetch is already in flight
+      if (this._ready) {
+        this._startDownload(format, height);
+        return;
+      }
+      // Not done yet: queue it and pin the worker so processing runs to the end
+      // regardless of play/pause, then save when it reaches "ready".
+      this._pendingDownload = { format, height };
+      this.closeMenu();
+      this.el.dataset.state = "working";
+      this.label.textContent = "Preparing";
+      this.session.ensureLiveForDownload();
+    }
+
+    /** Fetch the finished export from the backend and save it to disk. We fetch
+     *  the bytes and save via a blob: URL because a direct cross-origin
      *  <a download> to the backend would have its filename ignored. */
-    async download(format, height = 0) {
+    async _startDownload(format, height = 0) {
       const jobId = this.session?.jobId;
       if (!jobId) return;
       if (this._downloading) return; // ignore double-clicks mid-download

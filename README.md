@@ -180,8 +180,8 @@ You only do this once. The extension stays installed.
 7. Click the button again any time to turn nomusic off and hear the
    original audio.
 
-**Save the result.** Once the button turns green and reads **nomusic
-on**, a small download chevron (⤵) appears on it. Click it for a menu:
+**Save the result.** A small download chevron (⤵) appears on the button
+while it's working and once it's done. Click it for a menu:
    - **MP3** — saves just the music-stripped audio.
    - **MP4 at a chosen resolution** (Best / 4K / 1440p / 1080p / 720p /
      480p) — saves the original video with its audio replaced by the
@@ -190,6 +190,11 @@ on**, a small download chevron (⤵) appears on it. Click it for a menu:
      resolution re-downloads the video, so it can take a while and use
      more disk; repeat saves are fast.) Resolution is a ceiling — if the
      video tops out below your pick, you get its best available.
+
+You can pick a format **before** processing finishes — the button shows
+**Preparing %**, keeps working even if you pause the video or stop
+watching (just leave the tab open), and saves automatically the moment
+it's ready. No need to sit through the whole video to get the file.
 
 **Re-watching the same video is instant** — nomusic remembers the work
 it already did, for up to 7 days.
