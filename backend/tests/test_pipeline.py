@@ -189,12 +189,12 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     # Progress callback fires for each completed chunk.
     assert progress_seen == sorted(progress_seen)
     assert progress_seen[-1] == meta.total_chunks
-    # Phase ordering: each chunk emits downloading -> separating -> mixing
-    # -> chunk_complete (in order, though phases for different chunks may
-    # interleave). Just verify all four phases were seen at least once.
-    assert {"downloading", "separating", "mixing", "chunk_complete"}.issubset(
-        set(phases_seen)
-    )
+    # Pipeline phases: the GPU stage emits "separating" when it picks up a
+    # chunk, and the write stage emits "chunk_complete" once it's on disk.
+    # (The old serial "downloading"/"mixing" intra-chunk hints are gone — with
+    # chunks overlapping across stages they no longer denote a single chunk's
+    # progress.) Verify both fire.
+    assert {"separating", "chunk_complete"}.issubset(set(phases_seen))
 
     # Re-running is a no-op: cache hit short-circuits the pipeline.
     key2 = processor.run("fake://video", model="fake", keep_stems=["vocals", "other"])
