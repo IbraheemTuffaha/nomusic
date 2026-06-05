@@ -4,13 +4,25 @@ These back the ``/audio?format=mp3`` and ``/video`` download endpoints. They're
 kept out of ``server.py`` so they can be unit-tested without importing the
 FastAPI app (which loads the separation engine at import time).
 
-We feed the per-chunk Opus files to ffmpeg via the **concat demuxer** (a list
-file), not by byte-concatenating them into one stream. Raw byte concatenation
-of chained Ogg streams works for the browser's Web Audio decoder, but each
-chunk's Ogg timestamps restart at zero, so ffmpeg sees a "timestamp
-discontinuity" at every boundary — which produces an MP3 you can't seek in and
-an MP4 whose audio drifts out of sync. The concat demuxer rebases each file's
-timestamps onto a single monotonic timeline, so the output seeks cleanly.
+We join the per-chunk Opus files with ffmpeg's **concat filter** — one ``-i``
+input per chunk, spliced in the filtergraph — not the concat *demuxer* (a list
+file) and not raw byte concatenation. The distinction matters for A/V sync:
+
+Each chunk is an independently-encoded Ogg/Opus file. Opus carries a fixed
+encoder pre-skip (~6.5 ms of priming) and pads its final packet to a 20 ms
+frame boundary; a file's header/granule positions let a decoder discard both so
+a *single* file round-trips to its true length. The concat demuxer joins at the
+packet/timestamp level, so those per-file priming/padding samples are NOT
+trimmed at each boundary — every chunk lands a few ms long and the error
+*accumulates*, dragging the audio progressively behind the video (negligible at
+the start, a second or more by the end of a long video). Live playback hides
+this because the extension schedules every chunk at an absolute position derived
+from the video clock, re-syncing on each one; the export has no such anchor.
+
+The concat *filter* decodes each input independently first, so each file's
+pre-skip/end-padding is applied per-file and the splice is sample-accurate — no
+per-boundary drift. The cost is one ffmpeg input per chunk (fine for the chunk
+counts real videos produce).
 """
 
 from __future__ import annotations
@@ -38,28 +50,41 @@ def snapshot_chunk_files(cache, job_id: str, total_chunks: int) -> list[tuple[Pa
     return chunk_files
 
 
-def write_concat_list(chunk_files: list[tuple[Path, int]], dest: Path) -> None:
-    """Write an ffmpeg concat-demuxer list file referencing each chunk in order.
-
-    Each line is ``file '<abs-path>'``; embedded single quotes are escaped the
-    way the concat demuxer expects (``'`` -> ``'\\''``), so a cache path under a
-    home dir with odd characters can't break the list.
-    """
-    lines = []
-    for p, _ in chunk_files:
-        safe = str(p).replace("'", "'\\''")
-        lines.append(f"file '{safe}'")
-    dest.write_text("\n".join(lines) + "\n")
-
-
 _FFMPEG_BASE = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
 
 
-def mp3_transcode_cmd(list_path: Path, dest: Path) -> list[str]:
-    """ffmpeg command to transcode the chunk list (concat demuxer) to MP3."""
+def _audio_inputs(chunk_files: list[tuple[Path, int]]) -> list[str]:
+    """``-i <chunk>`` args, one per chunk, in order."""
+    args: list[str] = []
+    for p, _ in chunk_files:
+        args += ["-i", str(p)]
+    return args
+
+
+def _concat_chain(n: int, *, first_input: int = 0) -> str:
+    """An *unlabeled* filtergraph chain that decodes ``n`` audio inputs and
+    splices them, in order, into one stream.
+
+    The caller terminates the chain — ``+ "[aout]"`` to label it, or
+    ``+ ",apad[aud]"`` to chain another filter on. ``first_input`` is the ffmpeg
+    input index of the first chunk (0 for the audio-only MP3 path; 1 for the MP4
+    path, where input 0 is the video). Each input is decoded on its own, so
+    per-file Opus pre-skip/padding is discarded before the join — the splice is
+    sample-accurate. ``concat=n=1`` is a no-op passthrough, so a single-chunk
+    job works too.
+    """
+    labels = "".join(f"[{first_input + i}:a]" for i in range(n))
+    return f"{labels}concat=n={n}:v=0:a=1"
+
+
+def mp3_transcode_cmd(chunk_files: list[tuple[Path, int]], dest: Path) -> list[str]:
+    """ffmpeg command to splice the chunks (concat filter) and encode to MP3."""
+    n = len(chunk_files)
     return [
         *_FFMPEG_BASE,
-        "-f", "concat", "-safe", "0", "-i", str(list_path),
+        *_audio_inputs(chunk_files),
+        "-filter_complex", _concat_chain(n) + "[aout]",
+        "-map", "[aout]",
         "-c:a", "libmp3lame", "-b:a", "192k",
         "-f", "mp3", str(dest),
     ]
@@ -67,28 +92,32 @@ def mp3_transcode_cmd(list_path: Path, dest: Path) -> list[str]:
 
 def mux_video_cmd(
     video: Path,
-    list_path: Path,
+    chunk_files: list[tuple[Path, int]],
     dest: Path,
     *,
     reencode_video: bool = False,
 ) -> list[str]:
     """ffmpeg command to mux the stripped audio over ``video`` into an MP4.
 
-    The audio (the chunk list, via the concat demuxer) is re-encoded to AAC,
-    which the MP4 container needs (it can't carry Opus reliably). The video is
-    stream-copied by default — fast and lossless — but VP9/AV1 sources (the only
-    codecs YouTube serves above 1080p) play in an MP4 only in VLC/Chrome, not in
-    QuickTime/Safari. Pass ``reencode_video=True`` for those to re-encode to
-    H.264 so the file plays everywhere. ``yuv420p`` forces 8-bit 4:2:0 (some
-    VP9/AV1 are 10-bit, which QuickTime won't decode); ``veryfast`` keeps a 4K
-    re-encode tolerable. ``+faststart`` moves the moov atom to the front so
-    players can start immediately.
+    The audio (the chunks, spliced sample-accurately via the concat filter) is
+    re-encoded to AAC, which the MP4 container needs (it can't carry Opus
+    reliably). The video is stream-copied by default — fast and lossless — but
+    VP9/AV1 sources (the only codecs YouTube serves above 1080p) play in an MP4
+    only in VLC/Chrome, not in QuickTime/Safari. Pass ``reencode_video=True`` for
+    those to re-encode to H.264 so the file plays everywhere. ``yuv420p`` forces
+    8-bit 4:2:0 (some VP9/AV1 are 10-bit, which QuickTime won't decode);
+    ``veryfast`` keeps a 4K re-encode tolerable. ``+faststart`` moves the moov
+    atom to the front so players can start immediately.
 
-    ``apad`` + ``-shortest`` pad/trim the audio to the video's length so both
-    streams start and end together. The per-chunk Opus durations sum to slightly
-    more than the video (encoder priming, ~6.5 ms/chunk), which otherwise leaves
-    the audio running past the end of the video; this keeps them aligned.
+    The concat filter makes the spliced audio sample-accurate, so it no longer
+    drifts against the video. ``apad`` + ``-shortest`` then only equalize the
+    *total* length: the stripped track's duration can differ from the video's by
+    a fraction of a second (the source's audio and video streams need not be
+    exactly equal), so we pad the audio tail with silence (``apad``) and trim the
+    output to the video (``-shortest``). That keeps the full video and a
+    matching-length audio stream without truncating either's content.
     """
+    n = len(chunk_files)
     if reencode_video:
         vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                   "-pix_fmt", "yuv420p"]
@@ -97,10 +126,11 @@ def mux_video_cmd(
     return [
         *_FFMPEG_BASE,
         "-i", str(video),
-        "-f", "concat", "-safe", "0", "-i", str(list_path),
-        "-map", "0:v:0", "-map", "1:a:0",
+        *_audio_inputs(chunk_files),  # chunks are inputs 1..n
+        "-filter_complex", _concat_chain(n, first_input=1) + ",apad[aud]",
+        "-map", "0:v:0", "-map", "[aud]",
         *vcodec,
-        "-filter:a", "apad", "-c:a", "aac", "-b:a", "192k",
+        "-c:a", "aac", "-b:a", "192k",
         "-shortest",
         "-movflags", "+faststart",
         str(dest),

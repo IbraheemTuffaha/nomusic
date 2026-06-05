@@ -50,7 +50,6 @@ from pipeline.export import (  # noqa: E402
     mp3_transcode_cmd,
     mux_video_cmd,
     snapshot_chunk_files,
-    write_concat_list,
 )
 from pipeline.processor import Processor  # noqa: E402
 
@@ -565,10 +564,8 @@ def create_app() -> FastAPI:
             # this simple and is fine for a local single-user backend.
             tmp_dir = Path(tempfile.mkdtemp(prefix="nomusic-mp3-"))
             try:
-                list_path = tmp_dir / "chunks.txt"
-                write_concat_list(chunk_files, list_path)
                 out = tmp_dir / "full.mp3"
-                _run_ffmpeg(mp3_transcode_cmd(list_path, out))
+                _run_ffmpeg(mp3_transcode_cmd(chunk_files, out))
             except BaseException:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 raise
@@ -662,8 +659,6 @@ def create_app() -> FastAPI:
             # --- Phase 2: mux the stripped audio over the video ---
             _set_export_progress(progress_key, "encoding", 0.0)
             tmp_dir = Path(tempfile.mkdtemp(prefix="nomusic-mp4-"))
-            list_path = tmp_dir / "chunks.txt"
-            write_concat_list(chunk_files, list_path)
             out = tmp_dir / "full.mp4"
             total_seconds = _video_duration(video_path)
 
@@ -675,7 +670,7 @@ def create_app() -> FastAPI:
             reencode = _video_codec(video_path) not in _MP4_COPYABLE_VCODECS
             try:
                 _run_ffmpeg_progress(
-                    mux_video_cmd(video_path, list_path, out, reencode_video=reencode),
+                    mux_video_cmd(video_path, chunk_files, out, reencode_video=reencode),
                     total_seconds, _enc_pct,
                 )
             except HTTPException:
@@ -690,7 +685,7 @@ def create_app() -> FastAPI:
                 # percent so the poller doesn't see it jump backward mid-export.
                 _set_export_progress(progress_key, "encoding", 0.0)
                 _run_ffmpeg_progress(
-                    mux_video_cmd(video_path, list_path, out, reencode_video=True),
+                    mux_video_cmd(video_path, chunk_files, out, reencode_video=True),
                     total_seconds, _enc_pct,
                 )
         except BaseException:

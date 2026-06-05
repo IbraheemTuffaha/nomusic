@@ -22,7 +22,6 @@ from pipeline.export import (
     mp3_transcode_cmd,
     mux_video_cmd,
     snapshot_chunk_files,
-    write_concat_list,
 )
 from pipeline.processor import Processor, plan_chunks
 
@@ -379,22 +378,6 @@ def test_snapshot_chunk_files_returns_contiguous_prefix(tmp_path):
     assert [size for _, size in files] == [len(b"chunk0"), len(b"chunk1"), len(b"chunk2")]
 
 
-def test_write_concat_list_quotes_and_escapes_paths(tmp_path):
-    # The concat demuxer list wraps each path in single quotes; an embedded
-    # quote (a home dir like /Users/o'brien/...) must be escaped or ffmpeg
-    # would misparse the list.
-    chunk_files = [
-        (Path("/tmp/a/chunk_000.opus"), 1),
-        (Path("/tmp/o'brien/chunk_001.opus"), 2),
-    ]
-    dest = tmp_path / "chunks.txt"
-    write_concat_list(chunk_files, dest)
-    assert dest.read_text() == (
-        "file '/tmp/a/chunk_000.opus'\n"
-        "file '/tmp/o'\\''brien/chunk_001.opus'\n"
-    )
-
-
 def _make_opus_chunk(wav: Path, out: Path) -> None:
     subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(wav),
@@ -419,18 +402,49 @@ def test_mp3_transcode_produces_playable_mp3(tmp_path):
         _make_opus_chunk(tone, c)
         chunk_files.append((c, c.stat().st_size))
 
-    list_path = tmp_path / "chunks.txt"
-    write_concat_list(chunk_files, list_path)
     out = tmp_path / "full.mp3"
-    subprocess.run(mp3_transcode_cmd(list_path, out), check=True, capture_output=True)
+    subprocess.run(mp3_transcode_cmd(chunk_files, out), check=True, capture_output=True)
 
     streams = _ffprobe_streams(out)
     assert [s["codec_type"] for s in streams] == ["audio"]
     assert streams[0]["codec_name"] == "mp3"
-    # ~6s total (three 2s chunks). The concat demuxer rebases timestamps onto
-    # one monotonic timeline, so the duration reflects every chunk (a regression
-    # guard against byte-concatenation, which left the file unseekable).
+    # ~6s total (three 2s chunks). The concat filter splices every chunk onto one
+    # timeline, so the duration reflects all of them (a regression guard against
+    # byte-concatenation, which left the file unseekable).
     assert abs(_ffprobe_duration(out) - 6.0) < 0.3
+
+
+@pytest.mark.skipif(
+    not (_ffmpeg_has_encoder("libopus") and _ffmpeg_has_encoder("libmp3lame")
+         and _has("ffprobe")),
+    reason="needs ffmpeg with libopus + libmp3lame and ffprobe",
+)
+def test_concat_is_sample_accurate_no_drift(tmp_path):
+    # Regression for end-of-video A/V drift. Each chunk is encoded to Opus
+    # independently, which adds a fixed encoder pre-skip and pads the final
+    # packet to a 20 ms frame. The concat *demuxer* (the old approach) left that
+    # per-file slop in at every boundary, so the joined audio grew ~10+ ms per
+    # chunk and slid behind the video — worst at the end. The concat *filter*
+    # decodes each input on its own, so the splice is sample-accurate.
+    #
+    # Use a chunk length that is NOT a multiple of 20 ms (0.45 s) so the padding
+    # is real, and enough chunks that any per-boundary slop would accumulate far
+    # past the tolerance (the old join drifted ~0.2 s over these 16 chunks).
+    n, dur = 16, 0.45
+    chunk_files = []
+    for i in range(n):
+        tone = tmp_path / f"tone_{i}.wav"
+        _write_tone(tone, seconds=dur)
+        c = tmp_path / f"chunk_{i:03d}.opus"
+        _make_opus_chunk(tone, c)
+        chunk_files.append((c, c.stat().st_size))
+
+    out = tmp_path / "full.mp3"
+    subprocess.run(mp3_transcode_cmd(chunk_files, out), check=True, capture_output=True)
+
+    # Tolerance absorbs the MP3 encoder's own small priming/padding but is far
+    # tighter than the accumulated drift the demuxer join produced.
+    assert abs(_ffprobe_duration(out) - n * dur) < 0.1
 
 
 @pytest.mark.skipif(
@@ -448,8 +462,6 @@ def test_mux_video_replaces_audio_with_stripped_track(tmp_path):
         c = tmp_path / f"chunk_{i:03d}.opus"
         _make_opus_chunk(tone, c)
         chunk_files.append((c, c.stat().st_size))
-    list_path = tmp_path / "chunks.txt"
-    write_concat_list(chunk_files, list_path)
 
     video = tmp_path / "video.mp4"
     subprocess.run(
@@ -460,7 +472,7 @@ def test_mux_video_replaces_audio_with_stripped_track(tmp_path):
     )
 
     out = tmp_path / "out.mp4"
-    subprocess.run(mux_video_cmd(video, list_path, out), check=True, capture_output=True)
+    subprocess.run(mux_video_cmd(video, chunk_files, out), check=True, capture_output=True)
 
     streams = _ffprobe_streams(out)
     kinds = sorted(s["codec_type"] for s in streams)
@@ -496,8 +508,7 @@ def test_mux_video_reencodes_vp9_to_h264(tmp_path):
     _write_tone(tone, seconds=2.0)
     audio = tmp_path / "chunk_000.opus"
     _make_opus_chunk(tone, audio)
-    list_path = tmp_path / "chunks.txt"
-    write_concat_list([(audio, audio.stat().st_size)], list_path)
+    chunk_files = [(audio, audio.stat().st_size)]
 
     video = tmp_path / "video.webm"
     subprocess.run(
@@ -510,7 +521,7 @@ def test_mux_video_reencodes_vp9_to_h264(tmp_path):
 
     out = tmp_path / "out.mp4"
     subprocess.run(
-        mux_video_cmd(video, list_path, out, reencode_video=True),
+        mux_video_cmd(video, chunk_files, out, reencode_video=True),
         check=True, capture_output=True,
     )
     video_stream = next(s for s in _ffprobe_streams(out) if s["codec_type"] == "video")
