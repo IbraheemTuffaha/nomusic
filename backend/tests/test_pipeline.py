@@ -58,27 +58,19 @@ class _FakeEngine(Engine):
             default_model="fake",
         )
 
-    def separate(
-        self,
-        audio_path: Path,
-        out_dir: Path,
-        *,
-        model: str | None = None,
-    ) -> SeparationResult:
+    def prepare(self, audio_path: Path, *, model: str | None = None):
         audio, sr = sf.read(str(audio_path), always_2d=True, dtype="float32")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        stems: dict[str, Path] = {}
+        return (audio, sr)
+
+    def infer(self, prepared) -> SeparationResult:
+        audio, sr = prepared
         # Vocals: half the source; other: a quarter; drums/bass: zeros.
-        for name, gain in (
-            ("vocals", 0.5),
-            ("other", 0.25),
-            ("drums", 0.0),
-            ("bass", 0.0),
-        ):
-            arr = audio * gain
-            p = out_dir / f"{name}.wav"
-            sf.write(str(p), arr, sr, subtype="PCM_16")
-            stems[name] = p
+        stems = {
+            "vocals": audio * 0.5,
+            "other": audio * 0.25,
+            "drums": audio * 0.0,
+            "bass": audio * 0.0,
+        }
         return SeparationResult(
             stems=stems,
             sample_rate=sr,

@@ -604,8 +604,11 @@ class Processor:
 
             emit("separating")
             t1 = time.perf_counter()
-            result = self.engine.separate(raw, tmp / "stems", model=model)
-            t_separate = time.perf_counter() - t1
+            prepared = self.engine.prepare(raw, model=model)
+            t_decode = time.perf_counter() - t1
+            ti = time.perf_counter()
+            result = self.engine.infer(prepared)
+            t_infer = time.perf_counter() - ti
 
             emit("mixing")
             t2 = time.perf_counter()
@@ -629,19 +632,21 @@ class Processor:
             idle = max(0.0, wall - gpu)
             log.info(
                 "chunk %d: %.2fs wall (%.1fx realtime) — "
-                "slice=%.2fs separate=%.2fs mix+write=%.2fs | "
+                "slice=%.2fs decode=%.2fs infer=%.2fs mix+write=%.2fs | "
                 "gpu=%.2fs idle=%.2fs (%.0f%% idle)",
-                plan.index, wall, ratio, t_slice, t_separate, t_mix_write,
+                plan.index, wall, ratio, t_slice, t_decode, t_infer, t_mix_write,
                 gpu, idle, 100.0 * idle / wall if wall > 0 else 0.0,
             )
             return gpu
 
     @staticmethod
     def _mix_stems(
-        stems: dict[str, Path],
+        stems: dict[str, np.ndarray],
         keep: list[str],
     ) -> np.ndarray:
         """Sum the kept stems and return a (samples, channels) float32 array.
+
+        ``stems`` are the engine's in-memory ``(samples, channels)`` arrays.
 
         Applies RMS-matched loudness compensation. The vocals stem alone
         typically sits 6-12 dB below the full mix's RMS energy, so playing
@@ -655,14 +660,7 @@ class Processor:
         if missing:
             raise RuntimeError(f"engine did not return stems: {missing}")
 
-        # Load every stem we got back so we can use the full-mix RMS as a
-        # loudness reference. This costs one extra disk read + sum per
-        # chunk; negligible compared with separation.
-        arrays: dict[str, np.ndarray] = {}
-        for name, path in stems.items():
-            audio, _ = sf.read(str(path), always_2d=True, dtype="float32")
-            arrays[name] = audio
-
+        arrays = stems  # already in-memory; the full set is the loudness ref
         mix = sum(arrays[n] for n in keep)
         full_mix = sum(arrays.values())
 

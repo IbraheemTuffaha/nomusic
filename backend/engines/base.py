@@ -9,6 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 # Demucs' four-stem model output. Kept here so callers don't need to import a
 # concrete engine to validate stem names.
@@ -30,16 +31,17 @@ class EngineCapabilities:
 class SeparationResult:
     """Result of separating one audio buffer into stems.
 
-    ``stems`` maps a stem name to a 16-bit PCM WAV path on disk. We pass paths
-    rather than in-memory arrays so the processor can hand chunks to ffmpeg for
-    crossfading without an extra round-trip through Python.
+    ``stems`` maps a stem name to its audio as an in-memory ``(samples,
+    channels)`` float32 array. We keep stems in memory (not WAVs on disk) so the
+    mixing stage doesn't round-trip through ffmpeg/disk on the hot path, and so
+    the GPU stage can be a pure ``input -> arrays`` function in the pipeline.
     """
 
-    stems: dict[str, Path]
+    stems: dict[str, Any]
     sample_rate: int
     duration_seconds: float
     # Wall-clock seconds spent in the actual model inference (the GPU/accelerator
-    # call), excluding decode + stem write-out. Lets the processor report a GPU
+    # call), excluding decode + stem hand-off. Lets the processor report a GPU
     # duty cycle vs the rest of the per-chunk pipeline. ``None`` if the engine
     # doesn't measure it (e.g. test stubs).
     gpu_seconds: float | None = None
@@ -58,16 +60,22 @@ class Engine(ABC):
         """Static metadata. Must not load model weights."""
 
     @abstractmethod
-    def separate(
-        self,
-        audio_path: Path,
-        out_dir: Path,
-        *,
-        model: str | None = None,
-    ) -> SeparationResult:
-        """Separate ``audio_path`` into stems written under ``out_dir``.
+    def prepare(self, audio_path: Path, *, model: str | None = None) -> Any:
+        """Decode + pre-process ``audio_path`` into a model-ready input.
 
-        ``model`` defaults to ``capabilities().default_model``.
+        Returns an opaque object passed straight back to :meth:`infer`. This is
+        the CPU/IO half (ffmpeg decode, resample, normalize), split from the
+        accelerator half so a caller can run it on another thread — overlapping
+        it with a GPU inference of a *different* chunk. ``model`` defaults to
+        ``capabilities().default_model``.
+        """
+
+    @abstractmethod
+    def infer(self, prepared: Any) -> SeparationResult:
+        """Run separation on a :meth:`prepare` result, returning in-memory stems.
+
+        The accelerator half — kept free of disk I/O so it can be the sole
+        GPU-bound stage of a pipeline.
         """
 
     def warmup(self) -> None:
