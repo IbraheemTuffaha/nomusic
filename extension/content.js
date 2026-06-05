@@ -924,6 +924,18 @@
       this.icon.className = "nomusic-btn__icon";
       this.icon.src = chrome.runtime.getURL("icons/button.png");
       this.icon.alt = "";
+      // Lock the icon's box with inline !important. Some hosts (Telegram Web)
+      // force-size every <img> in their message UI to fill its container with a
+      // high-specificity !important rule; an inline !important declaration
+      // outranks any stylesheet rule, so this stops the 1008x510 wordmark from
+      // ballooning across the video. 28x14 keeps its ~2:1 ratio.
+      for (const [k, v] of Object.entries({
+        width: "28px", height: "14px",
+        "max-width": "28px", "max-height": "14px",
+        "min-width": "0", "min-height": "0",
+      })) {
+        this.icon.style.setProperty(k, v, "important");
+      }
       this.label = document.createElement("span");
       this.label.className = "nomusic-btn__label";
       this.label.textContent = "nomusic";

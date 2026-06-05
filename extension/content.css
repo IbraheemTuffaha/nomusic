@@ -211,12 +211,15 @@
 }
 
 .nomusic-btn__icon {
-  height: 14px;
-  width: auto;
   flex: 0 0 auto;
   display: block;
   /* Subtle separation from the dark pill so the lime mark reads cleanly. */
   filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35));
+  /* The icon's 28x14 box is locked with inline !important in content.js, NOT
+     here: some hosts (Telegram Web) force-size every <img> in their message UI
+     with a high-specificity !important rule that would beat a stylesheet rule
+     and blow the wordmark up to its natural 1008x510 across the video. An inline
+     !important declaration outranks any stylesheet rule, so it's set there. */
 }
 
 .nomusic-btn[data-state="working"] .nomusic-btn__icon {
