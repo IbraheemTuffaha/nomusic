@@ -180,6 +180,22 @@ You only do this once. The extension stays installed.
 7. Click the button again any time to turn nomusic off and hear the
    original audio.
 
+**Save the result.** A small download chevron (⤵) appears on the button
+while it's working and once it's done. Click it for a menu:
+   - **MP3** — saves just the music-stripped audio.
+   - **MP4 at a chosen resolution** (Best / 4K / 1440p / 1080p / 720p /
+     480p) — saves the original video with its audio replaced by the
+     music-stripped track. The button shows live **Fetching %** then
+     **Encoding %** while it prepares. (The first save at a given
+     resolution re-downloads the video, so it can take a while and use
+     more disk; repeat saves are fast.) Resolution is a ceiling — if the
+     video tops out below your pick, you get its best available.
+
+You can pick a format **before** processing finishes — the button shows
+**Preparing %**, keeps working even if you pause the video or stop
+watching (just leave the tab open), and saves automatically the moment
+it's ready. No need to sit through the whole video to get the file.
+
 **Re-watching the same video is instant** — nomusic remembers the work
 it already did, for up to 7 days.
 
@@ -283,8 +299,9 @@ backend/
     base.py             Abstract Engine interface
     mlx_engine.py       Apple Silicon implementation
   pipeline/
-    downloader.py       yt-dlp + ffmpeg slicing
+    downloader.py       yt-dlp + ffmpeg slicing (audio + on-demand video)
     processor.py        Chunking, mixing, encoding
+    export.py           Chunk concat + ffmpeg commands for MP3/MP4 download
     cache.py            ~/.cache/nomusic with TTL sweep
   tests/                pytest suite (no torch / yt-dlp needed)
 extension/
@@ -331,7 +348,9 @@ All optional, all prefixed `NOMUSIC_`:
 | GET | `/status/{job_id}` | `JobStatus` |
 | GET | `/events/{job_id}` | `text/event-stream` of `JobStatus` updates (204 if unknown); replaces polling |
 | GET | `/chunk/{job_id}/{idx}` | OGG/Opus bytes (425 if not yet ready) |
-| GET | `/audio/{job_id}` | Streams concatenated OGG/Opus (425 if not complete) |
+| GET | `/audio/{job_id}` | Streams concatenated OGG/Opus; `?format=mp3` transcodes to MP3 (425 if not complete) |
+| GET | `/video/{job_id}` | Original video with the stripped audio muxed in, as MP4; `?max_height=N` caps resolution (425 if not complete) |
+| GET | `/video/{job_id}/progress` | `{phase, percent}` for the in-flight MP4 export (polled by the menu) |
 | GET | `/cache` | Cache stats |
 | POST | `/cache/clear` | Wipes the cache |
 

@@ -6,14 +6,23 @@ so they're suitable for CI on any platform.
 
 from __future__ import annotations
 
+import json
 import math
+import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
+import pytest
 import soundfile as sf
 
 from engines.base import Engine, EngineCapabilities, SeparationResult
 from pipeline.cache import JobCache
+from pipeline.export import (
+    mp3_transcode_cmd,
+    mux_video_cmd,
+    snapshot_chunk_files,
+)
 from pipeline.processor import Processor, plan_chunks
 
 
@@ -293,6 +302,230 @@ def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
     assert meta.chunks_ready == [0, 1, 2]  # not wiped
     assert info.duration_seconds == 120.0  # reused, not re-probed
     assert len(returned_plans) == len(plans)
+
+
+# --- Download export helpers (back the /audio?format=mp3 and /video endpoints) ---
+
+
+def _has(*bins: str) -> bool:
+    return all(shutil.which(b) for b in bins)
+
+
+def _ffmpeg_has_encoder(name: str) -> bool:
+    if not shutil.which("ffmpeg"):
+        return False
+    out = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True
+    )
+    return name in out.stdout
+
+
+def _ffprobe_streams(path: Path) -> list[dict]:
+    out = subprocess.run(
+        ["ffprobe", "-hide_banner", "-loglevel", "error", "-show_entries",
+         "stream=codec_name,codec_type", "-of", "json", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(out.stdout)["streams"]
+
+
+def _ffprobe_duration(path: Path) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-hide_banner", "-loglevel", "error", "-show_entries",
+         "format=duration", "-of", "json", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(json.loads(out.stdout)["format"]["duration"])
+
+
+def test_video_format_honours_height_cap():
+    from pipeline.downloader import _video_format
+
+    capped = _video_format(720)
+    assert capped == "bestvideo[height<=720]/bestvideo/best"
+    # Must NOT pin a codec in the selector: avc1 tops out at 1080p on YouTube,
+    # so an avc1 filter would silently cap 1440p/4K requests at 1080p.
+    assert "vcodec" not in capped and "avc1" not in capped
+
+    assert _video_format(None) == "bestvideo/best"  # no cap, no redundant dup
+    assert _video_format(0) == "bestvideo/best"  # 0 == best available
+
+
+def test_video_dir_keyed_by_resolution(tmp_path):
+    cache = JobCache(tmp_path / "cache")
+    url = "https://example.com/watch?v=abc"
+    # Different resolutions must not share a cache dir (else switching quality
+    # would reuse the wrong-resolution download); same args are stable.
+    assert cache.video_dir(url, 1080) != cache.video_dir(url, 720)
+    assert cache.video_dir(url, 1080) == cache.video_dir(url, 1080)
+    assert cache.video_dir(url, None) != cache.video_dir(url, 1080)
+
+
+def test_snapshot_chunk_files_returns_contiguous_prefix(tmp_path):
+    # A gap in the chunk sequence must truncate the snapshot — the export must
+    # never advertise/serve chunks past the first hole.
+    cache = JobCache(tmp_path / "cache")
+    key = "job0"
+    cache.dir_for(key)  # create the dir without going through the processor
+    for idx in (0, 1, 2, 4):  # note: 3 is missing
+        cache.chunk_path(key, idx).write_bytes(f"chunk{idx}".encode())
+
+    files = snapshot_chunk_files(cache, key, total_chunks=5)
+    assert [p.name for p, _ in files] == [
+        "chunk_000.opus", "chunk_001.opus", "chunk_002.opus"
+    ]
+    # Sizes are captured in the same pass and match what's on disk.
+    assert [size for _, size in files] == [len(b"chunk0"), len(b"chunk1"), len(b"chunk2")]
+
+
+def _make_opus_chunk(wav: Path, out: Path) -> None:
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(wav),
+         "-c:a", "libopus", "-b:a", "96k", "-f", "ogg", str(out)],
+        check=True,
+    )
+
+
+@pytest.mark.skipif(
+    not (_ffmpeg_has_encoder("libopus") and _ffmpeg_has_encoder("libmp3lame")
+         and _has("ffprobe")),
+    reason="needs ffmpeg with libopus + libmp3lame and ffprobe",
+)
+def test_mp3_transcode_produces_playable_mp3(tmp_path):
+    # The /audio?format=mp3 path: concatenated Opus chunks must transcode to a
+    # single MP3 of the combined duration.
+    tone = tmp_path / "tone.wav"
+    _write_tone(tone, seconds=2.0)
+    chunk_files = []
+    for i in range(3):
+        c = tmp_path / f"chunk_{i:03d}.opus"
+        _make_opus_chunk(tone, c)
+        chunk_files.append((c, c.stat().st_size))
+
+    out = tmp_path / "full.mp3"
+    subprocess.run(mp3_transcode_cmd(chunk_files, out), check=True, capture_output=True)
+
+    streams = _ffprobe_streams(out)
+    assert [s["codec_type"] for s in streams] == ["audio"]
+    assert streams[0]["codec_name"] == "mp3"
+    # ~6s total (three 2s chunks). The concat filter splices every chunk onto one
+    # timeline, so the duration reflects all of them (a regression guard against
+    # byte-concatenation, which left the file unseekable).
+    assert abs(_ffprobe_duration(out) - 6.0) < 0.3
+
+
+@pytest.mark.skipif(
+    not (_ffmpeg_has_encoder("libopus") and _ffmpeg_has_encoder("libmp3lame")
+         and _has("ffprobe")),
+    reason="needs ffmpeg with libopus + libmp3lame and ffprobe",
+)
+def test_concat_is_sample_accurate_no_drift(tmp_path):
+    # Regression for end-of-video A/V drift. Each chunk is encoded to Opus
+    # independently, which adds a fixed encoder pre-skip and pads the final
+    # packet to a 20 ms frame. The concat *demuxer* (the old approach) left that
+    # per-file slop in at every boundary, so the joined audio grew ~10+ ms per
+    # chunk and slid behind the video — worst at the end. The concat *filter*
+    # decodes each input on its own, so the splice is sample-accurate.
+    #
+    # Use a chunk length that is NOT a multiple of 20 ms (0.45 s) so the padding
+    # is real, and enough chunks that any per-boundary slop would accumulate far
+    # past the tolerance (the old join drifted ~0.2 s over these 16 chunks).
+    n, dur = 16, 0.45
+    chunk_files = []
+    for i in range(n):
+        tone = tmp_path / f"tone_{i}.wav"
+        _write_tone(tone, seconds=dur)
+        c = tmp_path / f"chunk_{i:03d}.opus"
+        _make_opus_chunk(tone, c)
+        chunk_files.append((c, c.stat().st_size))
+
+    out = tmp_path / "full.mp3"
+    subprocess.run(mp3_transcode_cmd(chunk_files, out), check=True, capture_output=True)
+
+    # Tolerance absorbs the MP3 encoder's own small priming/padding but is far
+    # tighter than the accumulated drift the demuxer join produced.
+    assert abs(_ffprobe_duration(out) - n * dur) < 0.1
+
+
+@pytest.mark.skipif(
+    not (_ffmpeg_has_encoder("libopus") and _ffmpeg_has_encoder("libx264")
+         and _ffmpeg_has_encoder("aac") and _has("ffprobe")),
+    reason="needs ffmpeg with libopus + libx264 + aac and ffprobe",
+)
+def test_mux_video_replaces_audio_with_stripped_track(tmp_path):
+    # The /video path: a copied video stream plus the stripped audio re-encoded
+    # to AAC, in one MP4.
+    tone = tmp_path / "tone.wav"
+    _write_tone(tone, seconds=2.0)
+    chunk_files = []
+    for i in range(2):
+        c = tmp_path / f"chunk_{i:03d}.opus"
+        _make_opus_chunk(tone, c)
+        chunk_files.append((c, c.stat().st_size))
+
+    video = tmp_path / "video.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "testsrc=duration=4:size=320x240:rate=10", "-c:v", "libx264",
+         "-pix_fmt", "yuv420p", str(video)],
+        check=True, capture_output=True,
+    )
+
+    out = tmp_path / "out.mp4"
+    subprocess.run(mux_video_cmd(video, chunk_files, out), check=True, capture_output=True)
+
+    streams = _ffprobe_streams(out)
+    kinds = sorted(s["codec_type"] for s in streams)
+    assert kinds == ["audio", "video"]
+    audio_stream = next(s for s in streams if s["codec_type"] == "audio")
+    assert audio_stream["codec_name"] == "aac"
+    video_stream = next(s for s in streams if s["codec_type"] == "video")
+    assert video_stream["codec_name"] == "h264"  # copied through, not re-encoded
+
+    # apad + -shortest must align the streams: audio padded/trimmed to the
+    # video length so both end together (guards the end-of-video A/V drift fix).
+    def _sdur(stream):
+        res = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", stream,
+             "-show_entries", "stream=duration", "-of", "default=nw=1:nk=1", str(out)],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        return float(res)
+    assert abs(_sdur("a:0") - _sdur("v:0")) < 0.1
+
+
+@pytest.mark.skipif(
+    not (_ffmpeg_has_encoder("libopus") and _ffmpeg_has_encoder("libvpx-vp9")
+         and _ffmpeg_has_encoder("libx264") and _ffmpeg_has_encoder("aac")
+         and _has("ffprobe")),
+    reason="needs ffmpeg with libopus + libvpx-vp9 + libx264 + aac and ffprobe",
+)
+def test_mux_video_reencodes_vp9_to_h264(tmp_path):
+    # VP9 (YouTube's codec above 1080p) can be byte-copied into MP4 but won't
+    # play in QuickTime/Safari, so the export re-encodes it to H.264. This
+    # guards the playability fix.
+    tone = tmp_path / "tone.wav"
+    _write_tone(tone, seconds=2.0)
+    audio = tmp_path / "chunk_000.opus"
+    _make_opus_chunk(tone, audio)
+    chunk_files = [(audio, audio.stat().st_size)]
+
+    video = tmp_path / "video.webm"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "testsrc=duration=2:size=320x240:rate=10", "-c:v", "libvpx-vp9",
+         "-b:v", "200k", str(video)],
+        check=True, capture_output=True,
+    )
+    assert _ffprobe_streams(video)[0]["codec_name"] == "vp9"
+
+    out = tmp_path / "out.mp4"
+    subprocess.run(
+        mux_video_cmd(video, chunk_files, out, reencode_video=True),
+        check=True, capture_output=True,
+    )
+    video_stream = next(s for s in _ffprobe_streams(out) if s["codec_type"] == "video")
+    assert video_stream["codec_name"] == "h264"  # re-encoded, QuickTime-playable
 
 
 def test_abandon_all_signals_workers_and_clears_state():

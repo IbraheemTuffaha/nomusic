@@ -199,6 +199,108 @@ def download_source(
     return final
 
 
+_VIDEO_STEM = "video"
+# Extensions yt-dlp may emit for a video stream across the sites we support.
+_VIDEO_EXTS: tuple[str, ...] = ("mp4", "webm", "mkv", "mov", "flv")
+
+
+def _video_format(max_height: int | None) -> str:
+    """Build the yt-dlp format selector for the MP4 export.
+
+    Pick the highest-resolution video-only stream up to ``max_height``,
+    regardless of codec, then fall back to anything. We deliberately do NOT
+    filter by codec here: on YouTube, H.264 (avc1) tops out at 1080p while
+    1440p/4K exist only as VP9/AV1, so an ``avc1``-first selector would silently
+    cap every request at 1080p. Codec preference (H.264 for a clean MP4
+    stream-copy) is handled by ``_VIDEO_FORMAT_SORT`` *within* a resolution, so
+    1080p still comes out as copyable H.264 while higher resolutions take the
+    VP9/AV1 stream (which the mux copies, or re-encodes as a fallback).
+    ``max_height`` caps the resolution (e.g. 1080); ``None`` takes the best.
+    """
+    # Capped: try the height-limited video-only stream, then any video-only
+    # stream, then anything. Uncapped: the first two would be identical, so
+    # collapse to a single bestvideo before the catch-all.
+    if max_height:
+        return f"bestvideo[height<={max_height}]/bestvideo/best"
+    return "bestvideo/best"
+
+
+# Sort priority: highest resolution first, then prefer H.264 among equal-res
+# streams (so the MP4 export can stream-copy without re-encoding when possible).
+# User format_sort fields take precedence over yt-dlp's defaults.
+_VIDEO_FORMAT_SORT = ["res", "vcodec:h264"]
+
+
+def download_video(
+    url: str,
+    out_dir: Path,
+    *,
+    max_height: int | None = None,
+    progress_hook=None,
+) -> Path:
+    """Download the video stream for ``url`` into ``out_dir`` for the MP4 export.
+
+    The normal pipeline fetches audio only, so this is a separate, on-demand
+    pull. We grab a video-only stream when one exists (we replace the audio at
+    mux time anyway) and fall back to a progressive video+audio stream.
+    ``max_height`` caps the resolution (e.g. 1080); ``None`` takes the best
+    available.
+
+    Returns the path to the downloaded file. Idempotent: a previously-downloaded
+    video file already present is returned as-is.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    existing = _find_video(out_dir)
+    if existing is not None:
+        log.info("Using cached video: %s", existing.name)
+        if progress_hook:
+            try:
+                size = existing.stat().st_size
+                progress_hook(
+                    {"status": "finished", "downloaded_bytes": size, "total_bytes": size}
+                )
+            except Exception:  # never let a UI hook break the download
+                pass
+        return existing
+
+    from yt_dlp import YoutubeDL
+
+    opts: dict[str, Any] = {
+        **_common_opts(),
+        "format": _video_format(max_height),
+        "format_sort": _VIDEO_FORMAT_SORT,
+        "outtmpl": str(out_dir / f"{_VIDEO_STEM}.%(ext)s"),
+        "overwrites": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
+    }
+    if progress_hook:
+        opts["progress_hooks"] = [progress_hook]
+    ratelimit = _download_ratelimit()
+    if ratelimit:
+        opts["ratelimit"] = ratelimit
+    log.info("Downloading video for %s -> %s", url, out_dir)
+    with YoutubeDL(opts) as ydl:
+        ydl.download([url])
+
+    final = _find_video(out_dir)
+    if final is None:
+        raise RuntimeError(
+            f"yt-dlp didn't produce a video file in {out_dir}; "
+            "supported extensions: " + ", ".join(_VIDEO_EXTS)
+        )
+    return final
+
+
+def _find_video(out_dir: Path) -> Path | None:
+    for ext in _VIDEO_EXTS:
+        p = out_dir / f"{_VIDEO_STEM}.{ext}"
+        if p.exists() and p.stat().st_size > 0:
+            return p
+    return None
+
+
 def _source_download_opts(out_dir: Path) -> dict[str, Any]:
     """yt-dlp options for pulling the source audio (shared by download_source
     and SourceFetcher), minus the per-call progress hook."""
