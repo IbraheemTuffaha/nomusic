@@ -25,9 +25,10 @@ import tempfile
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import numpy as np
 import soundfile as sf
@@ -90,6 +91,21 @@ class ChunkPlan:
     @property
     def is_first(self) -> bool:
         return self.index == 0
+
+
+@dataclass
+class _ChunkWork:
+    """One chunk in flight through the decode → infer → write pipeline. The
+    producer fills ``prepared`` + slice/decode times; the GPU stage fills
+    ``result`` + infer/gpu times; the consumer reads it all to write + log."""
+
+    plan: ChunkPlan
+    prepared: Any
+    t_slice: float
+    t_decode: float
+    result: Any = None
+    t_infer: float = 0.0
+    gpu: float = 0.0
 
 
 def plan_chunks(
@@ -462,74 +478,104 @@ class Processor:
             )
             next_chunk_provider = lambda: fallback.popleft() if fallback else None
 
-        logged_first = False
-        while True:
-            idx = next_chunk_provider()
-            if idx is None:
-                break
-            plan = plans_by_index.get(idx)
-            if plan is None:
-                log.warning("provider returned unknown chunk index %d", idx)
-                continue
-            # Race-safety: another caller (or a prior reorder pop) may have
-            # already completed this chunk between picks. Skip if so.
-            current_meta = self.cache.load_meta(key)
-            if (
-                current_meta
-                and plan.index in current_meta.chunks_ready
-                and self.cache.chunk_path(key, plan.index).exists()
-            ):
-                continue
-            source_path = source_for(plan)
-            if dl is not None and not logged_first:
-                logged_first = True
-                # The headline progressive signal: if the download is still
-                # running here, separation genuinely overlapped it (early
-                # start). If it's already complete, we ran sequentially.
-                log.debug(
-                    "progressive: first chunk %d released with download %s "
-                    "(%.0f/%.0fs on disk)",
-                    plan.index,
-                    "still running" if not dl.is_done() else "already complete",
-                    dl.available_seconds(),
-                    info.duration_seconds,
+        # ---- Pipelined stages so the GPU runs back-to-back -------------------
+        # decode (producer thread)  →  infer (GPU, THIS thread)  →  mix+write
+        # (consumer thread). One chunk is decoded ahead and writes drain behind,
+        # so the per-chunk CPU/IO (~25% of wall, serial before) hides inside the
+        # GPU window. Only this thread calls infer() (single GPU stream) and only
+        # the write pool touches cache meta (single writer — no lock needed).
+        loop_start = time.perf_counter()
+        total_gpu = 0.0
+        chunks_processed = 0
+        logged_first = [False]
+
+        def _log_duty() -> None:
+            if not chunks_processed:
+                return
+            loop_wall = time.perf_counter() - loop_start
+            duty = 100.0 * total_gpu / loop_wall if loop_wall > 0 else 0.0
+            # GPU-busy vs the whole processing loop — the headline "how fully are
+            # we using the GPU" number. Logged on completion AND on abandon.
+            log.info(
+                "GPU duty cycle: %.0f%% — %.1fs GPU / %.1fs wall across %d "
+                "chunks (%.1fs idle around/between chunks)",
+                duty, total_gpu, loop_wall, chunks_processed,
+                max(0.0, loop_wall - total_gpu),
+            )
+
+        def _next_decoded() -> _ChunkWork | None:
+            """Pick the next pending chunk and decode it (CPU/IO half). Returns a
+            ``_ChunkWork``, or ``None`` when the queue is exhausted. Raises
+            ``WorkerAbandoned`` (from the provider) to abort the run. Runs on the
+            single decode thread, so its skip-check reads are race-free."""
+            while True:
+                idx = next_chunk_provider()  # may raise WorkerAbandoned
+                if idx is None:
+                    return None
+                plan = plans_by_index.get(idx)
+                if plan is None:
+                    log.warning("provider returned unknown chunk index %d", idx)
+                    continue
+                # Race-safety: another caller may have finished this chunk
+                # between picks. Skip if so.
+                current_meta = self.cache.load_meta(key)
+                if (
+                    current_meta
+                    and plan.index in current_meta.chunks_ready
+                    and self.cache.chunk_path(key, plan.index).exists()
+                ):
+                    continue
+                source_path = source_for(plan)
+                if dl is not None and not logged_first[0]:
+                    logged_first[0] = True
+                    log.debug(
+                        "progressive: first chunk %d released with download %s "
+                        "(%.0f/%.0fs on disk)",
+                        plan.index,
+                        "still running" if not dl.is_done() else "already complete",
+                        dl.available_seconds(),
+                        info.duration_seconds,
+                    )
+                return self._decode_chunk(source_path, key, plan, model=model, dl=dl)
+
+        decode_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nm-decode")
+        write_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nm-write")
+        write_futures: list = []
+        try:
+            pending = decode_pool.submit(_next_decoded)
+            while True:
+                work = pending.result()  # the prefetched chunk (usually ready)
+                if work is None:
+                    break
+                # Decode the NEXT chunk while the GPU works on this one.
+                pending = decode_pool.submit(_next_decoded)
+                # GPU stage — this thread only.
+                if on_progress:
+                    m = self.cache.load_meta(key)
+                    if m:
+                        on_progress(m, "separating")
+                ti = time.perf_counter()
+                work.result = self.engine.infer(work.prepared)
+                work.t_infer = time.perf_counter() - ti
+                work.gpu = work.result.gpu_seconds or 0.0
+                work.prepared = None  # free the decoded input tensor promptly
+                total_gpu += work.gpu
+                chunks_processed += 1
+                # Hand mix+write+record to the consumer; it overlaps the next GPU.
+                write_futures.append(
+                    write_pool.submit(
+                        self._finish_chunk, work, key, keep_stems, on_progress
+                    )
                 )
-            try:
-                self._process_one(
-                    source_path,
-                    key,
-                    plan,
-                    model=model,
-                    keep_stems=keep_stems,
-                    on_progress=on_progress,
-                )
-            except Exception:
-                # Non-progressive failures are real. In progressive mode a slice
-                # can fail because the partial container isn't decodable yet
-                # (e.g. a non-streamable mp4) — degrade: wait for the full
-                # download and slice from it. Once it's complete, every later
-                # source_for() returns the final file, so this self-heals.
-                if dl is None:
-                    raise
-                log.warning(
-                    "progressive: chunk %d slice failed; waiting for full download",
-                    plan.index,
-                    exc_info=True,
-                )
-                full = dl.wait_complete()
-                self._process_one(
-                    full,
-                    key,
-                    plan,
-                    model=model,
-                    keep_stems=keep_stems,
-                    on_progress=on_progress,
-                )
-            self.cache.record_chunk(key, plan.index)
-            if on_progress:
-                refreshed = self.cache.load_meta(key)
-                if refreshed:
-                    on_progress(refreshed, "chunk_complete")
+                # Bound the write backlog and surface any consumer error early.
+                while len(write_futures) > 2:
+                    write_futures.pop(0).result()
+            for f in write_futures:
+                f.result()
+        finally:
+            decode_pool.shutdown(wait=True)
+            write_pool.shutdown(wait=True)
+            _log_duty()
 
         # Mark complete when every chunk is on disk.
         all_present = all(
@@ -547,62 +593,91 @@ class Processor:
 
     # -- internals -----------------------------------------------------------
 
-    def _process_one(
+    def _decode_chunk(
         self,
         source_path: Path,
         key: str,
         plan: ChunkPlan,
         *,
         model: str,
-        keep_stems: list[str],
-        on_progress: ProgressCb | None = None,
-    ) -> None:
-        def emit(phase: str) -> None:
-            if not on_progress:
-                return
-            meta = self.cache.load_meta(key)
-            if meta:
-                on_progress(meta, phase)
+        dl: Any | None,
+    ) -> _ChunkWork:
+        """Producer stage: slice + decode one chunk into a model-ready input.
 
-        with tempfile.TemporaryDirectory(prefix="nomusic-") as tmp_str:
-            tmp = Path(tmp_str)
-            raw = tmp / f"raw_{plan.index:03d}.wav"
+        Returns a ``_ChunkWork`` carrying the in-memory ``prepared`` input (no
+        files held across stages) and the slice/decode timings. In progressive
+        mode, a slice that fails on the partial container (e.g. a not-yet-
+        streamable mp4) degrades to waiting for the full download, then retries.
+        """
 
-            t0 = time.perf_counter()
-            emit("downloading")  # phase name kept for UI compatibility
-            slice_source(source_path, raw, start=plan.start, end=plan.end)
-            t_slice = time.perf_counter() - t0
-
-            emit("separating")
-            t1 = time.perf_counter()
-            result = self.engine.separate(raw, tmp / "stems", model=model)
-            t_separate = time.perf_counter() - t1
-
-            emit("mixing")
-            t2 = time.perf_counter()
-            mixed = self._mix_stems(result.stems, keep_stems)
-            self._write_chunk(mixed, result.sample_rate, key, plan)
-            t_mix_write = time.perf_counter() - t2
-
-            # Per-chunk benchmark: realtime ratio is the headline metric
-            # (how many seconds of audio we process per wall-clock second).
-            # Headline number first, breakdown after, so a grep is enough
-            # to scan a long log without parsing.
-            wall = time.perf_counter() - t0
-            chunk_dur = plan.play_end - plan.play_start
-            ratio = chunk_dur / wall if wall > 0 else 0.0
-            log.info(
-                "chunk %d: %.2fs wall (%.1fx realtime) — "
-                "slice=%.2fs separate=%.2fs mix+write=%.2fs",
-                plan.index, wall, ratio, t_slice, t_separate, t_mix_write,
+        def _do(src: Path) -> _ChunkWork:
+            with tempfile.TemporaryDirectory(prefix="nomusic-") as tmp_str:
+                raw = Path(tmp_str) / f"raw_{plan.index:03d}.wav"
+                t0 = time.perf_counter()
+                slice_source(src, raw, start=plan.start, end=plan.end)
+                t_slice = time.perf_counter() - t0
+                t1 = time.perf_counter()
+                prepared = self.engine.prepare(raw, model=model)
+                t_decode = time.perf_counter() - t1
+            return _ChunkWork(
+                plan=plan, prepared=prepared, t_slice=t_slice, t_decode=t_decode
             )
+
+        try:
+            return _do(source_path)
+        except Exception:
+            if dl is None:
+                raise
+            log.warning(
+                "progressive: chunk %d slice failed; waiting for full download",
+                plan.index,
+                exc_info=True,
+            )
+            return _do(dl.wait_complete())
+
+    def _finish_chunk(
+        self,
+        work: _ChunkWork,
+        key: str,
+        keep_stems: list[str],
+        on_progress: ProgressCb | None,
+    ) -> None:
+        """Consumer stage: mix the kept stems, encode + write the chunk, record
+        it, and emit progress. Runs on the single write thread, so it's the only
+        writer of the cache meta (no lock needed)."""
+        plan = work.plan
+        t2 = time.perf_counter()
+        mixed = self._mix_stems(work.result.stems, keep_stems)
+        self._write_chunk(mixed, work.result.sample_rate, key, plan)
+        t_mix_write = time.perf_counter() - t2
+
+        self.cache.record_chunk(key, plan.index)
+        if on_progress:
+            refreshed = self.cache.load_meta(key)
+            if refreshed:
+                on_progress(refreshed, "chunk_complete")
+
+        # Stage breakdown for one chunk. ``work`` is the sum of stage times (the
+        # serial-equivalent cost); the job-end "GPU duty cycle" line is the real
+        # measure of how much of it overlapped.
+        work_s = work.t_slice + work.t_decode + work.t_infer + t_mix_write
+        chunk_dur = plan.play_end - plan.play_start
+        ratio = chunk_dur / work_s if work_s > 0 else 0.0
+        log.info(
+            "chunk %d: %.2fs work (%.1fx realtime) — "
+            "slice=%.2fs decode=%.2fs infer=%.2fs mix+write=%.2fs | gpu=%.2fs",
+            plan.index, work_s, ratio, work.t_slice, work.t_decode,
+            work.t_infer, t_mix_write, work.gpu,
+        )
 
     @staticmethod
     def _mix_stems(
-        stems: dict[str, Path],
+        stems: dict[str, np.ndarray],
         keep: list[str],
     ) -> np.ndarray:
         """Sum the kept stems and return a (samples, channels) float32 array.
+
+        ``stems`` are the engine's in-memory ``(samples, channels)`` arrays.
 
         Applies RMS-matched loudness compensation. The vocals stem alone
         typically sits 6-12 dB below the full mix's RMS energy, so playing
@@ -616,14 +691,7 @@ class Processor:
         if missing:
             raise RuntimeError(f"engine did not return stems: {missing}")
 
-        # Load every stem we got back so we can use the full-mix RMS as a
-        # loudness reference. This costs one extra disk read + sum per
-        # chunk; negligible compared with separation.
-        arrays: dict[str, np.ndarray] = {}
-        for name, path in stems.items():
-            audio, _ = sf.read(str(path), always_2d=True, dtype="float32")
-            arrays[name] = audio
-
+        arrays = stems  # already in-memory; the full set is the loudness ref
         mix = sum(arrays[n] for n in keep)
         full_mix = sum(arrays.values())
 

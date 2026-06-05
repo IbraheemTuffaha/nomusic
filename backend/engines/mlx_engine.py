@@ -15,6 +15,8 @@ loading torch, and lets us pin a concrete backend per checkout.
 from __future__ import annotations
 
 import logging
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,6 +34,20 @@ _SUPPORTED_MODELS: tuple[str, ...] = (
     "htdemucs_ft",
 )
 _DEFAULT_MODEL = "htdemucs"
+
+
+@dataclass
+class _Prepared:
+    """Opaque ``prepare()`` output handed back to ``infer()``. Holds the decoded,
+    normalized input plus what's needed to denormalize and label the result."""
+
+    bundle: Any
+    wav: Any  # torch.Tensor (channels, samples), normalized
+    ref: Any  # torch.Tensor used to undo normalization
+    sources: list[str]
+    sample_rate: int
+    name: str
+    model_name: str
 
 
 class MLXEngine(Engine):
@@ -57,13 +73,12 @@ class MLXEngine(Engine):
     def warmup(self) -> None:
         self._ensure_loaded(_DEFAULT_MODEL)
 
-    def separate(
-        self,
-        audio_path: Path,
-        out_dir: Path,
-        *,
-        model: str | None = None,
-    ) -> SeparationResult:
+    def prepare(self, audio_path: Path, *, model: str | None = None) -> Any:
+        """Decode + normalize ``audio_path`` into a model-ready input (CPU/IO).
+
+        Split from :meth:`infer` so the pipeline can run this on a producer
+        thread while the GPU is busy with another chunk. No GPU work here.
+        """
         model_name = model or _DEFAULT_MODEL
         if model_name not in _SUPPORTED_MODELS:
             raise ValueError(
@@ -71,19 +86,8 @@ class MLXEngine(Engine):
             )
 
         bundle = self._ensure_loaded(model_name)
-        out_dir.mkdir(parents=True, exist_ok=True)
 
-        import soundfile as sf
-        import torch
-        from demucs.apply import apply_model
-        from demucs.audio import AudioFile, convert_audio
-
-        log.info(
-            "Separating %s with %s on %s",
-            audio_path.name,
-            model_name,
-            self._device,
-        )
+        from demucs.audio import AudioFile
 
         demucs_model = bundle.model
         sample_rate = int(demucs_model.samplerate)
@@ -95,17 +99,39 @@ class MLXEngine(Engine):
         wav = AudioFile(audio_path).read(
             streams=0, samplerate=sample_rate, channels=channels
         )
-        # Normalize to mean 0 / unit variance per channel — demucs's own
-        # separate.py does the same, and it noticeably improves quality on
-        # quiet inputs.
+        # Normalize to mean 0 / unit variance — demucs's own separate.py does the
+        # same, and it noticeably improves quality on quiet inputs. Keep ``ref``
+        # so :meth:`infer` can undo it.
         ref = wav.mean(0)
-        wav -= ref.mean()
-        wav /= ref.std() + 1e-8
+        wav = (wav - ref.mean()) / (ref.std() + 1e-8)
+        return _Prepared(
+            bundle=bundle,
+            wav=wav,
+            ref=ref,
+            sources=sources,
+            sample_rate=sample_rate,
+            name=audio_path.name,
+            model_name=model_name,
+        )
 
+    def infer(self, prepared: Any) -> SeparationResult:
+        """Run the model on a :meth:`prepare` result (the GPU half).
+
+        Returns in-memory ``(samples, channels)`` float32 stem arrays — no disk
+        I/O — so it can be the sole GPU-bound stage of the pipeline.
+        """
+        import torch
+        from demucs.apply import apply_model
+
+        log.info("Separating %s with %s on %s", prepared.name,
+                 prepared.model_name, self._device)
+
+        # Time only the inference call — the real accelerator work.
+        t_gpu0 = time.perf_counter()
         with torch.no_grad():
             estimates = apply_model(
-                demucs_model,
-                wav[None],
+                prepared.bundle.model,
+                prepared.wav[None],
                 device=self._device,
                 shifts=0,
                 split=True,
@@ -113,28 +139,35 @@ class MLXEngine(Engine):
                 progress=False,
                 num_workers=0,
             )[0]
+        # MPS dispatches kernels asynchronously, so apply_model can return before
+        # the GPU is done. Force a sync inside the timed region or we'd measure
+        # only dispatch and wildly undercount. (CPU inference is synchronous.)
+        if self._device == "mps":
+            sync = getattr(getattr(torch, "mps", None), "synchronize", None)
+            if sync:
+                sync()
+        gpu_seconds = time.perf_counter() - t_gpu0
+
+        ref = prepared.ref
         # Undo the normalization so output amplitude matches the input.
         estimates = estimates * ref.std() + ref.mean()
 
-        stem_paths: dict[str, Path] = {}
+        sample_rate = prepared.sample_rate
+        stems: dict[str, Any] = {}
         duration_samples = 0
-        for stem_name, stem_tensor in zip(sources, estimates):
+        for stem_name, stem_tensor in zip(prepared.sources, estimates):
             arr = stem_tensor.detach().to("cpu").numpy().T  # (samples, channels)
             duration_samples = max(duration_samples, arr.shape[0])
-            stem_path = out_dir / f"{stem_name}.wav"
-            sf.write(str(stem_path), arr, sample_rate, subtype="PCM_16", format="WAV")
-            stem_paths[stem_name] = stem_path
+            stems[stem_name] = arr
+            if stem_name not in DEMUCS_STEMS:
+                log.warning("Unexpected stem from %s: %s",
+                            prepared.model_name, stem_name)
 
-        for name in stem_paths:
-            if name not in DEMUCS_STEMS:
-                log.warning("Unexpected stem from %s: %s", model_name, name)
-
-        # silence "unused" linters for symbols we only use via apply_model
-        del convert_audio
         return SeparationResult(
-            stems=stem_paths,
+            stems=stems,
             sample_rate=sample_rate,
             duration_seconds=duration_samples / sample_rate if sample_rate else 0.0,
+            gpu_seconds=gpu_seconds,
         )
 
     # -- internals -----------------------------------------------------------
