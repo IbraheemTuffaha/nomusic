@@ -38,6 +38,11 @@ class SeparationResult:
     stems: dict[str, Path]
     sample_rate: int
     duration_seconds: float
+    # Wall-clock seconds spent in the actual model inference (the GPU/accelerator
+    # call), excluding decode + stem write-out. Lets the processor report a GPU
+    # duty cycle vs the rest of the per-chunk pipeline. ``None`` if the engine
+    # doesn't measure it (e.g. test stubs).
+    gpu_seconds: float | None = None
 
 
 class Engine(ABC):

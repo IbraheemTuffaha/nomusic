@@ -463,8 +463,33 @@ class Processor:
             next_chunk_provider = lambda: fallback.popleft() if fallback else None
 
         logged_first = False
+        loop_start = time.perf_counter()
+        total_gpu = 0.0
+        chunks_processed = 0
+
+        def _log_duty() -> None:
+            if not chunks_processed:
+                return
+            loop_wall = time.perf_counter() - loop_start
+            duty = 100.0 * total_gpu / loop_wall if loop_wall > 0 else 0.0
+            # GPU-busy vs the whole processing loop, so the idle here also folds
+            # in between-chunk overhead and any download waits — the headline
+            # "how fully are we using the GPU" number. Logged on normal
+            # completion AND on abandon (the common case while watching).
+            log.info(
+                "GPU duty cycle: %.0f%% — %.1fs GPU / %.1fs wall across %d "
+                "chunks (%.1fs idle around/between chunks)",
+                duty, total_gpu, loop_wall, chunks_processed,
+                max(0.0, loop_wall - total_gpu),
+            )
+
         while True:
-            idx = next_chunk_provider()
+            try:
+                idx = next_chunk_provider()
+            except Exception:
+                # WorkerAbandoned (idle timeout) surfaces here, between chunks.
+                _log_duty()
+                raise
             if idx is None:
                 break
             plan = plans_by_index.get(idx)
@@ -495,7 +520,7 @@ class Processor:
                     info.duration_seconds,
                 )
             try:
-                self._process_one(
+                gpu = self._process_one(
                     source_path,
                     key,
                     plan,
@@ -517,7 +542,7 @@ class Processor:
                     exc_info=True,
                 )
                 full = dl.wait_complete()
-                self._process_one(
+                gpu = self._process_one(
                     full,
                     key,
                     plan,
@@ -526,10 +551,14 @@ class Processor:
                     on_progress=on_progress,
                 )
             self.cache.record_chunk(key, plan.index)
+            total_gpu += gpu or 0.0
+            chunks_processed += 1
             if on_progress:
                 refreshed = self.cache.load_meta(key)
                 if refreshed:
                     on_progress(refreshed, "chunk_complete")
+
+        _log_duty()
 
         # Mark complete when every chunk is on disk.
         all_present = all(
@@ -591,11 +620,21 @@ class Processor:
             wall = time.perf_counter() - t0
             chunk_dur = plan.play_end - plan.play_start
             ratio = chunk_dur / wall if wall > 0 else 0.0
+            # ``separate`` wraps decode + GPU inference + stem write-out; ``gpu``
+            # is just the inference, so ``idle`` (wall − gpu) is all the
+            # non-accelerator work bracketing it (slice, decode, stem I/O, mix,
+            # Opus encode). The job-end duty-cycle line additionally folds in the
+            # between-chunk overhead.
+            gpu = result.gpu_seconds or 0.0
+            idle = max(0.0, wall - gpu)
             log.info(
                 "chunk %d: %.2fs wall (%.1fx realtime) — "
-                "slice=%.2fs separate=%.2fs mix+write=%.2fs",
+                "slice=%.2fs separate=%.2fs mix+write=%.2fs | "
+                "gpu=%.2fs idle=%.2fs (%.0f%% idle)",
                 plan.index, wall, ratio, t_slice, t_separate, t_mix_write,
+                gpu, idle, 100.0 * idle / wall if wall > 0 else 0.0,
             )
+            return gpu
 
     @staticmethod
     def _mix_stems(

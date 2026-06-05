@@ -15,6 +15,7 @@ loading torch, and lets us pin a concrete backend per checkout.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -102,6 +103,9 @@ class MLXEngine(Engine):
         wav -= ref.mean()
         wav /= ref.std() + 1e-8
 
+        # Time only the inference call — the real accelerator work — so the
+        # caller can separate GPU-busy time from the surrounding decode + write.
+        t_gpu0 = time.perf_counter()
         with torch.no_grad():
             estimates = apply_model(
                 demucs_model,
@@ -113,6 +117,14 @@ class MLXEngine(Engine):
                 progress=False,
                 num_workers=0,
             )[0]
+        # MPS dispatches kernels asynchronously, so apply_model can return before
+        # the GPU is done. Force a sync inside the timed region or we'd measure
+        # only dispatch and wildly undercount. (CPU inference is synchronous.)
+        if self._device == "mps":
+            sync = getattr(getattr(torch, "mps", None), "synchronize", None)
+            if sync:
+                sync()
+        gpu_seconds = time.perf_counter() - t_gpu0
         # Undo the normalization so output amplitude matches the input.
         estimates = estimates * ref.std() + ref.mean()
 
@@ -135,6 +147,7 @@ class MLXEngine(Engine):
             stems=stem_paths,
             sample_rate=sample_rate,
             duration_seconds=duration_samples / sample_rate if sample_rate else 0.0,
+            gpu_seconds=gpu_seconds,
         )
 
     # -- internals -----------------------------------------------------------
