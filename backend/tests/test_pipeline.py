@@ -50,6 +50,11 @@ def test_plan_chunks_rejects_overlap_eq_chunk():
 class _FakeEngine(Engine):
     """Returns deterministic per-stem WAVs of the right length."""
 
+    def __init__(self) -> None:
+        # Every batch size handed to infer_batch, so a test can assert the
+        # processor never exceeds the configured batch (or stops batching).
+        self.batch_sizes: list[int] = []
+
     def capabilities(self) -> EngineCapabilities:
         return EngineCapabilities(
             name="fake",
@@ -63,6 +68,7 @@ class _FakeEngine(Engine):
         return (audio, sr)
 
     def infer_batch(self, prepared) -> list[SeparationResult]:
+        self.batch_sizes.append(len(prepared))
         out = []
         for audio, sr in prepared:
             # Vocals: half the source; other: a quarter; drums/bass: zeros.
@@ -138,8 +144,9 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     monkeypatch.setattr(proc, "slice_source", fake_slice_source)
 
     cache = JobCache(tmp_path / "cache")
+    engine = _FakeEngine()
     processor = Processor(
-        engine=_FakeEngine(),
+        engine=engine,
         cache=cache,
         chunk_seconds=4.0,
         chunk_overlap_seconds=0.5,
@@ -196,6 +203,18 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     # chunks overlapping across stages they no longer denote a single chunk's
     # progress.) Verify both fire.
     assert {"separating", "chunk_complete"}.issubset(set(phases_seen))
+
+    # The GPU stage batches opportunistically. We can't pin exact batch sizes
+    # (they depend on decode-vs-infer timing), but every call must stay within
+    # [1, gpu_batch] — a regression that passed the whole queue in one call, or
+    # broke the per-call list, would land outside that bound. The batch count
+    # must also account for every chunk exactly once.
+    from config import SETTINGS
+
+    cap = max(1, SETTINGS.gpu_batch)
+    assert engine.batch_sizes, "infer_batch was never called"
+    assert all(1 <= n <= cap for n in engine.batch_sizes), engine.batch_sizes
+    assert sum(engine.batch_sizes) == meta.total_chunks
 
     # Re-running is a no-op: cache hit short-circuits the pipeline.
     key2 = processor.run("fake://video", model="fake", keep_stems=["vocals", "other"])
@@ -588,20 +607,48 @@ def test_infer_batch_matches_single_mlx(tmp_path):
 
     from engines.mlx_engine import MLXEngine
 
-    # Two DISTINCT 2s stereo tones, so a batch that leaked across items would
-    # be caught. Equal length -> no padding path, a clean apples-to-apples cmp.
-    for name, freq in (("a", 220.0), ("b", 330.0)):
-        t = np.arange(int(2.0 * 44100)) / 44100
+    def _tone(name: str, freq: float, seconds: float) -> Path:
+        t = np.arange(int(seconds * 44100)) / 44100
         tone = (0.2 * np.sin(2 * math.pi * freq * t)).astype(np.float32)
-        sf.write(str(tmp_path / f"{name}.wav"),
-                 np.stack([tone, tone], axis=1), 44100, subtype="PCM_16")
-    a, b = tmp_path / "a.wav", tmp_path / "b.wav"
+        path = tmp_path / f"{name}.wav"
+        sf.write(str(path), np.stack([tone, tone], axis=1), 44100, subtype="PCM_16")
+        return path
 
     eng = MLXEngine()
-    single_a = eng.infer(eng.prepare(a))
-    single_b = eng.infer(eng.prepare(b))
-    batched = eng.infer_batch([eng.prepare(a), eng.prepare(b)])
 
-    for name in ("vocals", "drums", "bass", "other"):
-        assert np.allclose(batched[0].stems[name], single_a.stems[name], atol=3e-3), name
-        assert np.allclose(batched[1].stems[name], single_b.stems[name], atol=3e-3), name
+    # Batched vs single won't be bit-exact: a batched run reorders float
+    # reductions vs a singleton, and a zero-padded short chunk makes demucs
+    # segment its (split/overlap) windows differently than a native-length one.
+    # Measured worst case across these tones is ~5e-3 (-47 dB) on the noisy
+    # `other` residual, spread UNIFORMLY across the signal (not a tail glitch) —
+    # inaudible. The tolerance guards against gross failure (cross-item leakage,
+    # padding bleeding through), which would be orders of magnitude larger; the
+    # exact-shape check below is the real trim/length guard.
+    _ATOL = 1e-2
+
+    def _assert_batch_matches_singles(paths):
+        singles = [eng.infer(eng.prepare(p)) for p in paths]
+        batched = eng.infer_batch([eng.prepare(p) for p in paths])
+        for i, single in enumerate(singles):
+            # Output length must be exactly the un-padded chunk length — catches
+            # a trim that leaves zero-padding in (or trims real audio out).
+            for name in ("vocals", "drums", "bass", "other"):
+                assert batched[i].stems[name].shape == single.stems[name].shape, (
+                    f"{name} shape {batched[i].stems[name].shape} != "
+                    f"{single.stems[name].shape}"
+                )
+                assert np.allclose(
+                    batched[i].stems[name], single.stems[name], atol=_ATOL
+                ), f"chunk {i} stem {name}"
+
+    # Equal-length batch: two DISTINCT tones, so a batch that leaked across
+    # items would be caught. No padding path — a clean apples-to-apples cmp.
+    _assert_batch_matches_singles([_tone("a", 220.0, 2.0), _tone("b", 330.0, 2.0)])
+
+    # Unequal-length batch: the SHORTER item is zero-padded up to the longer
+    # one inside infer_batch, then trimmed back. This is the path that runs on
+    # every real track (the final chunk is always short), and where demucs's
+    # internal split/overlap windowing could let padding bleed into the tail.
+    # Lengths chosen NOT to be multiples of the segment size so the boundary is
+    # exercised, not coincidentally aligned.
+    _assert_batch_matches_singles([_tone("c", 220.0, 2.0), _tone("d", 330.0, 1.3)])
