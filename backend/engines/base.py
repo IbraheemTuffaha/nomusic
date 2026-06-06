@@ -71,12 +71,20 @@ class Engine(ABC):
         """
 
     @abstractmethod
-    def infer(self, prepared: Any) -> SeparationResult:
-        """Run separation on a :meth:`prepare` result, returning in-memory stems.
+    def infer_batch(self, prepared: list[Any]) -> list[SeparationResult]:
+        """Separate a batch of :meth:`prepare` results in one accelerator call.
 
-        The accelerator half — kept free of disk I/O so it can be the sole
-        GPU-bound stage of a pipeline.
+        Returns one :class:`SeparationResult` per input, in order, with in-memory
+        stems (no disk I/O). Batching fills the GPU's cores — a single chunk
+        leaves them partly idle — for higher throughput at identical per-chunk
+        output. Each result's ``gpu_seconds`` is the batch's inference time split
+        evenly across its members, so callers can still sum a GPU duty cycle.
         """
+
+    def infer(self, prepared: Any) -> SeparationResult:
+        """Separate one prepared input. Convenience wrapper over
+        :meth:`infer_batch`."""
+        return self.infer_batch([prepared])[0]
 
     def warmup(self) -> None:
         """Optional: load weights ahead of the first request. No-op by default."""

@@ -33,6 +33,7 @@ from typing import Any, Callable, Iterator, Optional
 import numpy as np
 import soundfile as sf
 
+from config import SETTINGS
 from engines.base import Engine
 
 from .cache import CacheMeta, JobCache
@@ -479,11 +480,12 @@ class Processor:
             next_chunk_provider = lambda: fallback.popleft() if fallback else None
 
         # ---- Pipelined stages so the GPU runs back-to-back -------------------
-        # decode (producer thread)  →  infer (GPU, THIS thread)  →  mix+write
-        # (consumer thread). One chunk is decoded ahead and writes drain behind,
-        # so the per-chunk CPU/IO (~25% of wall, serial before) hides inside the
-        # GPU window. Only this thread calls infer() (single GPU stream) and only
-        # the write pool touches cache meta (single writer — no lock needed).
+        # decode (producer thread)  →  infer (GPU, THIS thread, batched)  →
+        # mix+write (consumer thread). Chunks are decoded ahead and writes drain
+        # behind, so the per-chunk CPU/IO (~25% of wall, serial before) hides
+        # inside the GPU window; the GPU itself separates several chunks per call
+        # to fill its cores. Only this thread calls the engine (single GPU
+        # stream) and only the write pool touches cache meta (single writer).
         loop_start = time.perf_counter()
         total_gpu = 0.0
         chunks_processed = 0
@@ -538,37 +540,73 @@ class Processor:
                     )
                 return self._decode_chunk(source_path, key, plan, model=model, dl=dl)
 
+        # Batch up to BATCH chunks per GPU call: a single chunk leaves the GPU
+        # cores partly idle, so we separate a few at once for higher throughput
+        # at identical per-chunk output. Decode stays on one thread (so the
+        # provider's skip-check is race-free) but we keep BATCH decodes queued so
+        # a full batch is usually ready when the GPU frees up.
+        batch_size = max(1, SETTINGS.gpu_batch)
         decode_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nm-decode")
         write_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nm-write")
         write_futures: list = []
+        inflight: deque = deque()
+        stream_done = False
+
+        def _refill() -> None:
+            while not stream_done and len(inflight) < batch_size:
+                inflight.append(decode_pool.submit(_next_decoded))
+
         try:
-            pending = decode_pool.submit(_next_decoded)
-            while True:
-                work = pending.result()  # the prefetched chunk (usually ready)
+            _refill()
+            while inflight:
+                # Block for the first ready chunk, then add only chunks that are
+                # ALREADY decoded — never wait to *fill* a batch. So at startup
+                # or right after a seek (one chunk ready) we run a batch of 1 at
+                # minimal latency, while in steady state (decode running ahead of
+                # the GPU) the batch fills to ``batch_size``.
+                batch_works: list[_ChunkWork] = []
+                work = inflight.popleft().result()  # may raise WorkerAbandoned
                 if work is None:
+                    stream_done = True
+                else:
+                    batch_works.append(work)
+                    _refill()
+                    while (
+                        inflight
+                        and len(batch_works) < batch_size
+                        and inflight[0].done()
+                    ):
+                        nxt = inflight.popleft().result()
+                        if nxt is None:
+                            stream_done = True
+                            break
+                        batch_works.append(nxt)
+                        _refill()
+                if not batch_works:
                     break
-                # Decode the NEXT chunk while the GPU works on this one.
-                pending = decode_pool.submit(_next_decoded)
                 # GPU stage — this thread only.
                 if on_progress:
                     m = self.cache.load_meta(key)
                     if m:
                         on_progress(m, "separating")
                 ti = time.perf_counter()
-                work.result = self.engine.infer(work.prepared)
-                work.t_infer = time.perf_counter() - ti
-                work.gpu = work.result.gpu_seconds or 0.0
-                work.prepared = None  # free the decoded input tensor promptly
-                total_gpu += work.gpu
-                chunks_processed += 1
-                # Hand mix+write+record to the consumer; it overlaps the next GPU.
-                write_futures.append(
-                    write_pool.submit(
-                        self._finish_chunk, work, key, keep_stems, on_progress
+                results = self.engine.infer_batch([w.prepared for w in batch_works])
+                dt = time.perf_counter() - ti
+                for work, result in zip(batch_works, results):
+                    work.result = result
+                    work.prepared = None  # free the decoded input tensor promptly
+                    work.t_infer = dt / len(batch_works)
+                    work.gpu = result.gpu_seconds or 0.0
+                    total_gpu += work.gpu
+                    chunks_processed += 1
+                    # Hand mix+write+record to the consumer; overlaps the next GPU.
+                    write_futures.append(
+                        write_pool.submit(
+                            self._finish_chunk, work, key, keep_stems, on_progress
+                        )
                     )
-                )
                 # Bound the write backlog and surface any consumer error early.
-                while len(write_futures) > 2:
+                while len(write_futures) > 2 * batch_size:
                     write_futures.pop(0).result()
             for f in write_futures:
                 f.result()

@@ -114,31 +114,38 @@ class MLXEngine(Engine):
             model_name=model_name,
         )
 
-    def infer(self, prepared: Any) -> SeparationResult:
-        """Run the model on a :meth:`prepare` result (the GPU half).
+    def infer_batch(self, prepared: list[Any]) -> list[SeparationResult]:
+        """Run the model on a batch of :meth:`prepare` results (the GPU half).
 
-        Returns in-memory ``(samples, channels)`` float32 stem arrays — no disk
-        I/O — so it can be the sole GPU-bound stage of the pipeline.
+        One ``apply_model`` call over the whole batch fills the GPU's cores that
+        a single chunk leaves idle. Inputs may differ in length (the last chunk
+        of a track is shorter); we zero-pad to the longest, then trim each output
+        back. Each chunk keeps its own normalization ``ref``. Returns in-memory
+        ``(samples, channels)`` float32 stems — no disk I/O.
         """
         import torch
         from demucs.apply import apply_model
 
-        log.info("Separating %s with %s on %s", prepared.name,
-                 prepared.model_name, self._device)
+        n = len(prepared)
+        model = prepared[0].bundle.model
+        lengths = [p.wav.shape[-1] for p in prepared]
+        max_len = max(lengths)
+        channels = prepared[0].wav.shape[0]
+        log.info("Separating %d chunk(s) (%s) with %s on %s",
+                 n, prepared[0].name, prepared[0].model_name, self._device)
+
+        # Stack into (batch, channels, samples), zero-padding short members.
+        x = torch.zeros(n, channels, max_len, dtype=prepared[0].wav.dtype)
+        for i, p in enumerate(prepared):
+            x[i, :, : lengths[i]] = p.wav
 
         # Time only the inference call — the real accelerator work.
         t_gpu0 = time.perf_counter()
         with torch.no_grad():
             estimates = apply_model(
-                prepared.bundle.model,
-                prepared.wav[None],
-                device=self._device,
-                shifts=0,
-                split=True,
-                overlap=0.25,
-                progress=False,
-                num_workers=0,
-            )[0]
+                model, x, device=self._device, shifts=0, split=True,
+                overlap=0.25, progress=False, num_workers=0,
+            )
         # MPS dispatches kernels asynchronously, so apply_model can return before
         # the GPU is done. Force a sync inside the timed region or we'd measure
         # only dispatch and wildly undercount. (CPU inference is synchronous.)
@@ -146,29 +153,27 @@ class MLXEngine(Engine):
             sync = getattr(getattr(torch, "mps", None), "synchronize", None)
             if sync:
                 sync()
-        gpu_seconds = time.perf_counter() - t_gpu0
+        gpu_each = (time.perf_counter() - t_gpu0) / n
 
-        ref = prepared.ref
-        # Undo the normalization so output amplitude matches the input.
-        estimates = estimates * ref.std() + ref.mean()
-
-        sample_rate = prepared.sample_rate
-        stems: dict[str, Any] = {}
-        duration_samples = 0
-        for stem_name, stem_tensor in zip(prepared.sources, estimates):
-            arr = stem_tensor.detach().to("cpu").numpy().T  # (samples, channels)
-            duration_samples = max(duration_samples, arr.shape[0])
-            stems[stem_name] = arr
-            if stem_name not in DEMUCS_STEMS:
-                log.warning("Unexpected stem from %s: %s",
-                            prepared.model_name, stem_name)
-
-        return SeparationResult(
-            stems=stems,
-            sample_rate=sample_rate,
-            duration_seconds=duration_samples / sample_rate if sample_rate else 0.0,
-            gpu_seconds=gpu_seconds,
-        )
+        results: list[SeparationResult] = []
+        for i, p in enumerate(prepared):
+            # Per-chunk denormalization, then trim off the zero-padding.
+            est = estimates[i] * p.ref.std() + p.ref.mean()
+            stems: dict[str, Any] = {}
+            for stem_name, stem_tensor in zip(p.sources, est):
+                arr = stem_tensor.detach().to("cpu").numpy().T  # (samples, channels)
+                stems[stem_name] = arr[: lengths[i]]
+                if stem_name not in DEMUCS_STEMS:
+                    log.warning("Unexpected stem from %s: %s",
+                                p.model_name, stem_name)
+            sr = p.sample_rate
+            results.append(SeparationResult(
+                stems=stems,
+                sample_rate=sr,
+                duration_seconds=lengths[i] / sr if sr else 0.0,
+                gpu_seconds=gpu_each,
+            ))
+        return results
 
     # -- internals -----------------------------------------------------------
 
