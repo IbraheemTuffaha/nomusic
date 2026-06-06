@@ -62,20 +62,21 @@ class _FakeEngine(Engine):
         audio, sr = sf.read(str(audio_path), always_2d=True, dtype="float32")
         return (audio, sr)
 
-    def infer(self, prepared) -> SeparationResult:
-        audio, sr = prepared
-        # Vocals: half the source; other: a quarter; drums/bass: zeros.
-        stems = {
-            "vocals": audio * 0.5,
-            "other": audio * 0.25,
-            "drums": audio * 0.0,
-            "bass": audio * 0.0,
-        }
-        return SeparationResult(
-            stems=stems,
-            sample_rate=sr,
-            duration_seconds=audio.shape[0] / sr,
-        )
+    def infer_batch(self, prepared) -> list[SeparationResult]:
+        out = []
+        for audio, sr in prepared:
+            # Vocals: half the source; other: a quarter; drums/bass: zeros.
+            out.append(SeparationResult(
+                stems={
+                    "vocals": audio * 0.5,
+                    "other": audio * 0.25,
+                    "drums": audio * 0.0,
+                    "bass": audio * 0.0,
+                },
+                sample_rate=sr,
+                duration_seconds=audio.shape[0] / sr,
+            ))
+        return out
 
 
 def _write_tone(path: Path, *, seconds: float, sample_rate: int = 44100) -> None:
@@ -572,3 +573,35 @@ def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):
     assert status.state is JobState.QUEUED
     assert "k1" in registry._threads
     assert "k1" not in registry._abandoning
+
+
+def test_infer_batch_matches_single_mlx(tmp_path):
+    """Batched separation must produce the same per-chunk output as separate
+    single calls — otherwise batching for throughput would change results.
+    Uses the real MLX engine, so it's skipped where MPS/torch isn't available."""
+    try:
+        import torch
+    except Exception:
+        pytest.skip("torch not installed")
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+
+    from engines.mlx_engine import MLXEngine
+
+    # Two DISTINCT 2s stereo tones, so a batch that leaked across items would
+    # be caught. Equal length -> no padding path, a clean apples-to-apples cmp.
+    for name, freq in (("a", 220.0), ("b", 330.0)):
+        t = np.arange(int(2.0 * 44100)) / 44100
+        tone = (0.2 * np.sin(2 * math.pi * freq * t)).astype(np.float32)
+        sf.write(str(tmp_path / f"{name}.wav"),
+                 np.stack([tone, tone], axis=1), 44100, subtype="PCM_16")
+    a, b = tmp_path / "a.wav", tmp_path / "b.wav"
+
+    eng = MLXEngine()
+    single_a = eng.infer(eng.prepare(a))
+    single_b = eng.infer(eng.prepare(b))
+    batched = eng.infer_batch([eng.prepare(a), eng.prepare(b)])
+
+    for name in ("vocals", "drums", "bass", "other"):
+        assert np.allclose(batched[0].stems[name], single_a.stems[name], atol=3e-3), name
+        assert np.allclose(batched[1].stems[name], single_b.stems[name], atol=3e-3), name

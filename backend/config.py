@@ -119,6 +119,14 @@ class Settings:
     memory_gc_interval_seconds: float = field(
         default_factory=lambda: _env_float("MEMORY_GC_INTERVAL_SECONDS", 3600.0)
     )
+    # How many chunks to separate in one batched GPU inference. A single chunk
+    # under-utilizes the GPU (batch=1 leaves ~25% of the cores idle on an
+    # M-series Pro); batching ~2 fills them for ~+25% throughput at identical
+    # output. The sweet spot is chip-dependent — bigger GPUs (Max/Ultra) want a
+    # higher value — so it's tunable. ``1`` disables batching. Batches form
+    # opportunistically from whatever's already decoded, so a chunk never waits
+    # to be batched.
+    gpu_batch: int = field(default_factory=lambda: _env_int("GPU_BATCH", 2))
     # Start separating early chunks from the partially-downloaded source
     # instead of waiting for the whole download, so playback begins sooner.
     # Each chunk is sliced only once enough of the timeline is on disk; if the
