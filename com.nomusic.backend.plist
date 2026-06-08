@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent template for the nomusic backend. See SERVICE.md for setup.
+  Replace every /ABSOLUTE/PATH/TO/nomusic below with the full path to this
+  repo (run `pwd` from the repo root), then copy this file to
+  ~/Library/LaunchAgents/ and load it with launchctl.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nomusic.backend</string>
+
+    <!-- Launch the venv Python directly on server.py. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/nomusic/backend/.venv/bin/python</string>
+        <string>/ABSOLUTE/PATH/TO/nomusic/backend/server.py</string>
+    </array>
+
+    <!-- The server runs from the repo root. -->
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE/PATH/TO/nomusic</string>
+
+    <!-- The server shells out to ffmpeg / deno / yt-dlp, installed by Homebrew. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Start at login (i.e. after every restart) ... -->
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- ... and relaunch if it ever exits or crashes. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Don't hammer relaunches if it crashes on startup. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/nomusic-backend.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/nomusic-backend.log</string>
+</dict>
+</plist>
