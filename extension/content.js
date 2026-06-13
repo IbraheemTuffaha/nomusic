@@ -412,11 +412,21 @@
       const chunkStart = entry.playStart;
       const chunkEnd = chunkStart + entry.buffer.duration;
 
-      // Where in the chunk should playback begin?
-      let offset = (videoTime - chunkStart) * rate;
+      // Where in the chunk should playback begin? start()'s offset is in the
+      // buffer's own media time, and the buffer covers [chunkStart, chunkEnd]
+      // in video-timeline seconds, so the position is just videoTime -
+      // chunkStart at ANY playback rate. Rate only affects how fast the
+      // buffer is consumed (src.playbackRate below) and how soon a future
+      // chunk's onset arrives (the /rate in the `when` math) — scaling the
+      // offset by rate started chunks at the wrong position at non-1x, and
+      // the sync monitor then restarted the chunk every tick (audible
+      // stutter + desync).
+      let offset = videoTime - chunkStart;
       let when = now;
       if (offset < 0) {
-        // Chunk is in the future on the video timeline. Schedule its onset.
+        // Chunk is in the future on the video timeline. Schedule its onset:
+        // the video clock advances `rate` media-seconds per wall second, so
+        // the wall-clock delay to chunkStart is the media gap divided by rate.
         when = now + (chunkStart - videoTime) / rate;
         offset = 0;
       } else if (offset >= entry.buffer.duration) {
