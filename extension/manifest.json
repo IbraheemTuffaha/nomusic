@@ -46,6 +46,12 @@
     {
       "resources": [
         "icons/button.png",
+        "main.js",
+        "settings.js",
+        "session.js",
+        "button.js",
+        "mute-controller.js",
+        "audio-scheduler.js",
         "stretch.js",
         "third_party/soundtouch/*.js"
       ],
