@@ -50,6 +50,7 @@
         "settings.js",
         "session.js",
         "button.js",
+        "mute-controller.js",
         "stretch.js",
         "third_party/soundtouch/*.js"
       ],

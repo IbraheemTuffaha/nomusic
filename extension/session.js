@@ -8,6 +8,7 @@ import {
   SYNC_CHECK_MS,
   PITCH_PRESERVE,
 } from "./settings.js";
+import { MuteController } from "./mute-controller.js";
 
 // StretchClient (pitch-preserving WSOLA time-stretch) lives in stretch.js and
 // is dynamically imported by start() the first time a session needs it.
@@ -21,7 +22,8 @@ class Session {
     this.button = button;
     this.audioCtx = null;
     this.gain = null;
-    this.muteAsserter = null;
+    // Owns host-video muting + volume mirroring; created in start().
+    this.muteController = null;
     this.jobId = null;
     this.totalChunks = 0;
     // Must mirror the backend defaults (config.py: chunk_seconds=10,
@@ -61,8 +63,6 @@ class Session {
     this.syncTimer = null;
     this.bufferTimer = null;
     this.disposed = false;
-    this.originalMuted = video.muted;
-    this.originalVolume = video.volume;
     // When true, we (not the user) called video.pause() because the
     // chunk for the current timecode isn't on disk yet. We track this so
     // a manual pause stays paused but a buffering pause auto-resumes.
@@ -98,7 +98,7 @@ class Session {
       },
       ratechange: () => this.reschedule(),
       emptied: () => this.dispose(),
-      volumechange: () => this._onHostVolumeChange(),
+      volumechange: () => this.muteController?.handleHostVolumeChange(),
     };
   }
 
@@ -165,7 +165,21 @@ class Session {
       }
     }
 
-    this.muteVideo();
+    // Mute the host video and mirror its volume onto our gain. The callback is
+    // how MuteController pushes the effective level to our audio output.
+    this.muteController = new MuteController(this.video, (level, immediate) => {
+      if (!this.gain || !this.audioCtx) return;
+      if (immediate) {
+        this.gain.gain.value = level;
+        return;
+      }
+      try {
+        this.gain.gain.setTargetAtTime(level, this.audioCtx.currentTime, 0.005);
+      } catch (_err) {
+        this.gain.gain.value = level;
+      }
+    });
+    this.muteController.mute();
     // Pause the host video until chunk 0 is on disk; resume from the
     // chunk-fetch handler. Better than playing silent: the user doesn't
     // miss any seconds of content while the first chunk is being made.
@@ -833,200 +847,6 @@ class Session {
 
   // -- video glue -----------------------------------------------------------
 
-  muteVideo() {
-    this.originalMuted = this.video.muted;
-    this.originalVolume = this.video.volume;
-
-    // What we track across host events:
-    //   _userVolume — last slider position the user set (0..1). Survives
-    //                 mute toggles so unmuting restores the right level.
-    //   _lastMuted  — last muted state we observed. Lets the volumechange
-    //                 handler detect mute/unmute clicks (which can fire
-    //                 without a volume change).
-    this._userVolume =
-      this.originalVolume > 0 ? this.originalVolume : 1.0;
-    this._lastMuted = this.originalMuted;
-
-    // We override only ``volume`` and pin it to 0 via the prototype
-    // setter + rAF re-assertion. ``muted`` is left alone: audio is
-    // already silent because volume is 0, and reading video.muted gives
-    // us the user's real mute intent (needed by the volumechange path).
-    const proto = HTMLMediaElement.prototype;
-    const volumeDesc = Object.getOwnPropertyDescriptor(proto, "volume");
-    this._realSetVolume = (v) => volumeDesc.set.call(this.video, v);
-    this._realGetVolume = () => volumeDesc.get.call(this.video);
-
-    // Seed our processed-audio gain to whatever the user was listening
-    // at, so clicking the button doesn't jump the loudness.
-    if (this.gain) {
-      this.gain.gain.value = this.originalMuted
-        ? 0
-        : Math.max(0, Math.min(1, this.originalVolume));
-    }
-
-    // Hook the main-world page-script setter patch. Each volume write
-    // the host page performs lands here as a CustomEvent before the
-    // audio renderer can pick up a non-zero value, so there is no
-    // bleed window. The patched setter pins the underlying volume to 0
-    // for us.
-    this._volIntentHandler = (e) => {
-      if (!e || !e.detail) return;
-      const { volume, muted } = e.detail;
-      if (typeof volume === "number" && volume > 0) {
-        this._userVolume = volume;
-      }
-      if (typeof muted === "boolean") this._lastMuted = muted;
-      this._applyEffectiveVolume();
-    };
-    this.video.addEventListener(
-      "nomusic:vol-intent",
-      this._volIntentHandler,
-    );
-
-    // Flag this element so page-script.js knows to intercept its
-    // volume writes. dataset writes propagate to the main world via
-    // the shared DOM.
-    this.video.dataset.nomusicVolBlock = "1";
-
-    // Initial pin (also exercises the page-script path).
-    this._realSetVolume(0);
-
-    // Fallback rAF re-assertion. If page-script.js failed to load
-    // (e.g. a browser that disables MAIN-world content scripts), we
-    // still keep underlying volume pinned. Cheap: one comparison +
-    // at most one setter call per frame.
-    const tick = () => {
-      if (this.disposed) return;
-      try {
-        if (this._realGetVolume() !== 0) this._realSetVolume(0);
-      } catch (_err) {
-        /* element detached */
-      }
-      this.muteAsserter = requestAnimationFrame(tick);
-    };
-    this.muteAsserter = requestAnimationFrame(tick);
-
-    // YouTube's player updates volume via its own state machine and
-    // sometimes doesn't round-trip through video.volume at all, so the
-    // volumechange listener never sees the change. They do persist the
-    // setting to localStorage on every interaction; we poll that as a
-    // redundant signal.
-    this._startYouTubeVolumePoll();
-  }
-
-  _startYouTubeVolumePoll() {
-    if (!/(?:^|\.)youtube\.com$/.test(location.hostname)) return;
-
-    const readYT = () => {
-      try {
-        const raw = localStorage.getItem("yt-player-volume");
-        if (!raw) return null;
-        const wrapper = JSON.parse(raw);
-        const data =
-          typeof wrapper.data === "string"
-            ? JSON.parse(wrapper.data)
-            : wrapper.data;
-        return {
-          volume: Math.max(0, Math.min(1, (data.volume ?? 100) / 100)),
-          muted: !!data.muted,
-        };
-      } catch (_err) {
-        return null;
-      }
-    };
-
-    let last = null;
-    const tick = () => {
-      if (this.disposed) return;
-      this._ytVolTimer = setTimeout(tick, 200);
-      const yt = readYT();
-      if (!yt) return;
-      if (last && last.volume === yt.volume && last.muted === yt.muted) {
-        return;
-      }
-      last = yt;
-      if (yt.volume > 0) this._userVolume = yt.volume;
-      this._lastMuted = yt.muted;
-      this._applyEffectiveVolume();
-    };
-    tick();
-  }
-
-  /** Push the current user intent (volume + mute) into the processed-
-   *  audio gain. Short setTargetAtTime ramp avoids zipper noise on fast
-   *  slider drags. */
-  _applyEffectiveVolume() {
-    if (!this.gain || !this.audioCtx) return;
-    const effective = this._lastMuted ? 0 : this._userVolume;
-    try {
-      this.gain.gain.setTargetAtTime(
-        effective,
-        this.audioCtx.currentTime,
-        0.005,
-      );
-    } catch (_err) {
-      this.gain.gain.value = effective;
-    }
-  }
-
-  /**
-   * Fires whenever the host page changes volume or muted on the <video>.
-   * We update our intent state (_userVolume from non-zero volume reads,
-   * _lastMuted from any mute change) and push the effective volume to
-   * our gain. Then we re-silence the host's volume so the original audio
-   * stays off. The 'muted' attribute is left alone — the page can flip
-   * it freely; volume=0 is what actually keeps the host silent.
-   */
-  _onHostVolumeChange() {
-    if (this.disposed || !this._realGetVolume || !this.gain) return;
-    const realVol = this._realGetVolume();
-    const muted = this.video.muted;
-
-    let changed = false;
-    if (realVol > 0) {
-      // Page set a real volume — that's the user's intent. (When the
-      // page reads back 0 it's our pin, so it doesn't tell us anything.)
-      this._userVolume = realVol;
-      changed = true;
-    }
-    if (muted !== this._lastMuted) {
-      this._lastMuted = muted;
-      changed = true;
-    }
-
-    if (changed) this._applyEffectiveVolume();
-
-    if (realVol !== 0) {
-      try {
-        this._realSetVolume(0);
-      } catch (_err) {
-        /* element gone */
-      }
-    }
-  }
-
-  unmuteVideo() {
-    if (this.muteAsserter) cancelAnimationFrame(this.muteAsserter);
-    this.muteAsserter = null;
-    if (this._ytVolTimer) clearTimeout(this._ytVolTimer);
-    this._ytVolTimer = null;
-
-    if (this._volIntentHandler) {
-      this.video.removeEventListener(
-        "nomusic:vol-intent",
-        this._volIntentHandler,
-      );
-      this._volIntentHandler = null;
-    }
-
-    // Releasing the data attribute makes the main-world setter patch a
-    // no-op for this element again. Future volume writes flow through
-    // normally.
-    delete this.video.dataset.nomusicVolBlock;
-
-    if (this._realSetVolume) this._realSetVolume(this.originalVolume);
-  }
-
   attachVideoListeners() {
     for (const [name, handler] of Object.entries(this._boundHandlers)) {
       this.video.addEventListener(name, handler);
@@ -1058,7 +878,8 @@ class Session {
     // override and the user would have to hit play themselves.
     const resumeOnExit = this._pausedByUs;
     this._pausedByUs = false;
-    this.unmuteVideo();
+    this.muteController?.dispose();
+    this.muteController = null;
     if (resumeOnExit) {
       try {
         const p = this.video.play();
