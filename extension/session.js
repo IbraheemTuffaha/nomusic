@@ -330,7 +330,12 @@ class Session {
         return;
       }
       const buf = await resp.arrayBuffer();
+      // The session can be disposed mid-fetch (toggle off, SPA navigation,
+      // <video> emptied) — the scheduler is then null. Bail quietly rather
+      // than throwing on a dead session's audio graph.
+      if (this.disposed || !this.scheduler) return;
       const decoded = await this.scheduler.decode(buf);
+      if (this.disposed || !this.scheduler) return;
       const stride = this.chunkSeconds - this.chunkOverlapSeconds;
       const entry = {
         buffer: decoded,
