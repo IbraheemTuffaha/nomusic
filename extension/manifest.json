@@ -44,7 +44,11 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["icons/button.png"],
+      "resources": [
+        "icons/button.png",
+        "stretch.js",
+        "third_party/soundtouch/*.js"
+      ],
       "matches": ["<all_urls>"]
     }
   ]
