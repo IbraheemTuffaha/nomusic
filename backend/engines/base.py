@@ -87,8 +87,8 @@ class Engine(ABC):
         return self.infer_batch([prepared])[0]
 
     def warmup(self) -> None:
-        """Optional: load weights ahead of the first request. No-op by default."""
-        return None
+        """Optional: load weights ahead of the first request. No-op by default
+        (returns None implicitly); engines that pay a load cost override it."""
 
 
 @dataclass

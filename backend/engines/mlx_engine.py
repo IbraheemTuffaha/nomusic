@@ -205,7 +205,7 @@ def _pick_device() -> str:
         if torch.cuda.is_available() and _cuda_is_usable(torch):
             return "cuda"
     except Exception:  # torch not installed yet
-        pass
+        log.debug("device probe failed; defaulting to CPU", exc_info=True)
     return "cpu"
 
 

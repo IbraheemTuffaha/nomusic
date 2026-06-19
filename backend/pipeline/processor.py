@@ -50,6 +50,12 @@ from .downloader import (
 # vocals and the file size drops ~15x vs PCM_16 WAV.
 _OPUS_BITRATE = "96k"
 
+# Hard ceiling for a single chunk's Opus encode. A chunk is ~10 s of audio, so a
+# transparent VBR encode finishes in well under a second; this bound only trips
+# if ffmpeg wedges, in which case we'd rather fail the chunk than hang the
+# write thread forever.
+_OPUS_ENCODE_TIMEOUT_SECONDS = 120.0
+
 log = logging.getLogger(__name__)
 
 # (meta, phase) where phase is one of: 'separating', 'mixing', 'chunk_complete'.
@@ -195,7 +201,7 @@ class _ProgressiveSource:
             if self._ui_hook:
                 self._ui_hook(d)
         except Exception:  # never let a UI hook break the download
-            pass
+            log.debug("progressive UI hook raised", exc_info=True)
         status = d.get("status")
         if status == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
@@ -489,7 +495,7 @@ class Processor:
         loop_start = time.perf_counter()
         total_gpu = 0.0
         chunks_processed = 0
-        logged_first = [False]
+        logged_first = False
 
         def _log_duty() -> None:
             if not chunks_processed:
@@ -510,6 +516,7 @@ class Processor:
             ``_ChunkWork``, or ``None`` when the queue is exhausted. Raises
             ``WorkerAbandoned`` (from the provider) to abort the run. Runs on the
             single decode thread, so its skip-check reads are race-free."""
+            nonlocal logged_first
             while True:
                 idx = next_chunk_provider()  # may raise WorkerAbandoned
                 if idx is None:
@@ -528,8 +535,8 @@ class Processor:
                 ):
                     continue
                 source_path = source_for(plan)
-                if dl is not None and not logged_first[0]:
-                    logged_first[0] = True
+                if dl is not None and not logged_first:
+                    logged_first = True
                     log.debug(
                         "progressive: first chunk %d released with download %s "
                         "(%.0f/%.0fs on disk)",
@@ -831,7 +838,18 @@ def _encode_opus(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
         "ogg",
         str(out_path),
     ]
-    subprocess.run(cmd, input=wav_buf.getvalue(), check=True, capture_output=True)
+    try:
+        subprocess.run(
+            cmd,
+            input=wav_buf.getvalue(),
+            check=True,
+            capture_output=True,
+            timeout=_OPUS_ENCODE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"opus encode timed out after {_OPUS_ENCODE_TIMEOUT_SECONDS:.0f}s"
+        ) from exc
 
 
 def iter_ready_chunks(meta: CacheMeta) -> Iterator[int]:

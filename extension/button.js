@@ -1,6 +1,6 @@
 // Button: the floating pill UI per <video> — status display, menu, MP4
 // download. Creates/disposes a Session on toggle. Split out of content.js.
-import { settings } from "./settings.js";
+import { settings, dlog } from "./settings.js";
 import { Session } from "./session.js";
 
 // Strip characters that are illegal in filenames across Windows/macOS/Linux
@@ -404,8 +404,8 @@ class Button {
         try {
           const r = await fetch(progUrl, { cache: "no-store" });
           if (r.ok) this._showExportProgress(await r.json());
-        } catch (_e) {
-          /* transient; keep polling */
+        } catch (err) {
+          dlog("export progress poll failed (transient)", err?.name || err);
         }
       };
       pollTimer = setInterval(poll, 600);

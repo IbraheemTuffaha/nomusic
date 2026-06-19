@@ -32,8 +32,9 @@ async function load() {
       cache: "no-store",
     });
     if (resp.ok) caps = await resp.json();
-  } catch (_err) {
-    /* fall through */
+  } catch (err) {
+    // Backend down / wrong URL — fall through and render the offline state.
+    console.debug("[nomusic] capabilities fetch failed", err);
   }
 
   if (caps) {

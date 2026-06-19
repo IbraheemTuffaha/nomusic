@@ -25,7 +25,9 @@ from pipeline.cache import JobCache  # noqa: E402
 from pipeline.processor import Processor  # noqa: E402
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser. Split from :func:`main` so tests can
+    exercise argument handling without running the full pipeline."""
     parser = argparse.ArgumentParser(description="nomusic local CLI")
     parser.add_argument("url")
     parser.add_argument("--model", default=None)
@@ -33,7 +35,11 @@ def main() -> int:
         "--stems", default=None, help="comma-separated stem names to keep"
     )
     parser.add_argument("--engine", default=SETTINGS.engine_name)
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     logging.basicConfig(
         level=logging.INFO,

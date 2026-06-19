@@ -86,7 +86,7 @@ class JobStatus:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, object]:
         d = asdict(self)
         d["state"] = self.state.value
         return d

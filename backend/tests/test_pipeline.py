@@ -11,6 +11,7 @@ import math
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -63,11 +64,11 @@ class _FakeEngine(Engine):
             default_model="fake",
         )
 
-    def prepare(self, audio_path: Path, *, model: str | None = None):
+    def prepare(self, audio_path: Path, *, model: str | None = None) -> Any:
         audio, sr = sf.read(str(audio_path), always_2d=True, dtype="float32")
         return (audio, sr)
 
-    def infer_batch(self, prepared) -> list[SeparationResult]:
+    def infer_batch(self, prepared: list[Any]) -> list[SeparationResult]:
         self.batch_sizes.append(len(prepared))
         out = []
         for audio, sr in prepared:

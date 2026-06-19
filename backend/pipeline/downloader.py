@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,11 +33,21 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+# Hard ceiling for a single ffmpeg slice. A slice decodes at most one chunk's
+# download window (tens of seconds of audio), so anything beyond this means
+# ffmpeg has wedged on a corrupt/partial container rather than doing real work —
+# kill it and let the caller surface the failure instead of hanging the worker.
+_FFMPEG_SLICE_TIMEOUT_SECONDS = 300.0
+
 # WAV is large but lossless and trivial to load with soundfile. We're operating
 # on short ranges (~30 s) so the size is fine, and any other codec would force
 # us to round-trip through ffmpeg twice (download -> re-encode -> decode again).
 _TARGET_SAMPLE_RATE = 44100
 _TARGET_CHANNELS = 2
+
+# Byte-size multipliers for the K/M suffixes in NOMUSIC_DOWNLOAD_RATELIMIT.
+_BYTES_PER_KB = 1024
+_BYTES_PER_MB = _BYTES_PER_KB * _BYTES_PER_KB
 
 
 def _common_opts() -> dict[str, Any]:
@@ -84,9 +95,9 @@ def _download_ratelimit() -> float | None:
     raw = raw.strip().upper()
     mult = 1
     if raw.endswith("K"):
-        mult, raw = 1024, raw[:-1]
+        mult, raw = _BYTES_PER_KB, raw[:-1]
     elif raw.endswith("M"):
-        mult, raw = 1024 * 1024, raw[:-1]
+        mult, raw = _BYTES_PER_MB, raw[:-1]
     try:
         return float(raw) * mult
     except ValueError:
@@ -178,7 +189,7 @@ def download_source(
                     }
                 )
             except Exception:  # never let a UI hook break the pipeline
-                pass
+                log.debug("source cache-hit progress hook raised", exc_info=True)
         return existing
 
     from yt_dlp import YoutubeDL
@@ -260,7 +271,7 @@ def download_video(
                     {"status": "finished", "downloaded_bytes": size, "total_bytes": size}
                 )
             except Exception:  # never let a UI hook break the download
-                pass
+                log.debug("video cache-hit progress hook raised", exc_info=True)
         return existing
 
     from yt_dlp import YoutubeDL
@@ -391,8 +402,8 @@ class SourceFetcher:
                     progress_hook(
                         {"status": "finished", "downloaded_bytes": size, "total_bytes": size}
                     )
-                except Exception:
-                    pass
+                except Exception:  # never let a UI hook break the download
+                    log.debug("cached-source progress hook raised", exc_info=True)
             self._close()
             return self._cached
 
@@ -434,8 +445,8 @@ class SourceFetcher:
         if self._ydl is not None:
             try:
                 self._ydl.close()
-            except Exception:
-                pass
+            except Exception:  # closing is best-effort; a failure here is benign
+                log.debug("SourceFetcher: ydl.close() raised", exc_info=True)
             self._ydl = None
 
 
@@ -458,8 +469,6 @@ def slice_source(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     duration = end - start
     tmp_path = out_path.with_suffix(".part")
-
-    import subprocess
 
     cmd = [
         "ffmpeg",
@@ -494,8 +503,16 @@ def slice_source(
     ]
     # Capture stderr so a failure (e.g. a not-yet-decodable partial progressive
     # download) carries ffmpeg's actual error instead of leaking it to the
-    # server's inherited stderr and logging a bare "return code 1".
-    proc = subprocess.run(cmd, capture_output=True)
+    # server's inherited stderr and logging a bare "return code 1". The timeout
+    # stops a wedged ffmpeg (corrupt container) from hanging the worker forever.
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, timeout=_FFMPEG_SLICE_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"ffmpeg slice timed out after {_FFMPEG_SLICE_TIMEOUT_SECONDS:.0f}s"
+        ) from exc
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip() or "(no stderr)"
         raise RuntimeError(f"ffmpeg slice failed (exit {proc.returncode}): {detail}")

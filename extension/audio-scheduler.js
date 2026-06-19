@@ -339,8 +339,8 @@ class AudioScheduler {
     for (const src of this.activeSources) {
       try {
         src.stop();
-      } catch (_err) {
-        /* already stopped */
+      } catch (err) {
+        dlog("stopAll: source already stopped", err?.name || err);
       }
     }
     this.activeSources.clear();
@@ -409,8 +409,8 @@ class AudioScheduler {
     this.syncTimer = null;
     try {
       this.audioCtx?.close();
-    } catch (_err) {
-      /* already closed */
+    } catch (err) {
+      dlog("dispose: audioCtx already closed", err?.name || err);
     }
     this.audioCtx = null;
     this.stretcher?.dispose();

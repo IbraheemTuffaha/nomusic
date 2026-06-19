@@ -7,6 +7,8 @@ are loaded by name from :func:`get_engine`.
 
 from __future__ import annotations
 
+import importlib
+
 from .base import Engine, EngineCapabilities, SeparationResult
 
 _REGISTRY: dict[str, str] = {
@@ -29,8 +31,6 @@ def get_engine(name: str) -> Engine:
             f"Unknown engine {name!r}. Known engines: {sorted(_REGISTRY)}"
         )
     module_path, _, attr = _REGISTRY[name].partition(":")
-    import importlib
-
     module = importlib.import_module(module_path)
     return getattr(module, attr)()
 
