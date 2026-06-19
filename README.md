@@ -364,11 +364,19 @@ backend/
   tests/                pytest suite (no torch / yt-dlp needed)
 extension/
   manifest.json
-  background.js
-  content.js            Button + Web Audio sync + buffer pausing
-  content.css
+  background.js          Service worker: storage defaults + backend health ping
+  content.js            Content-script bootstrap: loads main.js as an ES module
+  main.js               <video> discovery + Button attach/re-anchor
+  button.js             Floating pill UI, menu, MP3/MP4 download
+  session.js            Per-video job lifecycle (SSE status, chunk fetch/decode)
+  audio-scheduler.js    Web Audio graph, gapless scheduling, drift correction
+  mute-controller.js    Host-video muting + volume mirroring
+  stretch.js            Pitch-preserving time-stretch (vendored SoundTouch)
+  settings.js           Config + chrome.storage cache (shared by the modules)
   page-script.js        Main-world prototype patch for volume control
+  content.css
   popup.html / popup.js
+  third_party/soundtouch/   Vendored SoundTouch WSOLA library
 ```
 
 ### Environment variables

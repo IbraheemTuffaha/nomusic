@@ -17,7 +17,7 @@ function sanitizeFilename(name) {
 // ---------------------------------------------------------------------------
 // Button + per-video attachment
 // ---------------------------------------------------------------------------
-class Button {
+export class Button {
   constructor(video) {
     this.video = video;
     this.session = null;
@@ -500,5 +500,3 @@ class Button {
   }
 }
 
-
-export { Button };

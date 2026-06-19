@@ -9,7 +9,7 @@ import { AudioScheduler } from "./audio-scheduler.js";
 // ---------------------------------------------------------------------------
 // Session: drives one <video> at a time. Reused if user toggles off and on.
 // ---------------------------------------------------------------------------
-class Session {
+export class Session {
   constructor(video, button) {
     this.video = video;
     this.button = button;
@@ -538,5 +538,3 @@ class Session {
     if (!preserveButtonState) this.button.dispose();
   }
 }
-
-export { Session };

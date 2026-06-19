@@ -12,7 +12,7 @@ import {
   SYNC_CHECK_MS,
 } from "./settings.js";
 
-class AudioScheduler {
+export class AudioScheduler {
   /** @param video  the host media element (clock + playbackRate).
    *  @param opts   { chunks: Map (shared, read), getStride: ()=>number (video
    *                  seconds per chunk), getTotalChunks: ()=>number }. */
@@ -131,7 +131,7 @@ class AudioScheduler {
       !this._stretchDisabled &&
       this.stretcher?.available
     ) {
-      const stretched = this._getStretched(idx, entry, rate);
+      const stretched = this._requestStretched(idx, entry, rate);
       if (!stretched) return; // still preparing; rescheduled when it lands
       playBuf = stretched;
       srcRate = 1;
@@ -226,10 +226,11 @@ class AudioScheduler {
     });
   }
 
-  /** Return the pitch-preserved buffer for (idx, rate), or null while it is
-   *  being prepared. On first request it kicks off the async stretch and,
-   *  when the result lands, caches it and reschedules so it starts playing. */
-  _getStretched(idx, entry, rate) {
+  /** Return the cached pitch-preserved buffer for (idx, rate), or null while
+   *  it is being prepared. NOT a pure getter: on the first request it kicks off
+   *  the async stretch and, when the result lands, caches it and reschedules so
+   *  it starts playing — hence the imperative ``request`` name. */
+  _requestStretched(idx, entry, rate) {
     const key = `${idx}@${rate}`;
     const cached = this.stretchCache.get(key);
     if (cached) return cached;
@@ -419,5 +420,3 @@ class AudioScheduler {
     this._stretchInflight.clear();
   }
 }
-
-export { AudioScheduler };
