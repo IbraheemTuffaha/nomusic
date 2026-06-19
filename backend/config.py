@@ -84,9 +84,9 @@ class Settings:
         default_factory=lambda: _env_float("CACHE_SWEEP_INTERVAL_SECONDS", 3600.0)
     )
 
-    # Once a job is fully processed (every chunk on disk + full.wav written),
-    # the original compressed audio file we pulled from yt-dlp is dead weight
-    # for normal re-watches — they read straight from the chunks. We delete
+    # Once a job is fully processed (every chunk on disk), the original
+    # compressed audio file we pulled from yt-dlp is dead weight for normal
+    # re-watches — they read straight from the chunks. We delete
     # it by default to save space. Set to True if you frequently re-run with
     # different keep_stems on the same URL, since each variant requires the
     # source to be re-downloaded.

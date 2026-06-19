@@ -113,3 +113,81 @@ def test_cache_stats_shape(client):
     assert "total_bytes" in body
     assert "job_count" in body
     assert "root" in body
+
+
+def test_cache_clear_returns_deleted_bytes(client):
+    resp = client.post("/cache/clear")
+    assert resp.status_code == 200
+    assert "deleted_bytes" in resp.json()
+
+
+# --- Happy path: a fully-cached job streams without any download/separation ---
+
+
+def _seed_complete_job(client) -> str:
+    """Write a complete cache entry (meta + one chunk) the way the processor
+    would, and return its job_id. Lets the HTTP happy path run with no network
+    or engine work."""
+    from config import SETTINGS
+    from pipeline.cache import CacheMeta
+
+    cache = client.app.state.cache
+    job_id = cache.key(
+        "http://example.com/v",
+        "fake",
+        ["vocals"],
+        chunk_seconds=SETTINGS.chunk_seconds,
+        chunk_overlap_seconds=SETTINGS.chunk_overlap_seconds,
+    )
+    cache.save_meta(
+        job_id,
+        CacheMeta(
+            url="http://example.com/v",
+            model="fake",
+            keep_stems=["vocals"],
+            duration_seconds=10.0,
+            chunk_seconds=SETTINGS.chunk_seconds,
+            chunk_overlap_seconds=SETTINGS.chunk_overlap_seconds,
+            total_chunks=1,
+            title="Cached",
+            extractor="fake",
+            chunks_ready=[0],
+            complete=True,
+        ),
+    )
+    cache.chunk_path(job_id, 0).write_bytes(b"OggS-fake-opus-bytes")
+    return job_id
+
+
+def test_process_cache_hit_returns_ready(client):
+    _seed_complete_job(client)
+    resp = client.post(
+        "/process", json={"url": "http://example.com/v", "keep_stems": ["vocals"]}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["state"] == "ready"
+    assert body["total_chunks"] == 1
+
+
+def test_status_and_chunk_for_cached_job(client):
+    job_id = _seed_complete_job(client)
+    status = client.get(f"/status/{job_id}")
+    assert status.status_code == 200
+    assert status.json()["state"] == "ready"
+
+    chunk = client.get(f"/chunk/{job_id}/0")
+    assert chunk.status_code == 200
+    assert chunk.content == b"OggS-fake-opus-bytes"
+
+    # Out-of-range chunk index is a 404, not a 200 of the wrong file.
+    assert client.get(f"/chunk/{job_id}/5").status_code == 404
+
+
+def test_events_terminal_job_single_shot(client):
+    job_id = _seed_complete_job(client)
+    resp = client.get(f"/events/{job_id}")
+    assert resp.status_code == 200
+    # A terminal (ready) job yields one SSE data frame and closes.
+    assert "data:" in resp.text
+    assert '"state": "ready"' in resp.text or '"state":"ready"' in resp.text

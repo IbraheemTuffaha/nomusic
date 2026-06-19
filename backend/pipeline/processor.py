@@ -19,7 +19,6 @@ from __future__ import annotations
 import io
 import logging
 import math
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -28,7 +27,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import soundfile as sf
@@ -41,7 +40,6 @@ from .downloader import (
     SourceFetcher,
     VideoMetadata,
     download_source,
-    probe,
     slice_source,
 )
 
@@ -58,9 +56,10 @@ _OPUS_ENCODE_TIMEOUT_SECONDS = 120.0
 
 log = logging.getLogger(__name__)
 
-# (meta, phase) where phase is one of: 'separating', 'mixing', 'chunk_complete'.
+# (meta, phase) where phase is one of: 'separating', 'chunk_complete'.
 # Phase 'chunk_complete' is the only one that guarantees meta.chunks_ready has
-# been updated; the others are best-effort UI hints.
+# been updated; 'separating' is a best-effort UI hint emitted when a batch
+# enters the GPU stage.
 ProgressCb = Callable[[CacheMeta, str], None]
 
 # Source-download progress, 0..1. ``None`` means total size unknown
@@ -764,7 +763,7 @@ class Processor:
         key: str,
         plan: ChunkPlan,
     ) -> None:
-        """Write ``chunk_NNN.wav`` covering exactly ``[play_start, play_end]``.
+        """Write ``chunk_NNN.opus`` covering exactly ``[play_start, play_end]``.
 
         The download window includes ``half_overlap`` of pre-roll / post-roll
         on each side so the separator has clean context at boundaries — but
@@ -850,21 +849,3 @@ def _encode_opus(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
         raise RuntimeError(
             f"opus encode timed out after {_OPUS_ENCODE_TIMEOUT_SECONDS:.0f}s"
         ) from exc
-
-
-def iter_ready_chunks(meta: CacheMeta) -> Iterator[int]:
-    """Yield each ready chunk index in order. Convenience for the HTTP layer."""
-    yield from sorted(set(meta.chunks_ready))
-
-
-# Small helper used by tests / the API; placed here so it lives with the rest
-# of the pipeline rather than leaking into the engine module.
-def silence_wav(path: Path, *, seconds: float, sample_rate: int = 44100) -> None:
-    samples = int(seconds * sample_rate)
-    audio = np.zeros((samples, 2), dtype=np.int16)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(path), audio, sample_rate, subtype="PCM_16")
-
-
-def copy_wav(src: Path, dst: Path) -> None:
-    shutil.copyfile(src, dst)

@@ -49,9 +49,12 @@ from jobs import JobRegistry  # noqa: E402
 from pipeline import downloader  # noqa: E402
 from pipeline.cache import CHUNK_MEDIA_TYPE, JobCache  # noqa: E402
 from pipeline.export import (  # noqa: E402
+    MP4_COPYABLE_VCODECS,
     mp3_transcode_cmd,
     mux_video_cmd,
     snapshot_chunk_files,
+    video_codec,
+    video_duration,
 )
 from pipeline.processor import Processor  # noqa: E402
 
@@ -66,10 +69,10 @@ _SECONDS_PER_DAY = 86400.0
 # Block size (64 KiB) for streaming concatenated audio chunks to the client.
 _STREAM_BLOCK_BYTES = 65536
 
-# ffprobe is a metadata read (sub-second); ffmpeg transcodes/muxes can run for a
-# while on a long video, so it gets a far larger ceiling. Both bound a wedged
-# subprocess so a corrupt input fails the request instead of hanging the worker.
-_FFPROBE_TIMEOUT_SECONDS = 60.0
+# ffmpeg transcodes/muxes can run for a while on a long video; this ceiling only
+# bounds a wedged subprocess so a corrupt input fails the request instead of
+# hanging the worker. (ffprobe's shorter timeout lives with the probe helpers in
+# pipeline/export.py.)
 _FFMPEG_TIMEOUT_SECONDS = 3600.0
 
 
@@ -130,57 +133,6 @@ def _run_ffmpeg(cmd: list[str]) -> None:
         detail = proc.stderr.decode("utf-8", "replace").strip() or "(no stderr)"
         log.error("ffmpeg failed (exit %d): %s", proc.returncode, detail)
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {detail}")
-
-
-# Codecs QuickTime/Safari can play inside an MP4 — these we stream-copy. Any
-# other video codec (VP9/AV1, which YouTube uses above 1080p) is re-encoded to
-# H.264 so the exported MP4 plays everywhere, not just in VLC/Chrome.
-_MP4_COPYABLE_VCODECS = frozenset({"h264", "hevc"})
-
-
-def _video_codec(path: Path) -> str:
-    """Return the first video stream's codec name via ffprobe ("" on failure)."""
-    try:
-        proc = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1",
-                str(path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_FFPROBE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        log.warning("ffprobe (codec) timed out for %s", path)
-        return ""
-    return proc.stdout.strip()
-
-
-def _video_duration(path: Path) -> float:
-    """Best-effort duration (seconds) of ``path``'s video stream, 0.0 on failure.
-
-    Used as the denominator for the ffmpeg encode-progress percentage. Falls
-    back to the container duration when the stream doesn't advertise one."""
-    for args in (
-        ["-select_streams", "v:0", "-show_entries", "stream=duration"],
-        ["-show_entries", "format=duration"],
-    ):
-        try:
-            out = subprocess.run(
-                ["ffprobe", "-v", "error", *args, "-of", "default=nw=1:nk=1", str(path)],
-                capture_output=True, text=True, timeout=_FFPROBE_TIMEOUT_SECONDS,
-            ).stdout.strip()
-        except subprocess.TimeoutExpired:
-            log.warning("ffprobe (duration) timed out for %s", path)
-            continue
-        try:
-            if out and out != "N/A":
-                return float(out)
-        except ValueError:
-            # Non-numeric output: try the next probe form, then fall back to 0.0.
-            log.debug("ffprobe returned non-numeric duration %r for %s", out, path)
-    return 0.0
 
 
 def _run_ffmpeg_progress(cmd: list[str], total_seconds: float, on_pct) -> None:
@@ -371,6 +323,12 @@ def create_app() -> FastAPI:
     _configure_logging()
     app = FastAPI(title="nomusic", version="0.2.0", lifespan=lifespan)
 
+    # SECURITY INVARIANT: allow_origins='*' with no auth is only safe because
+    # the server binds to 127.0.0.1 (see SETTINGS.host / config.py) — it's
+    # reachable only from this machine, so any origin reaching it is already
+    # local. If you ever change the bind to a non-loopback address, you MUST add
+    # authentication and tighten allow_origins; the two settings are coupled.
+    #
     # ``allow_private_network=True`` opts into Chrome's Private Network
     # Access flow: a fetch from a public origin (youtube.com) to a private
     # IP (127.0.0.1) gets an extra preflight with
@@ -731,14 +689,14 @@ def create_app() -> FastAPI:
             _export_progress.set(progress_key, "encoding", 0.0)
             tmp_dir = Path(tempfile.mkdtemp(prefix="nomusic-mp4-"))
             out = tmp_dir / "full.mp4"
-            total_seconds = _video_duration(video_path)
+            total_seconds = video_duration(video_path)
 
             def _enc_pct(frac: float) -> None:
                 _export_progress.set(progress_key, "encoding", 100.0 * frac)
 
             # Copy H.264/HEVC straight through (fast, lossless); re-encode
             # VP9/AV1 to H.264 so the MP4 plays in QuickTime/Safari too.
-            reencode = _video_codec(video_path) not in _MP4_COPYABLE_VCODECS
+            reencode = video_codec(video_path) not in MP4_COPYABLE_VCODECS
             try:
                 _run_ffmpeg_progress(
                     mux_video_cmd(video_path, chunk_files, out, reencode_video=reencode),

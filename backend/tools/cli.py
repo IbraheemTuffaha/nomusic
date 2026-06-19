@@ -1,7 +1,8 @@
 """Command-line driver for local testing.
 
-Usage:
-    backend/.venv/bin/python -m backend.tools.cli <url> [--model M] [--stems vocals,other]
+Usage (run from the ``backend/`` directory, matching the sibling-import
+bootstrap below):
+    .venv/bin/python -m tools.cli <url> [--model M] [--stems vocals,other]
 
 Runs the full pipeline (download -> separate -> chunk -> cache) without touching
 the HTTP server. Useful for benchmarking and debugging.

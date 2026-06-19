@@ -7,7 +7,7 @@ ONNX, CUDA, ...) translate the calls below into framework-specific code.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -89,12 +89,3 @@ class Engine(ABC):
     def warmup(self) -> None:
         """Optional: load weights ahead of the first request. No-op by default
         (returns None implicitly); engines that pay a load cost override it."""
-
-
-@dataclass
-class EngineRegistration:
-    """For tests and future plugin discovery. Unused at runtime today."""
-
-    name: str
-    factory: object
-    extras: dict[str, str] = field(default_factory=dict)

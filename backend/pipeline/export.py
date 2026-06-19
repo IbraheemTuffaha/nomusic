@@ -27,7 +27,65 @@ counts real videos produce).
 
 from __future__ import annotations
 
+import logging
+import subprocess
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+# ffprobe is a metadata read; a sub-second job in practice. The ceiling only
+# trips if ffprobe wedges, in which case the caller degrades gracefully.
+_FFPROBE_TIMEOUT_SECONDS = 60.0
+
+# Codecs QuickTime/Safari can play inside an MP4 — these the mux stream-copies.
+# Any other video codec (VP9/AV1, which YouTube uses above 1080p) is re-encoded
+# to H.264 so the exported MP4 plays everywhere, not just in VLC/Chrome.
+MP4_COPYABLE_VCODECS = frozenset({"h264", "hevc"})
+
+
+def video_codec(path: Path) -> str:
+    """Return the first video stream's codec name via ffprobe ("" on failure)."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_FFPROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("ffprobe (codec) timed out for %s", path)
+        return ""
+    return proc.stdout.strip()
+
+
+def video_duration(path: Path) -> float:
+    """Best-effort duration (seconds) of ``path``'s video stream, 0.0 on failure.
+
+    Used as the denominator for the ffmpeg encode-progress percentage. Falls
+    back to the container duration when the stream doesn't advertise one."""
+    for args in (
+        ["-select_streams", "v:0", "-show_entries", "stream=duration"],
+        ["-show_entries", "format=duration"],
+    ):
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", *args, "-of", "default=nw=1:nk=1", str(path)],
+                capture_output=True, text=True, timeout=_FFPROBE_TIMEOUT_SECONDS,
+            ).stdout.strip()
+        except subprocess.TimeoutExpired:
+            log.warning("ffprobe (duration) timed out for %s", path)
+            continue
+        try:
+            if out and out != "N/A":
+                return float(out)
+        except ValueError:
+            # Non-numeric output: try the next probe form, then fall back to 0.0.
+            log.debug("ffprobe returned non-numeric duration %r for %s", out, path)
+    return 0.0
 
 
 def snapshot_chunk_files(cache, job_id: str, total_chunks: int) -> list[tuple[Path, int]]:

@@ -223,25 +223,27 @@ class JobCache:
 
     # -- maintenance ---------------------------------------------------------
 
+    def _tree_entries(self, tree: str) -> list[Path]:
+        """Per-entry dirs under a url-keyed tree (``sources`` / ``videos``).
+
+        Both maintenance passes (stats tally, TTL sweep) walk these trees the
+        same way; centralizing the "child dirs of root/<tree>" iteration keeps
+        them from drifting apart.
+        """
+        root = self.root / tree
+        if not root.exists():
+            return []
+        return [p for p in root.iterdir() if p.is_dir()]
+
     def stats(self) -> dict[str, int]:
         """Tally on-disk sizes. Returns bytes counts the popup can render."""
-        sources_root = self.root / "sources"
-        source_count = 0
-        source_bytes = 0
-        if sources_root.exists():
-            for p in sources_root.glob("*"):
-                if p.is_dir():
-                    source_count += 1
-                    source_bytes += _dir_bytes(p)
+        source_dirs = self._tree_entries("sources")
+        source_count = len(source_dirs)
+        source_bytes = sum(_dir_bytes(p) for p in source_dirs)
 
-        videos_root = self.root / "videos"
-        video_count = 0
-        video_bytes = 0
-        if videos_root.exists():
-            for p in videos_root.glob("*"):
-                if p.is_dir():
-                    video_count += 1
-                    video_bytes += _dir_bytes(p)
+        video_dirs = self._tree_entries("videos")
+        video_count = len(video_dirs)
+        video_bytes = sum(_dir_bytes(p) for p in video_dirs)
 
         job_count = 0
         job_bytes = 0
@@ -316,12 +318,7 @@ class JobCache:
         # are url-keyed caches swept per-entry (a single old dir doesn't drag
         # the whole tree down with it).
         for tree in ("sources", "videos"):
-            tree_root = self.root / tree
-            if not tree_root.exists():
-                continue
-            for child in list(tree_root.iterdir()):
-                if not child.is_dir():
-                    continue
+            for child in self._tree_entries(tree):
                 if _dir_newest_mtime(child) < now - ttl_seconds:
                     freed += _dir_bytes(child)
                     shutil.rmtree(child, ignore_errors=True)

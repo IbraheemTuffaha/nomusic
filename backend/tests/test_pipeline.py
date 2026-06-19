@@ -271,9 +271,8 @@ def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
         def __init__(self, *a, **k):
             raise AssertionError("resume must not extract/download — no fetcher")
 
-    # Resume must reuse cached meta: no probe, no SourceFetcher construction.
-    monkeypatch.setattr(proc, "probe", lambda url: (_ for _ in ()).throw(
-        AssertionError("probe must be skipped on resume")))
+    # Resume must reuse cached meta: no SourceFetcher construction means no
+    # yt-dlp metadata extraction or download is attempted.
     monkeypatch.setattr(proc, "SourceFetcher", _BoomFetcher)
 
     cache = JobCache(tmp_path / "cache")

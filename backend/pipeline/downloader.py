@@ -29,9 +29,16 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
+
+# yt-dlp progress-hook callback. yt-dlp invokes it with a status dict whose keys
+# vary by phase — at minimum ``status`` ("downloading"/"finished"), plus
+# ``downloaded_bytes``, ``total_bytes`` / ``total_bytes_estimate``, ``speed``,
+# ``eta`` while downloading. We forward it verbatim; the values are
+# heterogeneous, hence the loose value type.
+ProgressHook = Callable[[dict[str, Any]], None]
 
 # Hard ceiling for a single ffmpeg slice. A slice decodes at most one chunk's
 # download window (tens of seconds of audio), so anything beyond this means
@@ -51,7 +58,7 @@ _BYTES_PER_MB = _BYTES_PER_KB * _BYTES_PER_KB
 
 
 def _common_opts() -> dict[str, Any]:
-    """Options shared by ``probe`` and ``download_range``.
+    """Options shared by ``probe`` and the source/video download helpers.
 
     YouTube requires a JavaScript runtime + EJS challenge solver scripts for
     most videos (without them, extraction fails with the misleading "This
@@ -162,7 +169,7 @@ def download_source(
     url: str,
     out_dir: Path,
     *,
-    progress_hook=None,
+    progress_hook: ProgressHook | None = None,
 ) -> Path:
     """Download the entire bestaudio stream for ``url`` into ``out_dir``.
 
@@ -247,7 +254,7 @@ def download_video(
     out_dir: Path,
     *,
     max_height: int | None = None,
-    progress_hook=None,
+    progress_hook: ProgressHook | None = None,
 ) -> Path:
     """Download the video stream for ``url`` into ``out_dir`` for the MP4 export.
 
@@ -393,7 +400,7 @@ class SourceFetcher:
             webpage_url=str(info.get("webpage_url", self.url)),
         )
 
-    def download(self, progress_hook=None) -> Path:
+    def download(self, progress_hook: ProgressHook | None = None) -> Path:
         if self._cached is not None:
             log.info("Using cached source audio: %s", self._cached.name)
             if progress_hook:
@@ -526,18 +533,3 @@ def _find_source(out_dir: Path) -> Path | None:
         if p.exists() and p.stat().st_size > 0:
             return p
     return None
-
-
-# Back-compat shim. Old code (or external callers) may still import
-# download_range; we redirect them through download_source + slice_source so
-# the keyframe-drift bug can't sneak back in.
-def download_range(
-    url: str,
-    out_path: Path,
-    *,
-    start: float,
-    end: float,
-) -> Path:
-    source_dir = out_path.parent / "_source"
-    source = download_source(url, source_dir)
-    return slice_source(source, out_path, start=start, end=end)
