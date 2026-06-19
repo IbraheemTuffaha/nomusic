@@ -698,6 +698,17 @@ def test_cuda_usable_accepts_forward_ptx_jit():
     assert _cuda_is_usable(_fake_torch((7, 0), ["compute_80"])) is False
 
 
+def test_cuda_usable_handles_arch_specific_suffixes():
+    from engines.mlx_engine import _cuda_is_usable
+
+    # CUDA 12.x/13.x wheels emit suffixed entries (sm_90a, sm_120a, compute_90a).
+    # These must not be silently dropped, or a usable Hopper/Blackwell GPU gets
+    # wrongly demoted to CPU.
+    assert _cuda_is_usable(_fake_torch((9, 0), ["sm_75", "sm_90a"])) is True
+    assert _cuda_is_usable(_fake_torch((12, 0), ["sm_90a", "sm_120a"])) is True
+    assert _cuda_is_usable(_fake_torch((9, 0), ["sm_75", "compute_90a"])) is True
+
+
 def test_cuda_usable_defaults_true_when_undetectable():
     from engines.mlx_engine import _cuda_is_usable
     from types import SimpleNamespace

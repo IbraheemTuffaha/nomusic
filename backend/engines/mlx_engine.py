@@ -1,11 +1,11 @@
-"""Apple Silicon source-separation engine.
+"""demucs source-separation engine (also registered under the alias ``demucs``).
 
 The class name reads "MLX" because that's the strategic backend we want; the
 *current* implementation runs htdemucs via the upstream ``demucs`` PyTorch
-package on Apple's MPS device, which is what's stable on M-series silicon
-today. Swapping in a real MLX backend later means replacing the
-``_make_separator`` factory below — nothing else in the codebase needs to
-change.
+package on whatever torch device is available — Apple MPS, NVIDIA CUDA, or CPU,
+auto-selected by :func:`_pick_device`. Swapping in a real MLX backend later
+means replacing the ``_make_separator`` factory below — nothing else in the
+codebase needs to change.
 
 Why the indirection: source separation libraries change their APIs frequently.
 Keeping the boundary at ``_make_separator`` lets tests stub the engine without
@@ -25,10 +25,10 @@ from .base import DEMUCS_STEMS, Engine, EngineCapabilities, SeparationResult
 log = logging.getLogger(__name__)
 
 # Models we expose. ``htdemucs`` is the project default: ~80 MB, 9.0 dB SDR,
-# and the fastest of the four-source models on M-series silicon. ``htdemucs_ft``
-# is more accurate but ~4x slower; never selected by default. The ``mdx_extra``
-# models are dropped — they're slower (or merely compact), not better, and the
-# quantized one needed an extra ``diffq`` dependency.
+# and the fastest of the four-source models. ``htdemucs_ft`` is more accurate
+# but ~4x slower; never selected by default. The ``mdx_extra`` models are
+# dropped — they're slower (or merely compact), not better, and the quantized
+# one needed an extra ``diffq`` dependency.
 _SUPPORTED_MODELS: tuple[str, ...] = (
     "htdemucs",
     "htdemucs_ft",
@@ -209,6 +209,18 @@ def _pick_device() -> str:
     return "cpu"
 
 
+def _arch_version(token: str) -> int | None:
+    """Parse an arch token's numeric capability: ``"90"`` / ``"90a"`` -> ``90``.
+
+    Torch emits architecture-specific entries with a trailing ``a``/``f`` (e.g.
+    ``sm_90a``, ``sm_120a``, ``compute_90a``) from ``get_arch_list()``; mirror
+    torch's own ``_extract_arch_version`` by stripping that suffix so these
+    aren't silently dropped.
+    """
+    num = token.removesuffix("a").removesuffix("f")
+    return int(num) if num.isdigit() else None
+
+
 def _cuda_is_usable(torch: Any) -> bool:
     """True if this torch build can run kernels on the current CUDA GPU.
 
@@ -217,6 +229,10 @@ def _cuda_is_usable(torch: Any) -> bool:
     capability against the wheel's built-in arch list, allowing same-major
     minor-version forward compatibility (an ``sm_80`` cubin runs on ``sm_86``)
     and forward PTX JIT (a ``compute_70`` PTX runs on anything ``>= 7.0``).
+
+    This doesn't model torch's rare embedded-SKU exclusions (e.g. sm_87 Jetson
+    Orin vs an sm_80/86 build), so a few uncommon embedded GPUs could be wrongly
+    accepted; the common too-old-GPU case (the one this guards) is handled.
     """
     try:
         major, minor = torch.cuda.get_device_capability()
@@ -224,8 +240,16 @@ def _cuda_is_usable(torch: Any) -> bool:
         archs = torch.cuda.get_arch_list()
     except Exception:
         return True  # can't introspect — let torch try
-    reals = [int(a[3:]) for a in archs if a.startswith("sm_") and a[3:].isdigit()]
-    ptx = [int(a[8:]) for a in archs if a.startswith("compute_") and a[8:].isdigit()]
+    reals, ptx = [], []
+    for a in archs:
+        if a.startswith("sm_"):
+            n = _arch_version(a[3:])
+            if n is not None:
+                reals.append(n)
+        elif a.startswith("compute_"):
+            n = _arch_version(a[8:])
+            if n is not None:
+                ptx.append(n)
     if any(r // 10 == dev // 10 and dev >= r for r in reals):
         return True
     if any(dev >= p for p in ptx):

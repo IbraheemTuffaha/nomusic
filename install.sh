@@ -96,9 +96,9 @@ if [[ -n "${NOMUSIC_PYTHON:-}" ]]; then
   alt="$(command -v "python${NOMUSIC_PYTHON}" || true)"
   [[ -n "$alt" ]] || die "NOMUSIC_PYTHON=${NOMUSIC_PYTHON} requested but 'python${NOMUSIC_PYTHON}' is not on PATH. Install it first (Ubuntu: sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt-get update && sudo apt-get install python${NOMUSIC_PYTHON} python${NOMUSIC_PYTHON}-venv), then re-run."
   PY="$alt"
-  # Debian/Ubuntu split venv's pip bootstrap (ensurepip) into a separate
-  # package; without it `python -m venv` dies at ensurepip. Make sure it's
-  # present for the chosen interpreter (idempotent).
+  # On Debian/Ubuntu this package provides the venv module itself (and its pip
+  # bootstrap); without it even `python -m venv --without-pip` fails, so the
+  # bootstrap fallback below can't save us. Install it (idempotent).
   if command -v apt-get >/dev/null 2>&1; then
     sudo apt-get install -y "python${NOMUSIC_PYTHON}-venv" \
       || warn "Could not install python${NOMUSIC_PYTHON}-venv; venv creation may fail."
@@ -137,10 +137,14 @@ source backend/.venv/bin/activate
 # fall back to get-pip.py fetched via the standard library (no curl needed).
 if ! python -m pip --version >/dev/null 2>&1; then
   step "Bootstrapping pip"
-  python -m ensurepip --upgrade >/dev/null 2>&1 || {
-    python -c "import urllib.request; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '/tmp/nomusic-get-pip.py')"
-    python /tmp/nomusic-get-pip.py
-  }
+  if ! python -m ensurepip --upgrade >/dev/null 2>&1; then
+    getpip="$(mktemp -t nomusic-get-pip.XXXXXX.py)"
+    trap 'rm -f "$getpip"' EXIT
+    python -c "import urllib.request,sys; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', sys.argv[1])" "$getpip" \
+      && python "$getpip" \
+      || die "Could not bootstrap pip (no ensurepip, and get-pip.py download failed). Install pip for ${PY} manually, then re-run."
+    rm -f "$getpip"; trap - EXIT
+  fi
 fi
 
 pip install --upgrade pip wheel
@@ -185,17 +189,27 @@ fi
 step "Installing Python dependencies (this may take a few minutes for torch)"
 pip install -r backend/requirements.txt
 
-# --- verify torch can see the GPU (Linux) ------------------------------------
+# --- verify which device the engine will actually use (Linux) ----------------
 
 if [[ "$OS" == "Linux" ]]; then
   step "Verifying torch device"
-  python - <<'PY'
+  # Report the device the server will really pick (_pick_device runs the same
+  # GPU-usability check), not just torch.cuda.is_available() — a detectable but
+  # too-old GPU still runs on CPU.
+  PYTHONPATH=backend python - <<'PY'
 import torch
-print(f"  torch {torch.__version__} — CUDA available: {torch.cuda.is_available()}")
-if not torch.cuda.is_available():
-    print("  [warn] torch can't see a GPU. If this box has an NVIDIA GPU, re-run")
-    print("         with a pinned CUDA build, e.g.: NOMUSIC_CUDA=cu128 ./install.sh")
-    print("         (try cu126 or cu118 if your driver is older).")
+from engines.mlx_engine import _pick_device
+
+dev = _pick_device()
+print(f"  torch {torch.__version__} — engine device: {dev}")
+if dev != "cuda" and torch.cuda.is_available():
+    print("  [warn] A CUDA GPU was detected but this torch build can't run on it")
+    print("         (architecture too old); the engine will use CPU. For an older")
+    print("         GPU, pin a legacy build, e.g.:")
+    print("         NOMUSIC_PYTHON=3.11 NOMUSIC_CUDA=cu118 NOMUSIC_TORCH=2.4.1 ./install.sh")
+elif dev == "cpu":
+    print("  [warn] No usable GPU; the engine will use CPU. For an NVIDIA GPU,")
+    print("         check drivers, then pin a CUDA build: NOMUSIC_CUDA=cu128 ./install.sh")
 PY
 fi
 

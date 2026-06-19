@@ -386,6 +386,7 @@ All optional, all prefixed `NOMUSIC_`:
 | `NOMUSIC_KEEP_SOURCE_AFTER_COMPLETE` | `false` | Keep yt-dlp source audio after processing (faster stem switching, more disk) |
 | `NOMUSIC_CHUNK_SECONDS` | `10` | Chunk size |
 | `NOMUSIC_CHUNK_OVERLAP_SECONDS` | `0.5` | Per-chunk overlap for separator context |
+| `NOMUSIC_GPU_BATCH` | `2` | Chunks separated per batched inference call (1 disables batching); raise it on a big GPU with spare VRAM |
 | `NOMUSIC_IDLE_TIMEOUT_SECONDS` | `10` | How long a worker keeps running after you pause or close the tab before it abandons the job and releases the GPU; resume re-spawns from cache (0 disables) |
 | `NOMUSIC_SSE_KEEPALIVE_SECONDS` | `15` | Gap between SSE keep-alive comments on a quiet status stream |
 | `NOMUSIC_MEMORY_GC_INTERVAL_SECONDS` | `3600` | How often the in-memory job map is reclaimed for jobs whose disk cache is gone (0 disables) |
