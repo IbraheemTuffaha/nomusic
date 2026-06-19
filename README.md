@@ -279,8 +279,8 @@ so no extra configuration is needed.
 
 The installer is `apt`-based (Debian/Ubuntu). On other distros, install
 `python3` (+ `venv`/`pip`), `ffmpeg`, `git` and a JS runtime (`node`/`deno`)
-yourself, then create the venv and `pip install -r backend/requirements.txt`
-(installing torch from a CUDA wheel index first if you have a GPU).
+yourself, then create the venv, `pip install torch torchaudio` (PyPI's default
+Linux wheel is CUDA-enabled), and `pip install -r backend/requirements.txt`.
 
 1. Get the project files (`git clone https://github.com/IbraheemTuffaha/nomusic`
    or download + unzip the ZIP).
@@ -292,8 +292,10 @@ yourself, then create the venv and `pip install -r backend/requirements.txt`
 
    It detects your platform automatically. On Linux it installs the system
    packages via `apt`, then installs **CUDA torch if it finds an NVIDIA GPU**
-   (via `nvidia-smi`) or **CPU torch** otherwise. To target a specific CUDA
-   build, set `NOMUSIC_CUDA` (e.g. `NOMUSIC_CUDA=cu121 ./install.sh`).
+   (via `nvidia-smi`) or **CPU torch** otherwise, and prints whether torch can
+   see the GPU. If your driver needs a specific CUDA build, pin it with
+   `NOMUSIC_CUDA` — maintained tags are `cu118` / `cu126` / `cu128`
+   (e.g. `NOMUSIC_CUDA=cu126 ./install.sh`).
 
 3. Start the backend:
 

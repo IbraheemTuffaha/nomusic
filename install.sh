@@ -59,7 +59,7 @@ install_macos() {
 
 install_linux() {
   if ! command -v apt-get >/dev/null 2>&1; then
-    die "Linux auto-install currently supports Debian/Ubuntu (apt). On other distros, install python3 (+venv/pip), ffmpeg, git and a JS runtime (node/deno), then run: python3 -m venv backend/.venv && backend/.venv/bin/pip install -r backend/requirements.txt (install torch from https://download.pytorch.org/whl/cu124 first if you have an NVIDIA GPU)."
+    die "Linux auto-install currently supports Debian/Ubuntu (apt). On other distros, install python3 (+venv/pip), ffmpeg, git and a JS runtime (node/deno), then run: python3 -m venv backend/.venv && backend/.venv/bin/pip install torch torchaudio && backend/.venv/bin/pip install -r backend/requirements.txt (PyPI's default Linux torch wheel is CUDA-enabled; pin a build from https://download.pytorch.org/whl/cu128 if your driver needs a specific CUDA)."
   fi
 
   step "Installing system packages via apt"
@@ -100,11 +100,21 @@ pip install --upgrade pip wheel
 
 if [[ "$OS" == "Linux" ]]; then
   # Install torch BEFORE requirements.txt so the generic ``torch>=2.2`` pin is
-  # already satisfied and pip never falls back to PyPI's CPU-only Linux wheel.
+  # already satisfied and pip doesn't re-resolve it.
   if command -v nvidia-smi >/dev/null 2>&1; then
-    CUDA_TAG="${NOMUSIC_CUDA:-cu124}"  # override for a different CUDA, e.g. cu121/cu126/cu128
-    step "NVIDIA GPU detected — installing CUDA ($CUDA_TAG) torch"
-    pip install torch torchaudio --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
+    if [[ -n "${NOMUSIC_CUDA:-}" ]]; then
+      # Explicit CUDA build, e.g. NOMUSIC_CUDA=cu126 for an older driver. The
+      # maintained tags are cu118 / cu126 / cu128 (cu124 and older are frozen).
+      step "NVIDIA GPU detected — installing torch for CUDA ${NOMUSIC_CUDA}"
+      pip install torch torchaudio --index-url "https://download.pytorch.org/whl/${NOMUSIC_CUDA}"
+    else
+      # PyPI's default Linux torch wheel IS the CUDA build, and it covers the
+      # widest Python-version matrix, so it just works on a current driver.
+      # Pin NOMUSIC_CUDA (cu118/cu126/cu128) only if your driver needs a
+      # specific CUDA version.
+      step "NVIDIA GPU detected — installing CUDA torch (PyPI default)"
+      pip install torch torchaudio
+    fi
   else
     step "No NVIDIA GPU detected — installing CPU torch"
     pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
@@ -115,6 +125,20 @@ fi
 
 step "Installing Python dependencies (this may take a few minutes for torch)"
 pip install -r backend/requirements.txt
+
+# --- verify torch can see the GPU (Linux) ------------------------------------
+
+if [[ "$OS" == "Linux" ]]; then
+  step "Verifying torch device"
+  python - <<'PY'
+import torch
+print(f"  torch {torch.__version__} — CUDA available: {torch.cuda.is_available()}")
+if not torch.cuda.is_available():
+    print("  [warn] torch can't see a GPU. If this box has an NVIDIA GPU, re-run")
+    print("         with a pinned CUDA build, e.g.: NOMUSIC_CUDA=cu128 ./install.sh")
+    print("         (try cu126 or cu118 if your driver is older).")
+PY
+fi
 
 # --- done --------------------------------------------------------------------
 
