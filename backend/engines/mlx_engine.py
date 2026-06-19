@@ -1,11 +1,11 @@
-"""Apple Silicon source-separation engine.
+"""demucs source-separation engine (also registered under the alias ``demucs``).
 
 The class name reads "MLX" because that's the strategic backend we want; the
 *current* implementation runs htdemucs via the upstream ``demucs`` PyTorch
-package on Apple's MPS device, which is what's stable on M-series silicon
-today. Swapping in a real MLX backend later means replacing the
-``_make_separator`` factory below — nothing else in the codebase needs to
-change.
+package on whatever torch device is available — Apple MPS, NVIDIA CUDA, or CPU,
+auto-selected by :func:`_pick_device`. Swapping in a real MLX backend later
+means replacing the ``_make_separator`` factory below — nothing else in the
+codebase needs to change.
 
 Why the indirection: source separation libraries change their APIs frequently.
 Keeping the boundary at ``_make_separator`` lets tests stub the engine without
@@ -25,10 +25,10 @@ from .base import DEMUCS_STEMS, Engine, EngineCapabilities, SeparationResult
 log = logging.getLogger(__name__)
 
 # Models we expose. ``htdemucs`` is the project default: ~80 MB, 9.0 dB SDR,
-# and the fastest of the four-source models on M-series silicon. ``htdemucs_ft``
-# is more accurate but ~4x slower; never selected by default. The ``mdx_extra``
-# models are dropped — they're slower (or merely compact), not better, and the
-# quantized one needed an extra ``diffq`` dependency.
+# and the fastest of the four-source models. ``htdemucs_ft`` is more accurate
+# but ~4x slower; never selected by default. The ``mdx_extra`` models are
+# dropped — they're slower (or merely compact), not better, and the quantized
+# one needed an extra ``diffq`` dependency.
 _SUPPORTED_MODELS: tuple[str, ...] = (
     "htdemucs",
     "htdemucs_ft",
@@ -146,13 +146,15 @@ class MLXEngine(Engine):
                 model, x, device=self._device, shifts=0, split=True,
                 overlap=0.25, progress=False, num_workers=0,
             )
-        # MPS dispatches kernels asynchronously, so apply_model can return before
-        # the GPU is done. Force a sync inside the timed region or we'd measure
-        # only dispatch and wildly undercount. (CPU inference is synchronous.)
+        # MPS and CUDA dispatch kernels asynchronously, so apply_model can return
+        # before the GPU is done. Force a sync inside the timed region or we'd
+        # measure only dispatch and wildly undercount. (CPU is synchronous.)
         if self._device == "mps":
             sync = getattr(getattr(torch, "mps", None), "synchronize", None)
             if sync:
                 sync()
+        elif self._device == "cuda":
+            torch.cuda.synchronize()
         gpu_each = (time.perf_counter() - t_gpu0) / n
 
         results: list[SeparationResult] = []
@@ -188,17 +190,79 @@ class MLXEngine(Engine):
 
 
 def _pick_device() -> str:
-    """Return the best torch device available on the current host."""
+    """Return the best torch device available on the current host.
+
+    Priority: Apple MPS, then CUDA (NVIDIA), then CPU. A CUDA GPU is only chosen
+    if this torch build actually ships kernels for its compute capability —
+    otherwise inference crashes at launch ("no kernel image is available"), so
+    we fall back to CPU instead.
+    """
     try:
         import torch
 
         if torch.backends.mps.is_available():
             return "mps"
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and _cuda_is_usable(torch):
             return "cuda"
     except Exception:  # torch not installed yet
         pass
     return "cpu"
+
+
+def _arch_version(token: str) -> int | None:
+    """Parse an arch token's numeric capability: ``"90"`` / ``"90a"`` -> ``90``.
+
+    Torch emits architecture-specific entries with a trailing ``a``/``f`` (e.g.
+    ``sm_90a``, ``sm_120a``, ``compute_90a``) from ``get_arch_list()``; mirror
+    torch's own ``_extract_arch_version`` by stripping that suffix so these
+    aren't silently dropped.
+    """
+    num = token.removesuffix("a").removesuffix("f")
+    return int(num) if num.isdigit() else None
+
+
+def _cuda_is_usable(torch: Any) -> bool:
+    """True if this torch build can run kernels on the current CUDA GPU.
+
+    Recent torch wheels drop older GPU architectures (e.g. Pascal / sm_61), so a
+    *detectable* GPU isn't necessarily *usable*. Compare the device's compute
+    capability against the wheel's built-in arch list, allowing same-major
+    minor-version forward compatibility (an ``sm_80`` cubin runs on ``sm_86``)
+    and forward PTX JIT (a ``compute_70`` PTX runs on anything ``>= 7.0``).
+
+    This doesn't model torch's rare embedded-SKU exclusions (e.g. sm_87 Jetson
+    Orin vs an sm_80/86 build), so a few uncommon embedded GPUs could be wrongly
+    accepted; the common too-old-GPU case (the one this guards) is handled.
+    """
+    try:
+        major, minor = torch.cuda.get_device_capability()
+        dev = major * 10 + minor
+        archs = torch.cuda.get_arch_list()
+    except Exception:
+        return True  # can't introspect — let torch try
+    reals, ptx = [], []
+    for a in archs:
+        if a.startswith("sm_"):
+            n = _arch_version(a[3:])
+            if n is not None:
+                reals.append(n)
+        elif a.startswith("compute_"):
+            n = _arch_version(a[8:])
+            if n is not None:
+                ptx.append(n)
+    if any(r // 10 == dev // 10 and dev >= r for r in reals):
+        return True
+    if any(dev >= p for p in ptx):
+        return True
+    if reals or ptx:
+        log.warning(
+            "CUDA GPU (sm_%d%d) is not supported by this torch build "
+            "(arch list: %s) — falling back to CPU. Install a torch build that "
+            "targets your GPU to use it.",
+            major, minor, ", ".join(archs),
+        )
+        return False
+    return True  # empty/odd arch list — let torch try rather than guess
 
 
 class _ModelBundle:

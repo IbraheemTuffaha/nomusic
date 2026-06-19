@@ -10,7 +10,11 @@ from __future__ import annotations
 from .base import Engine, EngineCapabilities, SeparationResult
 
 _REGISTRY: dict[str, str] = {
+    # ``mlx`` is the historical name (the strategic Apple Silicon backend); the
+    # current implementation runs demucs via torch on MPS/CUDA/CPU. ``demucs`` is
+    # an alias that reads more honestly on non-Apple hosts.
     "mlx": "engines.mlx_engine:MLXEngine",
+    "demucs": "engines.mlx_engine:MLXEngine",
 }
 
 
