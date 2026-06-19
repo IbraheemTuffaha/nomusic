@@ -22,6 +22,10 @@ reasons.
 - About **20 minutes** for first-time setup. After that, starting
   nomusic takes 10 seconds.
 
+> Running on a **Linux** box instead — with an NVIDIA GPU or just a CPU?
+> See [Running on Linux](#running-on-linux) below. The Mac steps that
+> follow are the easy path for everyone else.
+
 You don't need to know anything technical. The steps below tell you
 exactly what to type or click.
 
@@ -258,11 +262,61 @@ back. (Steps 1-4 don't have to be repeated.)
 
 ## Privacy
 
-Everything happens on **your Mac**. The helper downloads the audio
-from the video site you're watching, processes it locally using the
-audio-separation model on your Mac's chip, and sends the result back
+Everything happens on **your own computer**. The helper downloads the
+audio from the video site you're watching, processes it locally using
+the audio-separation model on your machine, and sends the result back
 to your browser. Nothing goes to anyone else's server. The browser
 extension only talks to your own machine.
+
+---
+
+## Running on Linux
+
+nomusic also runs on Linux — with an **NVIDIA GPU** (CUDA) for full speed, or
+on **CPU** anywhere (slower, but works). Run the browser and the backend on the
+**same machine**; the extension talks to `http://127.0.0.1:8723` out of the box,
+so no extra configuration is needed.
+
+The installer is `apt`-based (Debian/Ubuntu). On other distros, install
+`python3` (+ `venv`/`pip`), `ffmpeg`, `git` and a JS runtime (`node`/`deno`)
+yourself, then create the venv and `pip install -r backend/requirements.txt`
+(installing torch from a CUDA wheel index first if you have a GPU).
+
+1. Get the project files (`git clone https://github.com/IbraheemTuffaha/nomusic`
+   or download + unzip the ZIP).
+2. From the project folder, run the installer:
+
+   ```bash
+   ./install.sh
+   ```
+
+   It detects your platform automatically. On Linux it installs the system
+   packages via `apt`, then installs **CUDA torch if it finds an NVIDIA GPU**
+   (via `nvidia-smi`) or **CPU torch** otherwise. To target a specific CUDA
+   build, set `NOMUSIC_CUDA` (e.g. `NOMUSIC_CUDA=cu121 ./install.sh`).
+
+3. Start the backend:
+
+   ```bash
+   backend/.venv/bin/python backend/server.py
+   ```
+
+   Check it picked the right device:
+
+   ```bash
+   curl -s http://127.0.0.1:8723/capabilities | python3 -m json.tool
+   ```
+
+   The `device` field reads `cuda (via demucs)` on a GPU box, or
+   `cpu (via demucs)` on a CPU-only box.
+
+4. Load the extension in Chrome on the same machine: open `chrome://extensions`,
+   turn on **Developer mode**, click **Load unpacked**, and pick the
+   `extension` folder. Then use it exactly as on a Mac (see **How to use it**).
+
+On an NVIDIA GPU with spare VRAM you can raise throughput by separating more
+chunks per inference call — set `NOMUSIC_GPU_BATCH` higher (default `2`, tuned
+for Apple Silicon).
 
 ---
 
@@ -280,13 +334,15 @@ FastAPI on 127.0.0.1:8723
 Engine abstraction (engines/base.py)
     │
     ▼
-MLX engine ── demucs (PyTorch on MPS) ── htdemucs
+MLX engine ── demucs (PyTorch on MPS / CUDA / CPU) ── htdemucs
 ```
 
-Engines are swappable. A future ONNX, CUDA, or native MLX engine drops
-in by implementing the `Engine` interface in `backend/engines/base.py`.
-The current "MLX engine" is named for the Apple Silicon target; today
-it runs htdemucs through `demucs` on the MPS backend.
+Engines are swappable. A future ONNX or native MLX engine drops in by
+implementing the `Engine` interface in `backend/engines/base.py`. The current
+"MLX engine" is named for the strategic Apple Silicon target, but it runs
+htdemucs through `demucs` on whatever torch device is available — MPS on Apple
+Silicon, CUDA on an NVIDIA GPU, or CPU — auto-detected by `_pick_device()`. It's
+also registered under the alias `demucs`.
 
 ### Layout
 
@@ -297,7 +353,7 @@ backend/
   jobs.py               In-process job registry + worker threads
   engines/
     base.py             Abstract Engine interface
-    mlx_engine.py       Apple Silicon implementation
+    mlx_engine.py       demucs via torch (MPS / CUDA / CPU)
   pipeline/
     downloader.py       yt-dlp + ffmpeg slicing (audio + on-demand video)
     processor.py        Chunking, mixing, encoding
@@ -321,7 +377,7 @@ All optional, all prefixed `NOMUSIC_`:
 |---|---|---|
 | `NOMUSIC_HOST` | `127.0.0.1` | Bind address |
 | `NOMUSIC_PORT` | `8723` | Listen port |
-| `NOMUSIC_ENGINE` | `mlx` | Engine name |
+| `NOMUSIC_ENGINE` | `mlx` | Engine name (alias: `demucs`) |
 | `NOMUSIC_CACHE_DIR` | `~/.cache/nomusic` | Cache root |
 | `NOMUSIC_CACHE_TTL_DAYS` | `7` | Days before unused entries are deleted (0 disables) |
 | `NOMUSIC_CACHE_SWEEP_INTERVAL_SECONDS` | `3600` | How often the TTL sweep runs |

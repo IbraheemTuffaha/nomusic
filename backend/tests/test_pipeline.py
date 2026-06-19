@@ -597,13 +597,13 @@ def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):
 def test_infer_batch_matches_single_mlx(tmp_path):
     """Batched separation must produce the same per-chunk output as separate
     single calls — otherwise batching for throughput would change results.
-    Uses the real MLX engine, so it's skipped where MPS/torch isn't available."""
+    Uses the real MLX engine, so it's skipped where a GPU/torch isn't available."""
     try:
         import torch
     except Exception:
         pytest.skip("torch not installed")
-    if not torch.backends.mps.is_available():
-        pytest.skip("MPS not available")
+    if not (torch.backends.mps.is_available() or torch.cuda.is_available()):
+        pytest.skip("no GPU (MPS/CUDA) available")
 
     from engines.mlx_engine import MLXEngine
 

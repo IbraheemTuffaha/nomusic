@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# Set up the nomusic backend on macOS / Apple Silicon.
+# Set up the nomusic backend.
 #
-# - Installs Python 3.11 and ffmpeg via Homebrew if missing
-# - Creates backend/.venv
-# - Installs Python deps from backend/requirements.txt
+# macOS / Apple Silicon:
+#   - Installs Python 3.11 and ffmpeg via Homebrew if missing
+#   - torch comes from PyPI (arm64 / MPS wheel)
+#
+# Linux (Debian/Ubuntu):
+#   - Installs Python, ffmpeg and a JS runtime via apt
+#   - Installs torch from the CUDA wheel index if an NVIDIA GPU is present,
+#     otherwise from the CPU wheel index
+#
+# Common:
+#   - Creates backend/.venv and installs Python deps from requirements.txt
 #
 # Re-running this script is safe; each step is idempotent.
 
@@ -17,45 +25,95 @@ step() { printf '\n\033[1;36m==>\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$1" >&2; }
 die()  { printf '\033[1;31m[err ]\033[0m %s\n' "$1" >&2; exit 1; }
 
-# --- platform check ----------------------------------------------------------
+OS="$(uname -s)"
+PY=""  # set by the platform installer below
 
-if [[ "$(uname -s)" != "Darwin" ]] || [[ "$(uname -m)" != "arm64" ]]; then
-  die "nomusic's default engine targets macOS on Apple Silicon."
-fi
+# --- macOS / Apple Silicon ---------------------------------------------------
 
-# --- homebrew prerequisites --------------------------------------------------
-
-if ! command -v brew >/dev/null 2>&1; then
-  die "Homebrew is required. Install it from https://brew.sh and re-run."
-fi
-
-step "Checking Homebrew packages"
-# deno is yt-dlp's preferred JavaScript runtime; without it (or node/bun)
-# many YouTube videos extract as "This video is not available" because the
-# signature-cipher challenge can't be solved.
-for pkg in python@3.11 ffmpeg git deno; do
-  if brew list --formula "$pkg" >/dev/null 2>&1; then
-    echo "  $pkg already installed"
-  else
-    echo "  installing $pkg"
-    brew install "$pkg"
+install_macos() {
+  if [[ "$(uname -m)" != "arm64" ]]; then
+    die "On macOS, nomusic's default engine targets Apple Silicon (arm64)."
   fi
-done
+  if ! command -v brew >/dev/null 2>&1; then
+    die "Homebrew is required. Install it from https://brew.sh and re-run."
+  fi
 
-PY="$(brew --prefix python@3.11)/bin/python3.11"
-[[ -x "$PY" ]] || die "python3.11 not found at $PY after brew install"
+  step "Checking Homebrew packages"
+  # deno is yt-dlp's preferred JavaScript runtime; without it (or node/bun)
+  # many YouTube videos extract as "This video is not available" because the
+  # signature-cipher challenge can't be solved.
+  for pkg in python@3.11 ffmpeg git deno; do
+    if brew list --formula "$pkg" >/dev/null 2>&1; then
+      echo "  $pkg already installed"
+    else
+      echo "  installing $pkg"
+      brew install "$pkg"
+    fi
+  done
+
+  PY="$(brew --prefix python@3.11)/bin/python3.11"
+  [[ -x "$PY" ]] || die "python3.11 not found at $PY after brew install"
+}
+
+# --- Linux (Debian/Ubuntu) ---------------------------------------------------
+
+install_linux() {
+  if ! command -v apt-get >/dev/null 2>&1; then
+    die "Linux auto-install currently supports Debian/Ubuntu (apt). On other distros, install python3 (+venv/pip), ffmpeg, git and a JS runtime (node/deno), then run: python3 -m venv backend/.venv && backend/.venv/bin/pip install -r backend/requirements.txt (install torch from https://download.pytorch.org/whl/cu124 first if you have an NVIDIA GPU)."
+  fi
+
+  step "Installing system packages via apt"
+  # nodejs is yt-dlp's JavaScript runtime here (deno isn't in apt); without it
+  # (or node/bun) many YouTube videos fail the signature-cipher challenge.
+  sudo apt-get update
+  sudo apt-get install -y python3 python3-venv python3-pip ffmpeg git nodejs
+
+  PY="$(command -v python3)"
+  [[ -x "$PY" ]] || die "python3 not found after apt install"
+
+  # The downloader looks for `deno`/`node`/`bun` on PATH. Older apt builds ship
+  # the binary as `nodejs`; if so, point the backend at it explicitly.
+  if ! command -v deno >/dev/null 2>&1 && ! command -v node >/dev/null 2>&1 \
+     && command -v nodejs >/dev/null 2>&1; then
+    warn "No 'node' on PATH (only 'nodejs'). For best YouTube support, start the server with: NOMUSIC_JS_RUNTIME=$(command -v nodejs) backend/.venv/bin/python backend/server.py"
+  fi
+}
+
+case "$OS" in
+  Darwin) install_macos ;;
+  Linux)  install_linux ;;
+  *)      die "Unsupported OS: $OS (supported: macOS/Apple Silicon, Debian/Ubuntu Linux)" ;;
+esac
 
 # --- venv --------------------------------------------------------------------
 
-step "Creating backend/.venv (Python 3.11)"
+step "Creating backend/.venv"
 if [[ ! -d backend/.venv ]]; then
   "$PY" -m venv backend/.venv
 fi
 # shellcheck disable=SC1091
 source backend/.venv/bin/activate
 
-step "Installing Python dependencies (this may take a few minutes for torch)"
 pip install --upgrade pip wheel
+
+# --- torch (Linux only; macOS gets the arm64/MPS wheel via requirements) ------
+
+if [[ "$OS" == "Linux" ]]; then
+  # Install torch BEFORE requirements.txt so the generic ``torch>=2.2`` pin is
+  # already satisfied and pip never falls back to PyPI's CPU-only Linux wheel.
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    CUDA_TAG="${NOMUSIC_CUDA:-cu124}"  # override for a different CUDA, e.g. cu121/cu126/cu128
+    step "NVIDIA GPU detected — installing CUDA ($CUDA_TAG) torch"
+    pip install torch torchaudio --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
+  else
+    step "No NVIDIA GPU detected — installing CPU torch"
+    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+  fi
+fi
+
+# --- remaining Python deps ---------------------------------------------------
+
+step "Installing Python dependencies (this may take a few minutes for torch)"
 pip install -r backend/requirements.txt
 
 # --- done --------------------------------------------------------------------

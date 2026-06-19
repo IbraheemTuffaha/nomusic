@@ -146,13 +146,15 @@ class MLXEngine(Engine):
                 model, x, device=self._device, shifts=0, split=True,
                 overlap=0.25, progress=False, num_workers=0,
             )
-        # MPS dispatches kernels asynchronously, so apply_model can return before
-        # the GPU is done. Force a sync inside the timed region or we'd measure
-        # only dispatch and wildly undercount. (CPU inference is synchronous.)
+        # MPS and CUDA dispatch kernels asynchronously, so apply_model can return
+        # before the GPU is done. Force a sync inside the timed region or we'd
+        # measure only dispatch and wildly undercount. (CPU is synchronous.)
         if self._device == "mps":
             sync = getattr(getattr(torch, "mps", None), "synchronize", None)
             if sync:
                 sync()
+        elif self._device == "cuda":
+            torch.cuda.synchronize()
         gpu_each = (time.perf_counter() - t_gpu0) / n
 
         results: list[SeparationResult] = []
@@ -188,7 +190,10 @@ class MLXEngine(Engine):
 
 
 def _pick_device() -> str:
-    """Return the best torch device available on the current host."""
+    """Return the best torch device available on the current host.
+
+    Priority: Apple MPS, then CUDA (NVIDIA), then CPU.
+    """
     try:
         import torch
 
