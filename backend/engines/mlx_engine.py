@@ -192,18 +192,53 @@ class MLXEngine(Engine):
 def _pick_device() -> str:
     """Return the best torch device available on the current host.
 
-    Priority: Apple MPS, then CUDA (NVIDIA), then CPU.
+    Priority: Apple MPS, then CUDA (NVIDIA), then CPU. A CUDA GPU is only chosen
+    if this torch build actually ships kernels for its compute capability —
+    otherwise inference crashes at launch ("no kernel image is available"), so
+    we fall back to CPU instead.
     """
     try:
         import torch
 
         if torch.backends.mps.is_available():
             return "mps"
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and _cuda_is_usable(torch):
             return "cuda"
     except Exception:  # torch not installed yet
         pass
     return "cpu"
+
+
+def _cuda_is_usable(torch: Any) -> bool:
+    """True if this torch build can run kernels on the current CUDA GPU.
+
+    Recent torch wheels drop older GPU architectures (e.g. Pascal / sm_61), so a
+    *detectable* GPU isn't necessarily *usable*. Compare the device's compute
+    capability against the wheel's built-in arch list, allowing same-major
+    minor-version forward compatibility (an ``sm_80`` cubin runs on ``sm_86``)
+    and forward PTX JIT (a ``compute_70`` PTX runs on anything ``>= 7.0``).
+    """
+    try:
+        major, minor = torch.cuda.get_device_capability()
+        dev = major * 10 + minor
+        archs = torch.cuda.get_arch_list()
+    except Exception:
+        return True  # can't introspect — let torch try
+    reals = [int(a[3:]) for a in archs if a.startswith("sm_") and a[3:].isdigit()]
+    ptx = [int(a[8:]) for a in archs if a.startswith("compute_") and a[8:].isdigit()]
+    if any(r // 10 == dev // 10 and dev >= r for r in reals):
+        return True
+    if any(dev >= p for p in ptx):
+        return True
+    if reals or ptx:
+        log.warning(
+            "CUDA GPU (sm_%d%d) is not supported by this torch build "
+            "(arch list: %s) — falling back to CPU. Install a torch build that "
+            "targets your GPU to use it.",
+            major, minor, ", ".join(archs),
+        )
+        return False
+    return True  # empty/odd arch list — let torch try rather than guess
 
 
 class _ModelBundle:

@@ -652,3 +652,61 @@ def test_infer_batch_matches_single_mlx(tmp_path):
     # Lengths chosen NOT to be multiples of the segment size so the boundary is
     # exercised, not coincidentally aligned.
     _assert_batch_matches_singles([_tone("c", 220.0, 2.0), _tone("d", 330.0, 1.3)])
+
+
+def _fake_torch(capability, arch_list):
+    """A stand-in for ``torch`` exposing just what ``_cuda_is_usable`` reads."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        cuda=SimpleNamespace(
+            get_device_capability=lambda: capability,
+            get_arch_list=lambda: arch_list,
+        )
+    )
+
+
+# A modern CUDA 12.x wheel's arch list (no Pascal/Volta) — what a GTX 1050 Ti
+# (sm_61) gets matched against.
+_MODERN_ARCHS = ["sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"]
+
+
+def test_cuda_usable_rejects_too_old_gpu():
+    from engines.mlx_engine import _cuda_is_usable
+
+    # GTX 1050 Ti is sm_61; the modern wheel ships nothing it can run.
+    assert _cuda_is_usable(_fake_torch((6, 1), _MODERN_ARCHS)) is False
+
+
+def test_cuda_usable_accepts_exact_and_minor_compatible():
+    from engines.mlx_engine import _cuda_is_usable
+
+    # Exact real-arch match (RTX 2080, sm_75).
+    assert _cuda_is_usable(_fake_torch((7, 5), _MODERN_ARCHS)) is True
+    # Same-major, higher-minor device runs an older minor's cubin (sm_80 -> 8.6).
+    assert _cuda_is_usable(_fake_torch((8, 6), ["sm_75", "sm_80"])) is True
+    # Backward minor is NOT compatible: an sm_86-only wheel can't run on sm_80.
+    assert _cuda_is_usable(_fake_torch((8, 0), ["sm_86"])) is False
+
+
+def test_cuda_usable_accepts_forward_ptx_jit():
+    from engines.mlx_engine import _cuda_is_usable
+
+    # A PTX (compute_) arch JIT-compiles forward to any newer device.
+    assert _cuda_is_usable(_fake_torch((9, 0), ["compute_80"])) is True
+    # ...but not backward.
+    assert _cuda_is_usable(_fake_torch((7, 0), ["compute_80"])) is False
+
+
+def test_cuda_usable_defaults_true_when_undetectable():
+    from engines.mlx_engine import _cuda_is_usable
+    from types import SimpleNamespace
+
+    def _boom():
+        raise RuntimeError("no CUDA introspection")
+
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(get_device_capability=_boom, get_arch_list=_boom)
+    )
+    # Can't introspect -> don't second-guess torch.
+    assert _cuda_is_usable(torch) is True
