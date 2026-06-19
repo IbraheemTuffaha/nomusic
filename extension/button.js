@@ -5,8 +5,8 @@ import { Session } from "./session.js";
 
 // Strip characters that are illegal in filenames across Windows/macOS/Linux
 // (plus control chars), collapse whitespace, and bound the length so a very
-// long video title can't produce an unwieldy filename.
-function sanitizeFilename(name) {
+// long video title can't produce an unwieldy filename. Exported for unit tests.
+export function sanitizeFilename(name) {
   return (name || "")
     .replace(/[/\\:*?"<>|\x00-\x1f]/g, " ")
     .replace(/\s+/g, " ")

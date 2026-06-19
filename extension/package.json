@@ -1,0 +1,10 @@
+{
+  "name": "nomusic-extension",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "nomusic browser extension (loaded unpacked; not bundled). `type: module` lets the content-script ES modules and the node:test unit suite share .js files.",
+  "scripts": {
+    "test": "node --test --import ./__tests__/_setup.js __tests__/*.test.js"
+  }
+}
