@@ -85,9 +85,30 @@ case "$OS" in
   *)      die "Unsupported OS: $OS (supported: macOS/Apple Silicon, Debian/Ubuntu Linux)" ;;
 esac
 
+# --- optional: pin a specific Python -----------------------------------------
+# NOMUSIC_PYTHON=3.11 forces a particular interpreter. Useful on Linux to drive
+# older GPUs (e.g. Pascal / GTX 10-series) whose torch builds with legacy CUDA
+# archs only ship for older Python versions. The interpreter must already be
+# installed (Ubuntu: add the deadsnakes PPA, then apt-get install python3.11
+# python3.11-venv); we just use it.
+
+if [[ -n "${NOMUSIC_PYTHON:-}" ]]; then
+  alt="$(command -v "python${NOMUSIC_PYTHON}" || true)"
+  [[ -n "$alt" ]] || die "NOMUSIC_PYTHON=${NOMUSIC_PYTHON} requested but 'python${NOMUSIC_PYTHON}' is not on PATH. Install it first (Ubuntu: sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt-get update && sudo apt-get install python${NOMUSIC_PYTHON} python${NOMUSIC_PYTHON}-venv), then re-run."
+  PY="$alt"
+fi
+
 # --- venv --------------------------------------------------------------------
 
 step "Creating backend/.venv"
+want_pyver="$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+if [[ -d backend/.venv ]]; then
+  have_pyver="$(backend/.venv/bin/python -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "")"
+  if [[ "$have_pyver" != "$want_pyver" ]]; then
+    warn "Existing venv is Python ${have_pyver:-unknown}; recreating with ${want_pyver}"
+    rm -rf backend/.venv
+  fi
+fi
 if [[ ! -d backend/.venv ]]; then
   "$PY" -m venv backend/.venv
 fi
@@ -101,23 +122,32 @@ pip install --upgrade pip wheel
 if [[ "$OS" == "Linux" ]]; then
   # Install torch BEFORE requirements.txt so the generic ``torch>=2.2`` pin is
   # already satisfied and pip doesn't re-resolve it.
+
+  # Optional exact version, e.g. NOMUSIC_TORCH=2.4.1 to get a build that still
+  # ships Pascal (sm_61) kernels for older GPUs. Empty = newest available.
+  if [[ -n "${NOMUSIC_TORCH:-}" ]]; then
+    torch_pkgs=("torch==${NOMUSIC_TORCH}" "torchaudio==${NOMUSIC_TORCH}")
+  else
+    torch_pkgs=(torch torchaudio)
+  fi
+
   if command -v nvidia-smi >/dev/null 2>&1; then
     if [[ -n "${NOMUSIC_CUDA:-}" ]]; then
-      # Explicit CUDA build, e.g. NOMUSIC_CUDA=cu126 for an older driver. The
-      # maintained tags are cu118 / cu126 / cu128 (cu124 and older are frozen).
+      # Explicit CUDA build, e.g. NOMUSIC_CUDA=cu118 for an older GPU/driver.
+      # Maintained tags are cu118 / cu126 / cu128 (cu124 and older are frozen).
       step "NVIDIA GPU detected — installing torch for CUDA ${NOMUSIC_CUDA}"
-      pip install torch torchaudio --index-url "https://download.pytorch.org/whl/${NOMUSIC_CUDA}"
+      pip install "${torch_pkgs[@]}" --index-url "https://download.pytorch.org/whl/${NOMUSIC_CUDA}"
     else
       # PyPI's default Linux torch wheel IS the CUDA build, and it covers the
       # widest Python-version matrix, so it just works on a current driver.
       # Pin NOMUSIC_CUDA (cu118/cu126/cu128) only if your driver needs a
       # specific CUDA version.
       step "NVIDIA GPU detected — installing CUDA torch (PyPI default)"
-      pip install torch torchaudio
+      pip install "${torch_pkgs[@]}"
     fi
   else
     step "No NVIDIA GPU detected — installing CPU torch"
-    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+    pip install "${torch_pkgs[@]}" --index-url https://download.pytorch.org/whl/cpu
   fi
 fi
 
