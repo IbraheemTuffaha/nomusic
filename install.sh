@@ -109,22 +109,39 @@ fi
 
 step "Creating backend/.venv"
 want_pyver="$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+# Recreate a stale (wrong Python) or broken (no activate / no pip) venv. A
+# previous run that died inside venv's ensurepip step can leave a partial venv.
 if [[ -d backend/.venv ]]; then
   have_pyver="$(backend/.venv/bin/python -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "")"
-  if [[ "$have_pyver" != "$want_pyver" ]]; then
-    warn "Existing venv is Python ${have_pyver:-unknown}; recreating with ${want_pyver}"
-    rm -rf backend/.venv
-  elif ! backend/.venv/bin/python -m pip --version >/dev/null 2>&1; then
-    # A previous run created the venv but ensurepip failed — no usable pip.
-    warn "Existing venv has no working pip; recreating"
+  if [[ "$have_pyver" != "$want_pyver" || ! -f backend/.venv/bin/activate ]] \
+     || ! backend/.venv/bin/python -m pip --version >/dev/null 2>&1; then
+    warn "Existing venv is stale or incomplete (Python ${have_pyver:-unknown}); recreating"
     rm -rf backend/.venv
   fi
 fi
 if [[ ! -d backend/.venv ]]; then
-  "$PY" -m venv backend/.venv
+  # Some distro/deadsnakes Python builds fail venv's bundled ensurepip step,
+  # which runs BEFORE the activate script is written — leaving a venv with no
+  # activate and no pip. Fall back to a pip-less venv (always writes activate)
+  # and bootstrap pip ourselves, so this works on any interpreter.
+  if ! "$PY" -m venv backend/.venv >/dev/null 2>&1 || [[ ! -f backend/.venv/bin/activate ]]; then
+    warn "venv with bundled pip failed; creating without pip"
+    rm -rf backend/.venv
+    "$PY" -m venv --without-pip backend/.venv
+  fi
 fi
 # shellcheck disable=SC1091
 source backend/.venv/bin/activate
+
+# Ensure pip exists (covers the --without-pip path above): try ensurepip, then
+# fall back to get-pip.py fetched via the standard library (no curl needed).
+if ! python -m pip --version >/dev/null 2>&1; then
+  step "Bootstrapping pip"
+  python -m ensurepip --upgrade >/dev/null 2>&1 || {
+    python -c "import urllib.request; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '/tmp/nomusic-get-pip.py')"
+    python /tmp/nomusic-get-pip.py
+  }
+fi
 
 pip install --upgrade pip wheel
 
