@@ -96,6 +96,13 @@ if [[ -n "${NOMUSIC_PYTHON:-}" ]]; then
   alt="$(command -v "python${NOMUSIC_PYTHON}" || true)"
   [[ -n "$alt" ]] || die "NOMUSIC_PYTHON=${NOMUSIC_PYTHON} requested but 'python${NOMUSIC_PYTHON}' is not on PATH. Install it first (Ubuntu: sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt-get update && sudo apt-get install python${NOMUSIC_PYTHON} python${NOMUSIC_PYTHON}-venv), then re-run."
   PY="$alt"
+  # Debian/Ubuntu split venv's pip bootstrap (ensurepip) into a separate
+  # package; without it `python -m venv` dies at ensurepip. Make sure it's
+  # present for the chosen interpreter (idempotent).
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get install -y "python${NOMUSIC_PYTHON}-venv" \
+      || warn "Could not install python${NOMUSIC_PYTHON}-venv; venv creation may fail."
+  fi
 fi
 
 # --- venv --------------------------------------------------------------------
@@ -106,6 +113,10 @@ if [[ -d backend/.venv ]]; then
   have_pyver="$(backend/.venv/bin/python -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "")"
   if [[ "$have_pyver" != "$want_pyver" ]]; then
     warn "Existing venv is Python ${have_pyver:-unknown}; recreating with ${want_pyver}"
+    rm -rf backend/.venv
+  elif ! backend/.venv/bin/python -m pip --version >/dev/null 2>&1; then
+    # A previous run created the venv but ensurepip failed — no usable pip.
+    warn "Existing venv has no working pip; recreating"
     rm -rf backend/.venv
   fi
 fi
