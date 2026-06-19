@@ -154,7 +154,8 @@ if [[ "$OS" == "Linux" ]]; then
   # Optional exact version, e.g. NOMUSIC_TORCH=2.4.1 to get a build that still
   # ships Pascal (sm_61) kernels for older GPUs. Empty = newest available.
   if [[ -n "${NOMUSIC_TORCH:-}" ]]; then
-    torch_pkgs=("torch==${NOMUSIC_TORCH}" "torchaudio==${NOMUSIC_TORCH}")
+    torch_ver="${NOMUSIC_TORCH#=}"  # tolerate a stray '=' (NOMUSIC_TORCH==x.y.z)
+    torch_pkgs=("torch==${torch_ver}" "torchaudio==${torch_ver}")
   else
     torch_pkgs=(torch torchaudio)
   fi
