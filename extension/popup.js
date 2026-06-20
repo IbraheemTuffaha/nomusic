@@ -18,7 +18,15 @@ const MODEL_HINTS = {
   htdemucs_ft: "slower, best",
 };
 
+// True once a reachable backend's /capabilities has populated the model + stem
+// controls. persist() reads those controls back, so until they're populated
+// (backend down) writing them would clobber the user's saved selections.
+let capsLoaded = false;
+
 async function load() {
+  // Reset until this load proves the backend is reachable; guards persist()
+  // against writing the empty form during an offline reload.
+  capsLoaded = false;
   const stored = await chrome.storage.sync.get([
     "backendUrl",
     "model",
@@ -38,6 +46,7 @@ async function load() {
   }
 
   if (caps) {
+    capsLoaded = true;
     $("status").classList.add("ok");
     $("statusText").textContent = "backend up";
     $("device").textContent = caps.engine?.device || "";
@@ -220,16 +229,20 @@ function flashSaved() {
 // button; the popup auto-saves.
 async function persist() {
   const backendUrl = $("backend").value.trim() || "http://127.0.0.1:8723";
-  const model = $("model").value || null;
-  const checkboxes = $("stems").querySelectorAll('input[type="checkbox"]');
-  const keepStems = Array.from(checkboxes)
-    .filter((cb) => cb.checked)
-    .map((cb) => cb.value);
-  await chrome.storage.sync.set({
-    backendUrl,
-    model,
-    keepStems: keepStems.length ? keepStems : null,
-  });
+  const update = { backendUrl };
+  // Only persist model/stems once the backend's capabilities have populated the
+  // form. When the backend is unreachable those controls are empty, and writing
+  // them would wipe the user's saved model + keep-stems — exactly during the
+  // recovery flow (fix the backend URL) that this very field exists for.
+  if (capsLoaded) {
+    update.model = $("model").value || null;
+    const checkboxes = $("stems").querySelectorAll('input[type="checkbox"]');
+    const keepStems = Array.from(checkboxes)
+      .filter((cb) => cb.checked)
+      .map((cb) => cb.value);
+    update.keepStems = keepStems.length ? keepStems : null;
+  }
+  await chrome.storage.sync.set(update);
   flashSaved();
 }
 
