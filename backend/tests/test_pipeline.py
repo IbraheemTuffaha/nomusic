@@ -325,6 +325,27 @@ def test_processor_progressive_produces_correct_chunks(tmp_path, monkeypatch):
         assert abs(info.duration - (plan.play_end - plan.play_start)) < 0.05
 
 
+def test_progressive_source_cancel_unblocks_source_for(tmp_path):
+    # An abort must release a source_for() that's blocked waiting for bytes, so
+    # an abandoned/failed run doesn't keep the GPU lock until the download lands
+    # (and the orphaned yt-dlp keeps going). cancel() makes the wait raise.
+    from pipeline.processor import (
+        ChunkPlan,
+        _DownloadCancelled,
+        _ProgressiveSource,
+    )
+
+    dl = _ProgressiveSource(
+        "fake://v", tmp_path, duration=100.0, ui_hook=None, fetcher=None
+    )
+    # Never start the download thread: available_seconds() stays 0, so source_for
+    # would otherwise block until the (nonexistent) download advances.
+    dl.cancel()
+    plan = ChunkPlan(index=5, start=50.0, end=60.0, play_start=50.0, play_end=60.0)
+    with pytest.raises(_DownloadCancelled):
+        dl.source_for(plan, overlap=0.5)
+
+
 def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
     # A prior run already probed this job and processed some chunks; a resume
     # (after idle-abandon or a page refresh) must NOT pay the yt-dlp probe

@@ -161,6 +161,13 @@ _PROGRESSIVE_MARGIN_SECONDS = 3.0
 _PROGRESSIVE_POLL_SECONDS = 0.15
 
 
+class _DownloadCancelled(Exception):
+    """Raised to unwind a progressive download that's being cancelled — from the
+    yt-dlp progress hook (which aborts the running download) and from
+    ``source_for`` (which releases a chunk wait). Distinct from a real download
+    error so the caller can tell an intentional abort from a failure."""
+
+
 class _ProgressiveSource:
     """Runs ``download_source`` on a background thread and tells the caller how
     much of the timeline is safely on disk, so chunk separation can start
@@ -188,6 +195,10 @@ class _ProgressiveSource:
         self._final: Optional[Path] = None
         self._error: Optional[BaseException] = None
         self._done = threading.Event()
+        # Set to abort the download (orphaned yt-dlp on idle-abandon, or a run
+        # that's failing/unwinding). Checked in the progress hook and the
+        # per-chunk wait so both the network half and a blocked decode release.
+        self._cancel = threading.Event()
         self._logged_size = False
         self._thread = threading.Thread(
             target=self._run, name="nomusic-progressive-dl", daemon=True
@@ -203,7 +214,17 @@ class _ProgressiveSource:
     def is_done(self) -> bool:
         return self._done.is_set()
 
+    def cancel(self) -> None:
+        """Ask the background download to stop. Idempotent; safe to call after
+        completion (a no-op then). The download thread aborts at its next
+        progress callback and any chunk waiting in ``source_for`` is released."""
+        self._cancel.set()
+
     def _hook(self, d: dict) -> None:
+        # Raising from a yt-dlp progress hook aborts the download — that's how a
+        # cancel reaches the network thread.
+        if self._cancel.is_set():
+            raise _DownloadCancelled()
         try:
             if self._ui_hook:
                 self._ui_hook(d)
@@ -286,6 +307,8 @@ class _ProgressiveSource:
         needed = plan.end + overlap + _PROGRESSIVE_MARGIN_SECONDS
         waits = 0
         while not self._done.is_set() and self.available_seconds() < needed:
+            if self._cancel.is_set():
+                raise _DownloadCancelled()
             self.raise_if_error()
             if abort_check:
                 abort_check()
@@ -624,8 +647,20 @@ class Processor:
                     write_futures.pop(0).result()
             for f in write_futures:
                 f.result()
+        except BaseException:
+            # Abandon (idle), engine failure, or any other abort: stop the
+            # background download so it doesn't keep running (orphaned yt-dlp)
+            # and so a decode thread blocked in source_for waiting for bytes is
+            # released — otherwise the GPU lock stays held until the download
+            # happens to land.
+            if dl is not None:
+                dl.cancel()
+            raise
         finally:
-            decode_pool.shutdown(wait=True)
+            # cancel_futures drops decodes still queued behind a cancel; the
+            # in-flight one is released by dl.cancel() above. Writes drain
+            # (wait, no cancel) so any already-separated chunk still lands.
+            decode_pool.shutdown(wait=True, cancel_futures=True)
             write_pool.shutdown(wait=True)
             _log_duty()
 
