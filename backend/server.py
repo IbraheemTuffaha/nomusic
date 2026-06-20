@@ -76,6 +76,39 @@ _STREAM_BLOCK_BYTES = 65536
 _FFMPEG_TIMEOUT_SECONDS = 3600.0
 
 
+def _raise_open_file_limit() -> None:
+    """Lift this process's open-file soft limit toward its hard limit.
+
+    The MP3/MP4 export opens one ffmpeg ``-i`` input per chunk (pipeline/export.py),
+    so a long video — a 45-min track is ~285 chunks at the default 9.5 s stride —
+    can blow past the macOS default soft limit of 256 file descriptors and fail
+    the export with an opaque ffmpeg error. ffmpeg inherits this process's
+    rlimits, so raising the limit here covers the spawned subprocess too.
+    Best-effort: any failure just leaves the default in place.
+    """
+    try:
+        import resource
+    except ImportError:
+        return  # non-POSIX (Windows): no rlimits, and unsupported anyway.
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):
+        return
+    # 8192 is comfortably above any realistic chunk count and well under macOS's
+    # per-process ceiling (kern.maxfilesperproc); macOS also rejects an infinite
+    # NOFILE, so cap to the concrete hard limit when it isn't unlimited.
+    target = 8192
+    if hard != resource.RLIM_INFINITY:
+        target = min(target, hard)
+    if soft >= target:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        log.info("Raised open-file soft limit %d -> %d", soft, target)
+    except (ValueError, OSError):
+        log.debug("could not raise open-file limit from %d", soft, exc_info=True)
+
+
 def _configure_logging() -> None:
     """Set up root logging once, at app/CLI startup rather than import time.
 
@@ -321,6 +354,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     _configure_logging()
+    _raise_open_file_limit()
     app = FastAPI(title="nomusic", version="0.2.0", lifespan=lifespan)
 
     # SECURITY INVARIANT: allow_origins='*' with no auth is only safe because
