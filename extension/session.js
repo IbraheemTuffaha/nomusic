@@ -18,6 +18,11 @@ export class Session {
     // Owns host-video muting + volume mirroring; created in start().
     this.muteController = null;
     this.jobId = null;
+    // The page URL captured when this session starts. The job's cache key is
+    // derived from it, so resumes must POST the SAME url — reading the live
+    // window.location.href on an SPA (a YouTube miniplayer, a Facebook URL
+    // rewrite) would target a different video and strand this session.
+    this.sourceUrl = null;
     this.totalChunks = 0;
     // Must mirror the backend defaults (config.py: chunk_seconds=10,
     // chunk_overlap_seconds=0.5). fetchCapabilities() overwrites these, but
@@ -79,6 +84,10 @@ export class Session {
   }
 
   async start() {
+    // Pin the video's URL up front so every later /process (resume after a
+    // pause/idle-abandon) targets this same video, even if the SPA has since
+    // changed window.location.href.
+    this.sourceUrl = window.location.href;
     let info;
     try {
       info = await this.requestJob();
@@ -163,7 +172,7 @@ export class Session {
   }
 
   async requestJob() {
-    const body = { url: window.location.href };
+    const body = { url: this.sourceUrl || window.location.href };
     if (settings.model) body.model = settings.model;
     if (settings.keepStems) body.keep_stems = settings.keepStems;
     const resp = await fetch(`${settings.backendUrl}/process`, {
@@ -259,14 +268,29 @@ export class Session {
   }
 
   async _resumeProcessing() {
+    let info;
     try {
-      await this.requestJob();
+      info = await this.requestJob();
     } catch (err) {
       // Backend unreachable on resume; reopening the stream below will
       // surface the failure (204/CLOSED) without crashing playback.
       dlog("resume requestJob failed", err?.name || err);
     }
     if (this.disposed) return;
+    // The cache key is derived from (url, model, stems), so a resume for the
+    // same video returns the same job_id. A DIFFERENT id means the backend
+    // handed us a new job (settings changed, or it had evicted the old one):
+    // adopt it and drop the dedup set so chunks refetch under the new id,
+    // instead of stalling on the dead job's /events stream and stale chunk URLs.
+    if (info && info.job_id && info.job_id !== this.jobId) {
+      if (this.eventSource) {
+        this.eventSource.close();
+        this.eventSource = null;
+      }
+      this.jobId = info.job_id;
+      this.totalChunks = info.total_chunks || this.totalChunks;
+      this.fetchedIdx.clear();
+    }
     if (!this.eventSource) this._openEventStream();
     // Re-point the worker at where the user actually is, in case it was
     // abandoned and respawned with a from-scratch chunk order.
