@@ -784,14 +784,23 @@ class Processor:
         # which is below the threshold where typical listeners notice level
         # shifts at scene boundaries.
         boost = min(2.0, max(1.0, full_rms / kept_rms))
-        if boost > 1.0:
+
+        # Fold headroom into the gain instead of soft-clipping after the fact.
+        # The old approach rescaled the WHOLE chunk by 1/peak and ran it through
+        # tanh — a nonlinearity that attenuates quiet samples too, so a chunk
+        # that happened to peak high dropped several dB below its neighbours
+        # (audible loudness pumping at the 10 s seams). Capping the boost so the
+        # peak can't exceed ~unity keeps the gain a single uniform factor across
+        # the chunk, so adjacent chunks stay level-matched.
+        peak = float(np.abs(mix).max() or 1.0)
+        boost = max(1.0, min(boost, 0.99 / peak))
+        if boost != 1.0:
             mix = mix * boost
 
-        # Soft-clip if the boost pushed past unity. tanh preserves loud-
-        # passage character without audible square-wave clipping.
-        peak = float(np.abs(mix).max() or 1.0)
-        if peak > 0.99:
-            mix = np.tanh(mix / peak) * 0.99
+        # Safety clip only for the rare chunk already past full scale before any
+        # boost (boost can't fix that without attenuating). Clamps isolated
+        # samples without touching the rest of the chunk.
+        np.clip(mix, -0.999, 0.999, out=mix)
         return mix
 
     def _write_chunk(

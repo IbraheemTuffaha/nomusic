@@ -74,6 +74,45 @@ def test_plan_chunks_rejects_overlap_eq_chunk():
     raise AssertionError("expected ValueError for overlap == chunk")
 
 
+def test_mix_stems_gain_is_uniform_when_peak_would_clip():
+    # When the loudness boost would push the peak past unity, the gain must stay
+    # a single uniform factor (capped by headroom), NOT the old whole-chunk tanh
+    # that attenuated quiet samples and pumped levels at chunk seams. Here the
+    # kept stem peaks at 0.9 and the full mix is 2x as loud, so the naive 2x
+    # boost would clip; headroom caps it to 0.99/0.9 = 1.1.
+    vocals = np.array([[0.9, 0.9], [0.3, 0.3], [0.1, 0.1]], dtype=np.float32)
+    stems = {
+        "vocals": vocals,
+        "other": vocals.copy(),  # full mix = 2x vocals -> full/kept RMS = 2
+        "drums": np.zeros_like(vocals),
+        "bass": np.zeros_like(vocals),
+    }
+    out = Processor._mix_stems(stems, ["vocals"])
+    # Uniform gain: every sample scaled by the same factor (no nonlinearity).
+    ratios = out[vocals != 0] / vocals[vocals != 0]
+    assert np.allclose(ratios, ratios[0], rtol=1e-5), ratios
+    # ...and that factor parks the peak just under full scale, not below it.
+    assert abs(float(np.abs(out).max()) - 0.99) < 1e-4
+    assert np.isclose(ratios[0], 1.1, rtol=1e-4)
+
+
+def test_mix_stems_clips_only_already_hot_samples():
+    # A chunk already past full scale before any boost (boost can't help without
+    # attenuating) gets a plain per-sample clip — the hot sample is clamped, the
+    # quiet ones are left exactly as-is (no global gain change).
+    vocals = np.array([[1.5, 1.5], [0.1, 0.1]], dtype=np.float32)
+    stems = {
+        "vocals": vocals,
+        "other": np.zeros_like(vocals),  # full mix == kept -> boost = 1.0
+        "drums": np.zeros_like(vocals),
+        "bass": np.zeros_like(vocals),
+    }
+    out = Processor._mix_stems(stems, ["vocals"])
+    assert float(np.abs(out).max()) <= 0.999 + 1e-6
+    assert np.isclose(out[0, 0], 0.999, atol=1e-4)  # hot sample clamped
+    assert np.isclose(out[1, 0], 0.1, atol=1e-6)    # quiet sample untouched
+
+
 class _FakeEngine(Engine):
     """Returns deterministic per-stem WAVs of the right length."""
 
