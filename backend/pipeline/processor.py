@@ -650,8 +650,16 @@ class Processor:
 
         Returns a ``_ChunkWork`` carrying the in-memory ``prepared`` input (no
         files held across stages) and the slice/decode timings. In progressive
-        mode, a slice that fails on the partial container (e.g. a not-yet-
-        streamable mp4) degrades to waiting for the full download, then retries.
+        mode, a slice that fails on the partial container degrades to waiting
+        for the full download, then retries. Two distinct causes land here:
+
+        * the partial container isn't decodable yet (a genuine "too early"), or
+        * the download finished and renamed ``source.<ext>.part`` to its final
+          name *after* ``source_for`` handed back the ``.part`` path but before
+          ffmpeg opened it (a benign race, common on small/fast downloads).
+
+        Only the former is worth a loud warning; the latter is expected, so it
+        logs quietly and just re-slices the completed file.
         """
 
         def _do(src: Path) -> _ChunkWork:
@@ -672,11 +680,23 @@ class Processor:
         except Exception:
             if dl is None:
                 raise
-            log.warning(
-                "progressive: chunk %d slice failed; waiting for full download",
-                plan.index,
-                exc_info=True,
-            )
+            if dl.is_done():
+                # The download completed (and renamed the .part out from under
+                # the captured path) — expected; re-slice the final file quietly.
+                log.debug(
+                    "progressive: chunk %d slice raced the download finishing; "
+                    "re-slicing the completed file",
+                    plan.index,
+                )
+            else:
+                # Download still in flight: the partial container genuinely
+                # wasn't sliceable yet. Surface it for diagnostics.
+                log.warning(
+                    "progressive: chunk %d slice failed on the partial container; "
+                    "waiting for full download",
+                    plan.index,
+                    exc_info=True,
+                )
             return _do(dl.wait_complete())
 
     def _finish_chunk(
