@@ -129,6 +129,41 @@ class ProcessRequest(BaseModel):
     model: Optional[str] = None
     keep_stems: Optional[list[str]] = None
 
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: str) -> str:
+        # A web page can drive /process (the content script posts the page URL),
+        # so an unvalidated URL is an SSRF / local-file-read primitive: yt-dlp
+        # will happily open file:// paths or fetch internal hosts and serve the
+        # result back via /audio and /video. This tool only ever strips public
+        # web videos, so reject anything that isn't a public http(s) URL.
+        import ipaddress
+        from urllib.parse import urlsplit
+
+        v = v.strip()
+        parts = urlsplit(v)
+        if parts.scheme not in ("http", "https"):
+            raise ValueError("url must be an http(s) URL")
+        host = parts.hostname
+        if not host:
+            raise ValueError("url must include a host")
+        lowered = host.lower()
+        if lowered == "localhost" or lowered.endswith(".localhost"):
+            raise ValueError("url host is not allowed")
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None  # a hostname, not a literal IP — allowed.
+        if ip is not None and (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError("url host is not allowed")
+        return v
+
     @field_validator("keep_stems")
     @classmethod
     def _validate_stems(cls, v: Optional[list[str]]) -> Optional[list[str]]:

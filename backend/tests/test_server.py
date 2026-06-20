@@ -83,6 +83,33 @@ def test_process_requires_url(client):
     assert client.post("/process", json={}).status_code == 422
 
 
+def test_process_request_url_validator():
+    # A page can drive /process, so the URL is an SSRF / local-file primitive:
+    # only public http(s) URLs are allowed. (Unit-level so no worker is spawned.)
+    from pydantic import ValidationError
+
+    assert server.ProcessRequest(url="https://www.youtube.com/watch?v=abc").url
+    assert server.ProcessRequest(url="http://example.com/v").url
+    for bad in (
+        "file:///etc/passwd",   # local-file read via yt-dlp
+        "ftp://example.com/x",  # non-http(s) scheme
+        "http://127.0.0.1:8723/x",
+        "http://localhost/x",
+        "http://192.168.1.5/x",  # private network (SSRF)
+        "http://169.254.169.254/latest/meta-data",  # link-local metadata
+        "http://[::1]/x",
+    ):
+        with pytest.raises(ValidationError):
+            server.ProcessRequest(url=bad)
+
+
+def test_process_rejects_non_public_url_returns_422(client):
+    # The HTTP layer surfaces a rejected URL as a 422 (before any worker spawns).
+    for url in ("file:///etc/passwd", "http://127.0.0.1/x", "http://localhost/x"):
+        resp = client.post("/process", json={"url": url, "keep_stems": ["vocals"]})
+        assert resp.status_code == 422, url
+
+
 def test_chunk_unknown_job_is_404(client):
     assert client.get("/chunk/nope/0").status_code == 404
 
