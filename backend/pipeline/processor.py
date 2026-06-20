@@ -128,7 +128,15 @@ def plan_chunks(
         )
 
     stride = chunk_seconds - overlap_seconds
-    total = max(1, math.ceil((duration - overlap_seconds) / stride))
+    # Each chunk plays exactly ``stride`` video-seconds (play_end = play_start +
+    # stride), so covering the whole timeline needs ceil(duration / stride)
+    # windows. (The older ``(duration - overlap_seconds)`` numerator matched a
+    # scheme where play windows were a full chunk_seconds long; with
+    # stride-length windows it drops the final chunk whenever ``duration mod
+    # stride`` lands in (0, overlap_seconds], leaving the tail with no playback
+    # audio.) The tiny epsilon keeps a duration that is an exact multiple of the
+    # stride from spilling into an extra zero-length chunk on float rounding.
+    total = max(1, math.ceil(duration / stride - 1e-9))
     plans: list[ChunkPlan] = []
     for i in range(total):
         play_start = i * stride

@@ -40,6 +40,32 @@ def test_plan_chunks_covers_full_duration():
     assert plans[1].start < plans[0].end
 
 
+def test_plan_chunks_covers_tail_shorter_than_overlap():
+    # Regression: with stride-length play windows, a duration whose remainder
+    # past the last full stride is <= overlap_seconds used to drop the final
+    # chunk (count was ceil((duration - overlap)/stride)), leaving the tail with
+    # no playback audio — and that short result got cached + spliced into every
+    # export. Production defaults: chunk=10, overlap=0.5 -> stride=9.5.
+    # 95.3 / 9.5 = 10.03, so the 11th chunk (covering 95.0..95.3) is required.
+    plans = plan_chunks(duration=95.3, chunk_seconds=10.0, overlap_seconds=0.5)
+    assert len(plans) == 11
+    assert math.isclose(plans[-1].play_end, 95.3, abs_tol=1e-6)
+    # Full, gap-free coverage of the timeline.
+    coverage = sum(p.play_end - p.play_start for p in plans)
+    assert math.isclose(coverage, 95.3, rel_tol=1e-6, abs_tol=1e-6)
+    # No degenerate (zero-length) final chunk.
+    assert plans[-1].play_end > plans[-1].play_start
+
+
+def test_plan_chunks_exact_multiple_has_no_extra_chunk():
+    # When duration is an exact multiple of the stride, the count must not gain
+    # a spurious zero-length chunk from float rounding. stride = 9.5, so 95.0 is
+    # exactly 10 strides.
+    plans = plan_chunks(duration=95.0, chunk_seconds=10.0, overlap_seconds=0.5)
+    assert len(plans) == 10
+    assert math.isclose(plans[-1].play_end, 95.0, abs_tol=1e-6)
+
+
 def test_plan_chunks_rejects_overlap_eq_chunk():
     try:
         plan_chunks(duration=10.0, chunk_seconds=2.0, overlap_seconds=2.0)
