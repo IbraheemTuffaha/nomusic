@@ -15,6 +15,7 @@ loading torch, and lets us pin a concrete backend per checkout.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,13 @@ class MLXEngine(Engine):
         # Cached separator keyed by model name; demucs loads weights lazily and
         # we only want to pay that cost once per process.
         self._separators: dict[str, Any] = {}
+        # Serializes the lazy load. Without it the startup warmup thread and the
+        # first job's decode thread can both miss the cache and load the same
+        # model concurrently — a duplicate weight download plus two copies pushed
+        # to the GPU (transient ~2x memory), which matters most on a cold install
+        # or a low-VRAM GPU. The per-job GPU lock doesn't cover this: warmup runs
+        # outside it.
+        self._load_lock = threading.Lock()
         self._factory = separator_factory or _make_separator
         self._device = _pick_device()
 
@@ -180,13 +188,21 @@ class MLXEngine(Engine):
     # -- internals -----------------------------------------------------------
 
     def _ensure_loaded(self, model_name: str) -> Any:
+        # Double-checked: the fast path stays lock-free for the common
+        # already-loaded case, and the lock only serializes the rare concurrent
+        # first load (warmup vs first job) so the loser waits instead of
+        # duplicating the download + GPU copy.
         cached = self._separators.get(model_name)
         if cached is not None:
             return cached
-        log.info("Loading model %s on %s", model_name, self._device)
-        sep = self._factory(model_name, self._device)
-        self._separators[model_name] = sep
-        return sep
+        with self._load_lock:
+            cached = self._separators.get(model_name)
+            if cached is not None:
+                return cached
+            log.info("Loading model %s on %s", model_name, self._device)
+            sep = self._factory(model_name, self._device)
+            self._separators[model_name] = sep
+            return sep
 
 
 def _pick_device() -> str:
