@@ -624,6 +624,39 @@ def test_abandon_all_signals_workers_and_clears_state():
     assert registry._abandoning == {"k1", "k2"}
 
 
+def test_abandon_all_pushes_terminal_event_to_open_streams():
+    # /cache/clear must send a terminal event to each open /events stream so the
+    # client's EventSource closes instead of hanging on keep-alives forever.
+    import asyncio
+
+    from jobs import JobRegistry, JobState, JobStatus
+
+    registry = JobRegistry(processor=None, cache=None)
+    loop = asyncio.new_event_loop()
+    try:
+        registry.attach_loop(loop)
+        q: asyncio.Queue = asyncio.Queue()
+        registry._jobs["k1"] = JobStatus(job_id="k1", state=JobState.PROCESSING)
+        registry._subscribers["k1"] = [q]
+
+        registry.abandon_all()
+
+        # Run the loop briefly so the scheduled cross-thread put_nowait executes.
+        loop.call_soon(loop.stop)
+        loop.run_forever()
+
+        assert not q.empty(), "open stream got no terminal event"
+        snap = q.get_nowait()
+        assert snap["state"] == "error"
+        assert snap["job_id"] == "k1"
+    finally:
+        loop.close()
+
+    # State maps are still wiped (same as the no-subscriber path).
+    assert registry._jobs == {}
+    assert registry._subscribers == {}
+
+
 def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):
     # The C7 race: a /process landing during a job's abandon-unwind must NOT
     # hand back the dying job (which would leave it stuck with no worker); it

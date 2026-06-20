@@ -342,13 +342,39 @@ class JobRegistry:
         writing into directories that no longer exist — instead each worker
         unwinds cleanly out of the GPU lock via ``WorkerAbandoned`` and runs
         its own ``finally`` cleanup.
+
+        Each open /events stream is sent a terminal ``error`` snapshot before
+        its queue is dropped, so the stream closes itself instead of hanging on
+        keep-alives (the client never sees a ready/error event otherwise).
         """
+        # Build terminal snapshots BEFORE clearing, so every live stream gets a
+        # final event. Mirror _update's cross-thread enqueue: abandon_all runs on
+        # the request thread, not the event loop.
+        pending: list[tuple[asyncio.Queue, dict]] = []
         with self._lock:
-            for key in self._jobs:
+            for key, status in self._jobs.items():
                 self._abandoning.add(key)
+                subs = self._subscribers.get(key)
+                if not subs:
+                    continue
+                status.state = JobState.ERROR
+                status.phase = JobState.ERROR.value
+                status.phase_label = _PHASE_LABELS[JobState.ERROR.value]
+                status.error = "cache cleared"
+                status.updated_at = time.time()
+                snapshot = status.to_dict()
+                for q in subs:
+                    pending.append((q, snapshot))
             self._jobs.clear()
             self._subscribers.clear()
             self._last_disconnect_at.clear()
+        loop = self._loop
+        if pending and loop is not None and not loop.is_closed():
+            for q, snapshot in pending:
+                try:
+                    loop.call_soon_threadsafe(q.put_nowait, snapshot)
+                except RuntimeError:
+                    break
 
     # -- worker --------------------------------------------------------------
 
