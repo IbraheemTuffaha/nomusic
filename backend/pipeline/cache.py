@@ -22,7 +22,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
+import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -74,8 +76,9 @@ class JobCache:
     ) -> str:
         # ``chunk_seconds`` is in the key so changing the default value
         # auto-invalidates existing cache entries — old chunks would have
-        # incorrect timing for the new playback plan. Callers that don't
-        # care (legacy code, tests) can omit it.
+        # incorrect timing for the new playback plan. Both timing params are
+        # optional so callers that key purely on (url, model, stems) can omit
+        # them and still get a stable hash.
         payload: dict = {
             "v": SCHEMA_VERSION,
             "url": url,
@@ -164,8 +167,14 @@ class JobCache:
             return None
 
     def save_meta(self, key: str, meta: CacheMeta) -> None:
+        # Atomic write: a crash (or a concurrent reader) must never observe a
+        # half-written meta.json — load_meta would treat the truncated file as a
+        # cache miss and re-process the whole video. Write to a temp file in the
+        # same dir, then rename (atomic on the same filesystem).
         meta_path = self.dir_for(key) / "meta.json"
-        meta_path.write_text(json.dumps(asdict(meta), indent=2, sort_keys=True))
+        tmp_path = meta_path.with_suffix(".json.part")
+        tmp_path.write_text(json.dumps(asdict(meta), indent=2, sort_keys=True))
+        os.replace(tmp_path, meta_path)
 
     # -- chunks --------------------------------------------------------------
 
@@ -204,35 +213,37 @@ class JobCache:
         meta_path = self.dir_for(key) / "meta.json"
         if meta_path.exists():
             try:
-                import os
-                import time
-
                 now = time.time()
                 os.utime(meta_path, (now, now))
             except OSError as err:
+                # Best-effort TTL renewal: if the touch fails the entry just
+                # keeps its old mtime and may be swept a bit sooner — not worth
+                # failing a replay over, so log and move on.
                 log.debug("touch(%s) failed: %s", key, err)
 
     # -- maintenance ---------------------------------------------------------
 
-    def stats(self) -> dict:
-        """Tally on-disk sizes. Returns bytes counts the popup can render."""
-        sources_root = self.root / "sources"
-        source_count = 0
-        source_bytes = 0
-        if sources_root.exists():
-            for p in sources_root.glob("*"):
-                if p.is_dir():
-                    source_count += 1
-                    source_bytes += _dir_bytes(p)
+    def _tree_entries(self, tree: str) -> list[Path]:
+        """Per-entry dirs under a url-keyed tree (``sources`` / ``videos``).
 
-        videos_root = self.root / "videos"
-        video_count = 0
-        video_bytes = 0
-        if videos_root.exists():
-            for p in videos_root.glob("*"):
-                if p.is_dir():
-                    video_count += 1
-                    video_bytes += _dir_bytes(p)
+        Both maintenance passes (stats tally, TTL sweep) walk these trees the
+        same way; centralizing the "child dirs of root/<tree>" iteration keeps
+        them from drifting apart.
+        """
+        root = self.root / tree
+        if not root.exists():
+            return []
+        return [p for p in root.iterdir() if p.is_dir()]
+
+    def stats(self) -> dict[str, int]:
+        """Tally on-disk sizes. Returns bytes counts the popup can render."""
+        source_dirs = self._tree_entries("sources")
+        source_count = len(source_dirs)
+        source_bytes = sum(_dir_bytes(p) for p in source_dirs)
+
+        video_dirs = self._tree_entries("videos")
+        video_count = len(video_dirs)
+        video_bytes = sum(_dir_bytes(p) for p in video_dirs)
 
         job_count = 0
         job_bytes = 0
@@ -264,14 +275,18 @@ class JobCache:
         for child in list(self.root.iterdir()):
             try:
                 freed += _dir_bytes(child) if child.is_dir() else child.stat().st_size
-            except OSError:
-                pass
+            except OSError as err:
+                # Sizing is only for the freed-bytes tally; a stat failure here
+                # just undercounts the report, so log and keep deleting.
+                log.debug("clear_all: couldn't size %s: %s", child, err)
             try:
                 if child.is_dir():
                     shutil.rmtree(child, ignore_errors=True)
                 else:
                     child.unlink(missing_ok=True)
             except OSError as err:
+                # One stubborn entry shouldn't abort the whole clear; report it
+                # and continue so the rest of the cache is still reclaimed.
                 log.warning("clear_all: couldn't remove %s: %s", child, err)
         return freed
 
@@ -285,8 +300,6 @@ class JobCache:
         """
         if ttl_seconds <= 0:
             return (0, 0)
-
-        import time
 
         now = time.time()
         removed = 0
@@ -305,12 +318,7 @@ class JobCache:
         # are url-keyed caches swept per-entry (a single old dir doesn't drag
         # the whole tree down with it).
         for tree in ("sources", "videos"):
-            tree_root = self.root / tree
-            if not tree_root.exists():
-                continue
-            for child in list(tree_root.iterdir()):
-                if not child.is_dir():
-                    continue
+            for child in self._tree_entries(tree):
                 if _dir_newest_mtime(child) < now - ttl_seconds:
                     freed += _dir_bytes(child)
                     shutil.rmtree(child, ignore_errors=True)
@@ -329,8 +337,10 @@ def _dir_bytes(path: Path) -> int:
         try:
             if p.is_file():
                 total += p.stat().st_size
-        except OSError:
-            pass
+        except OSError as err:
+            # A file vanishing mid-walk (concurrent sweep/clear) is expected;
+            # skip it but leave a breadcrumb when debugging size discrepancies.
+            log.debug("_dir_bytes: skipping %s: %s", p, err)
     return total
 
 
@@ -347,6 +357,7 @@ def _dir_newest_mtime(path: Path) -> float:
                 m = p.stat().st_mtime
                 if m > newest:
                     newest = m
-        except OSError:
-            pass
+        except OSError as err:
+            # Same as _dir_bytes: a file racing the walk is expected; skip it.
+            log.debug("_dir_newest_mtime: skipping %s: %s", p, err)
     return newest

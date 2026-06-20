@@ -42,8 +42,10 @@
               detail: { volume: v, muted: !!this.muted },
             }),
           );
-        } catch (_err) {
-          /* swallow */
+        } catch (err) {
+          // Dispatching the intent event is best-effort; a failure here must
+          // not stop us from pinning the underlying volume below.
+          console.debug("[nomusic] vol-intent dispatch failed", err);
         }
         // Pin underlying volume to 0; the audio renderer never sees v.
         origSet.call(this, 0);

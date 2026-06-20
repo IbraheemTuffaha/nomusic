@@ -37,8 +37,9 @@ export async function loadSettings() {
     if (stored.backendUrl) settings.backendUrl = stored.backendUrl;
     if (stored.model !== undefined) settings.model = stored.model;
     if (stored.keepStems !== undefined) settings.keepStems = stored.keepStems;
-  } catch (_err) {
+  } catch (err) {
     // Storage permission missing? Fall back to defaults.
+    dlog("loadSettings failed; using defaults", err?.name || err);
   }
 }
 

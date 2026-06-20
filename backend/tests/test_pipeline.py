@@ -11,6 +11,7 @@ import math
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -63,11 +64,11 @@ class _FakeEngine(Engine):
             default_model="fake",
         )
 
-    def prepare(self, audio_path: Path, *, model: str | None = None):
+    def prepare(self, audio_path: Path, *, model: str | None = None) -> Any:
         audio, sr = sf.read(str(audio_path), always_2d=True, dtype="float32")
         return (audio, sr)
 
-    def infer_batch(self, prepared) -> list[SeparationResult]:
+    def infer_batch(self, prepared: list[Any]) -> list[SeparationResult]:
         self.batch_sizes.append(len(prepared))
         out = []
         for audio, sr in prepared:
@@ -270,9 +271,8 @@ def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
         def __init__(self, *a, **k):
             raise AssertionError("resume must not extract/download — no fetcher")
 
-    # Resume must reuse cached meta: no probe, no SourceFetcher construction.
-    monkeypatch.setattr(proc, "probe", lambda url: (_ for _ in ()).throw(
-        AssertionError("probe must be skipped on resume")))
+    # Resume must reuse cached meta: no SourceFetcher construction means no
+    # yt-dlp metadata extraction or download is attempted.
     monkeypatch.setattr(proc, "SourceFetcher", _BoomFetcher)
 
     cache = JobCache(tmp_path / "cache")

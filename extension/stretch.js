@@ -64,8 +64,9 @@ export class StretchClient {
     st.tempo = rate; // tempo > 1 shortens (faster); pitch is preserved
     try {
       st.quickSeek = WSOLA_QUICK_SEEK;
-    } catch (_e) {
-      /* older builds may not expose the setter */
+    } catch (err) {
+      // Older SoundTouch builds may not expose this setter; the default is fine.
+      console.debug("[nomusic] quickSeek unsupported by this SoundTouch build", err);
     }
 
     const target = Math.max(1, Math.ceil(inFrames / rate));

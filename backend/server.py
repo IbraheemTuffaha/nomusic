@@ -25,6 +25,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -47,20 +49,46 @@ from jobs import JobRegistry  # noqa: E402
 from pipeline import downloader  # noqa: E402
 from pipeline.cache import CHUNK_MEDIA_TYPE, JobCache  # noqa: E402
 from pipeline.export import (  # noqa: E402
+    MP4_COPYABLE_VCODECS,
     mp3_transcode_cmd,
     mux_video_cmd,
     snapshot_chunk_files,
+    video_codec,
+    video_duration,
 )
 from pipeline.processor import Processor  # noqa: E402
 
-# NOMUSIC_DEBUG=1 raises the level to DEBUG, surfacing the verbose diagnostics
-# (e.g. the progressive download/gate logs) that are otherwise hidden.
-_DEBUG = os.environ.get("NOMUSIC_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
-logging.basicConfig(
-    level=logging.DEBUG if _DEBUG else logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
 log = logging.getLogger("nomusic.server")
+
+# JSON object response/payload bodies carry heterogeneous values, so this is as
+# specific as a single alias gets; it documents intent better than a bare dict.
+JsonDict = dict[str, object]
+
+# Seconds in a day — the cache TTL is configured in days but compared in seconds.
+_SECONDS_PER_DAY = 86400.0
+# Block size (64 KiB) for streaming concatenated audio chunks to the client.
+_STREAM_BLOCK_BYTES = 65536
+
+# ffmpeg transcodes/muxes can run for a while on a long video; this ceiling only
+# bounds a wedged subprocess so a corrupt input fails the request instead of
+# hanging the worker. (ffprobe's shorter timeout lives with the probe helpers in
+# pipeline/export.py.)
+_FFMPEG_TIMEOUT_SECONDS = 3600.0
+
+
+def _configure_logging() -> None:
+    """Set up root logging once, at app/CLI startup rather than import time.
+
+    NOMUSIC_DEBUG=1 raises the level to DEBUG, surfacing the verbose diagnostics
+    (e.g. the progressive download/gate logs) that are otherwise hidden.
+    """
+    debug = os.environ.get("NOMUSIC_DEBUG", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 
 class ProcessRequest(BaseModel):
@@ -91,52 +119,20 @@ def _run_ffmpeg(cmd: list[str]) -> None:
     Mirrors slice_source's error handling: capture stderr so a failure carries
     ffmpeg's actual message instead of a bare exit code.
     """
-    proc = subprocess.run(cmd, capture_output=True)
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        log.error("ffmpeg timed out after %.0fs", _FFMPEG_TIMEOUT_SECONDS)
+        raise HTTPException(
+            status_code=500,
+            detail=f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS:.0f}s",
+        ) from exc
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip() or "(no stderr)"
         log.error("ffmpeg failed (exit %d): %s", proc.returncode, detail)
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {detail}")
-
-
-# Codecs QuickTime/Safari can play inside an MP4 — these we stream-copy. Any
-# other video codec (VP9/AV1, which YouTube uses above 1080p) is re-encoded to
-# H.264 so the exported MP4 plays everywhere, not just in VLC/Chrome.
-_MP4_COPYABLE_VCODECS = frozenset({"h264", "hevc"})
-
-
-def _video_codec(path: Path) -> str:
-    """Return the first video stream's codec name via ffprobe ("" on failure)."""
-    proc = subprocess.run(
-        [
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1",
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    return proc.stdout.strip()
-
-
-def _video_duration(path: Path) -> float:
-    """Best-effort duration (seconds) of ``path``'s video stream, 0.0 on failure.
-
-    Used as the denominator for the ffmpeg encode-progress percentage. Falls
-    back to the container duration when the stream doesn't advertise one."""
-    for args in (
-        ["-select_streams", "v:0", "-show_entries", "stream=duration"],
-        ["-show_entries", "format=duration"],
-    ):
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", *args, "-of", "default=nw=1:nk=1", str(path)],
-            capture_output=True, text=True,
-        ).stdout.strip()
-        try:
-            if out and out != "N/A":
-                return float(out)
-        except ValueError:
-            pass
-    return 0.0
 
 
 def _run_ffmpeg_progress(cmd: list[str], total_seconds: float, on_pct) -> None:
@@ -166,8 +162,18 @@ def _run_ffmpeg_progress(cmd: list[str], total_seconds: float, on_pct) -> None:
                     done = int(line.split("=", 1)[1]) / 1e6 / total_seconds
                     on_pct(max(0.0, min(1.0, done)))
                 except ValueError:
-                    pass
-        proc.wait()
+                    # Progress is cosmetic; a malformed line just skips one tick.
+                    log.debug("unparseable ffmpeg progress line: %r", line)
+        try:
+            proc.wait(timeout=_FFMPEG_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            proc.kill()
+            proc.wait()
+            log.error("ffmpeg timed out after %.0fs", _FFMPEG_TIMEOUT_SECONDS)
+            raise HTTPException(
+                status_code=500,
+                detail=f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS:.0f}s",
+            ) from exc
         if proc.returncode != 0:
             errf.seek(0)
             detail = errf.read().decode("utf-8", "replace").strip() or "(no stderr)"
@@ -176,25 +182,39 @@ def _run_ffmpeg_progress(cmd: list[str], total_seconds: float, on_pct) -> None:
 
 
 # --- MP4 export progress (polled by the extension while it prepares a video) --
-# Keyed by "<job_id>:<max_height or 0>". Each value is {"phase": str,
-# "percent": 0..100}. A plain dict guarded by a lock — exports are rare and
-# short-lived, so this never grows unbounded.
-_export_progress: dict[str, dict] = {}
-_export_progress_lock = threading.Lock()
+class _ExportProgress:
+    """Thread-safe map of in-flight MP4-export progress.
+
+    Keyed by ``"<job_id>:<max_height or 0>"``; each value is
+    ``{"phase": str, "percent": 0..100}``. Co-locating the dict with its lock
+    (rather than leaving both at module scope) keeps the synchronization
+    invariant in one place. Exports are rare and short-lived, so the map never
+    grows unbounded.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_key: dict[str, JsonDict] = {}
+
+    @staticmethod
+    def key(job_id: str, max_height: Optional[int]) -> str:
+        return f"{job_id}:{max_height or 0}"
+
+    def set(self, key: str, phase: str, percent: float) -> None:
+        with self._lock:
+            self._by_key[key] = {"phase": phase, "percent": round(percent, 1)}
+
+    def clear(self, key: str) -> None:
+        with self._lock:
+            self._by_key.pop(key, None)
+
+    def get(self, key: str) -> JsonDict:
+        """Snapshot for ``key``, or the ``idle`` sentinel when none is in flight."""
+        with self._lock:
+            return self._by_key.get(key, {"phase": "idle", "percent": 0})
 
 
-def _export_key(job_id: str, max_height: Optional[int]) -> str:
-    return f"{job_id}:{max_height or 0}"
-
-
-def _set_export_progress(key: str, phase: str, percent: float) -> None:
-    with _export_progress_lock:
-        _export_progress[key] = {"phase": phase, "percent": round(percent, 1)}
-
-
-def _clear_export_progress(key: str) -> None:
-    with _export_progress_lock:
-        _export_progress.pop(key, None)
+_export_progress = _ExportProgress()
 
 
 def _start_cache_ttl_sweeper(cache: JobCache) -> None:
@@ -206,11 +226,9 @@ def _start_cache_ttl_sweeper(cache: JobCache) -> None:
         log.info("Cache TTL sweep disabled (ttl_days=%s)", SETTINGS.cache_ttl_days)
         return
 
-    ttl_seconds = SETTINGS.cache_ttl_days * 86400.0
+    ttl_seconds = SETTINGS.cache_ttl_days * _SECONDS_PER_DAY
 
     def _loop() -> None:
-        import time
-
         while True:
             try:
                 removed, freed = cache.sweep_older_than(ttl_seconds)
@@ -221,6 +239,8 @@ def _start_cache_ttl_sweeper(cache: JobCache) -> None:
                         freed,
                     )
             except Exception:
+                # Daemon loop: one failed sweep must not kill the thread, or the
+                # cache would stop being reclaimed for the server's lifetime.
                 log.exception("TTL sweep failed")
             time.sleep(SETTINGS.cache_sweep_interval_seconds)
 
@@ -241,8 +261,6 @@ def _start_memory_gc(registry: JobRegistry) -> None:
         return
 
     def _loop() -> None:
-        import time
-
         while True:
             time.sleep(interval)
             try:
@@ -250,6 +268,8 @@ def _start_memory_gc(registry: JobRegistry) -> None:
                 if dropped:
                     log.info("Memory GC dropped %d stale in-memory job(s)", dropped)
             except Exception:
+                # Daemon loop: swallow so a single failed pass doesn't stop all
+                # future GC and let the in-memory job map grow unbounded.
                 log.exception("Memory GC failed")
 
     t = threading.Thread(target=_loop, name="nomusic-memory-gc", daemon=True)
@@ -271,6 +291,8 @@ def _start_engine_warmup(engine) -> None:
             engine.warmup()
             log.info("Engine warmup complete")
         except Exception:
+            # Warmup is a latency optimization only; on failure the first real
+            # job loads the model lazily, so this must never be fatal.
             log.exception("Engine warmup failed; will load lazily on first job")
 
     t = threading.Thread(target=_loop, name="nomusic-engine-warmup", daemon=True)
@@ -298,8 +320,15 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    _configure_logging()
     app = FastAPI(title="nomusic", version="0.2.0", lifespan=lifespan)
 
+    # SECURITY INVARIANT: allow_origins='*' with no auth is only safe because
+    # the server binds to 127.0.0.1 (see SETTINGS.host / config.py) — it's
+    # reachable only from this machine, so any origin reaching it is already
+    # local. If you ever change the bind to a non-loopback address, you MUST add
+    # authentication and tighten allow_origins; the two settings are coupled.
+    #
     # ``allow_private_network=True`` opts into Chrome's Private Network
     # Access flow: a fetch from a public origin (youtube.com) to a private
     # IP (127.0.0.1) gets an extra preflight with
@@ -337,11 +366,11 @@ def create_app() -> FastAPI:
     _start_engine_warmup(engine)
 
     @app.get("/healthz")
-    def healthz() -> dict:
+    def healthz() -> dict[str, bool]:
         return {"ok": True}
 
     @app.get("/capabilities")
-    def capabilities() -> dict:
+    def capabilities() -> JsonDict:
         caps = engine.capabilities()
         return {
             "server_version": app.version,
@@ -364,7 +393,7 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/process")
-    def process(req: ProcessRequest) -> dict:
+    def process(req: ProcessRequest) -> JsonDict:
         caps = engine.capabilities()
         model = req.model or caps.default_model
         if model not in caps.supported_models:
@@ -385,7 +414,7 @@ def create_app() -> FastAPI:
         return status.to_dict()
 
     @app.post("/process/{job_id}/prioritize")
-    def prioritize(job_id: str, req: PrioritizeRequest) -> dict:
+    def prioritize(job_id: str, req: PrioritizeRequest) -> dict[str, bool]:
         """Re-order the worker's pending chunks so ``from_chunk`` is next.
 
         Fire-and-forget from the client's perspective. Returns ``applied``
@@ -397,14 +426,14 @@ def create_app() -> FastAPI:
         return {"applied": ok}
 
     @app.get("/status/{job_id}")
-    def status(job_id: str) -> dict:
+    def status(job_id: str) -> JsonDict:
         status = registry.get(job_id)
         if status is None:
             raise HTTPException(status_code=404, detail="unknown job_id")
         return status.to_dict()
 
     @app.get("/events/{job_id}")
-    async def events(job_id: str, request: Request):
+    async def events(job_id: str, request: Request) -> Response:
         """Server-Sent Events stream of a job's status.
 
         Replaces the extension's old /status polling: the client opens one
@@ -434,7 +463,7 @@ def create_app() -> FastAPI:
 
         queue = registry.subscribe(job_id)
 
-        async def stream():
+        async def stream() -> AsyncIterator[str]:
             try:
                 # Emit the current state right away so the client paints
                 # without waiting for the next change. Re-read after subscribe
@@ -504,11 +533,11 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/cache")
-    def cache_stats() -> dict:
+    def cache_stats() -> JsonDict:
         return {"root": str(cache.root), **cache.stats()}
 
     @app.post("/cache/clear")
-    def cache_clear() -> dict:
+    def cache_clear() -> dict[str, int]:
         # Ask any in-flight workers to abandon at their next chunk boundary
         # (releases the GPU lock + runs their own cleanup) and drop the
         # in-memory status map so a freshly cleared cache doesn't surface stale
@@ -520,7 +549,7 @@ def create_app() -> FastAPI:
         return {"deleted_bytes": freed}
 
     @app.get("/audio/{job_id}")
-    def audio(job_id: str, format: str = "opus"):
+    def audio(job_id: str, format: str = "opus") -> Response:
         """On-demand concatenation of every chunk into a single track.
 
         We no longer keep a precomputed full file on disk (cut storage in
@@ -584,7 +613,7 @@ def create_app() -> FastAPI:
                     return  # deleted after the snapshot; stop short
                 with f:
                     while True:
-                        block = f.read(64 * 1024)
+                        block = f.read(_STREAM_BLOCK_BYTES)
                         if not block:
                             break
                         yield block
@@ -598,7 +627,7 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/video/{job_id}")
-    def video(job_id: str, max_height: Optional[int] = None):
+    def video(job_id: str, max_height: Optional[int] = None) -> Response:
         """Original video with its audio replaced by the music-stripped track.
 
         The pipeline never downloads video, so we pull the video stream on
@@ -629,19 +658,19 @@ def create_app() -> FastAPI:
         if not chunk_files:
             raise HTTPException(status_code=425, detail="full audio not ready")
 
-        progress_key = _export_key(job_id, max_height)
-        _set_export_progress(progress_key, "downloading", 0.0)
+        progress_key = _export_progress.key(job_id, max_height)
+        _export_progress.set(progress_key, "downloading", 0.0)
         tmp_dir: Optional[Path] = None
         try:
             # --- Phase 1: fetch the video stream (cached per url+resolution) ---
-            def _dl_hook(d: dict) -> None:
+            def _dl_hook(d: dict[str, object]) -> None:
                 if d.get("status") == "downloading":
                     total = d.get("total_bytes") or d.get("total_bytes_estimate")
                     got = d.get("downloaded_bytes")
                     if total and got is not None:
-                        _set_export_progress(progress_key, "downloading", 100.0 * got / total)
+                        _export_progress.set(progress_key, "downloading", 100.0 * got / total)
                 elif d.get("status") == "finished":
-                    _set_export_progress(progress_key, "downloading", 100.0)
+                    _export_progress.set(progress_key, "downloading", 100.0)
 
             try:
                 video_path = downloader.download_video(
@@ -657,17 +686,17 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=502, detail=f"video download failed: {exc}")
 
             # --- Phase 2: mux the stripped audio over the video ---
-            _set_export_progress(progress_key, "encoding", 0.0)
+            _export_progress.set(progress_key, "encoding", 0.0)
             tmp_dir = Path(tempfile.mkdtemp(prefix="nomusic-mp4-"))
             out = tmp_dir / "full.mp4"
-            total_seconds = _video_duration(video_path)
+            total_seconds = video_duration(video_path)
 
             def _enc_pct(frac: float) -> None:
-                _set_export_progress(progress_key, "encoding", 100.0 * frac)
+                _export_progress.set(progress_key, "encoding", 100.0 * frac)
 
             # Copy H.264/HEVC straight through (fast, lossless); re-encode
             # VP9/AV1 to H.264 so the MP4 plays in QuickTime/Safari too.
-            reencode = _video_codec(video_path) not in _MP4_COPYABLE_VCODECS
+            reencode = video_codec(video_path) not in MP4_COPYABLE_VCODECS
             try:
                 _run_ffmpeg_progress(
                     mux_video_cmd(video_path, chunk_files, out, reencode_video=reencode),
@@ -683,21 +712,21 @@ def create_app() -> FastAPI:
                 )
                 # The retry's progress restarts at 0; reset the published
                 # percent so the poller doesn't see it jump backward mid-export.
-                _set_export_progress(progress_key, "encoding", 0.0)
+                _export_progress.set(progress_key, "encoding", 0.0)
                 _run_ffmpeg_progress(
                     mux_video_cmd(video_path, chunk_files, out, reencode_video=True),
                     total_seconds, _enc_pct,
                 )
         except BaseException:
-            _clear_export_progress(progress_key)
+            _export_progress.clear(progress_key)
             if tmp_dir is not None:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
 
-        _set_export_progress(progress_key, "done", 100.0)
+        _export_progress.set(progress_key, "done", 100.0)
 
         def _cleanup() -> None:
-            _clear_export_progress(progress_key)
+            _export_progress.clear(progress_key)
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         return FileResponse(
@@ -708,7 +737,7 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/video/{job_id}/progress")
-    def video_progress(job_id: str, max_height: Optional[int] = None) -> dict:
+    def video_progress(job_id: str, max_height: Optional[int] = None) -> JsonDict:
         """Current MP4-export progress for the extension's download menu.
 
         Returns ``{"phase": "downloading"|"encoding"|"done"|"idle", "percent":
@@ -719,10 +748,7 @@ def create_app() -> FastAPI:
             max_height = None
         if max_height is not None:
             max_height = max(144, min(4320, max_height))
-        with _export_progress_lock:
-            return _export_progress.get(
-                _export_key(job_id, max_height), {"phase": "idle", "percent": 0}
-            )
+        return _export_progress.get(_export_progress.key(job_id, max_height))
 
     return app
 
@@ -731,7 +757,7 @@ app = create_app()
 
 
 def main() -> None:
-    import os
+    _configure_logging()
 
     import uvicorn
 

@@ -25,12 +25,26 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
+
+# yt-dlp progress-hook callback. yt-dlp invokes it with a status dict whose keys
+# vary by phase — at minimum ``status`` ("downloading"/"finished"), plus
+# ``downloaded_bytes``, ``total_bytes`` / ``total_bytes_estimate``, ``speed``,
+# ``eta`` while downloading. We forward it verbatim; the values are
+# heterogeneous, hence the loose value type.
+ProgressHook = Callable[[dict[str, Any]], None]
+
+# Hard ceiling for a single ffmpeg slice. A slice decodes at most one chunk's
+# download window (tens of seconds of audio), so anything beyond this means
+# ffmpeg has wedged on a corrupt/partial container rather than doing real work —
+# kill it and let the caller surface the failure instead of hanging the worker.
+_FFMPEG_SLICE_TIMEOUT_SECONDS = 300.0
 
 # WAV is large but lossless and trivial to load with soundfile. We're operating
 # on short ranges (~30 s) so the size is fine, and any other codec would force
@@ -38,9 +52,13 @@ log = logging.getLogger(__name__)
 _TARGET_SAMPLE_RATE = 44100
 _TARGET_CHANNELS = 2
 
+# Byte-size multipliers for the K/M suffixes in NOMUSIC_DOWNLOAD_RATELIMIT.
+_BYTES_PER_KB = 1024
+_BYTES_PER_MB = _BYTES_PER_KB * _BYTES_PER_KB
+
 
 def _common_opts() -> dict[str, Any]:
-    """Options shared by ``probe`` and ``download_range``.
+    """Options shared by ``probe`` and the source/video download helpers.
 
     YouTube requires a JavaScript runtime + EJS challenge solver scripts for
     most videos (without them, extraction fails with the misleading "This
@@ -84,9 +102,9 @@ def _download_ratelimit() -> float | None:
     raw = raw.strip().upper()
     mult = 1
     if raw.endswith("K"):
-        mult, raw = 1024, raw[:-1]
+        mult, raw = _BYTES_PER_KB, raw[:-1]
     elif raw.endswith("M"):
-        mult, raw = 1024 * 1024, raw[:-1]
+        mult, raw = _BYTES_PER_MB, raw[:-1]
     try:
         return float(raw) * mult
     except ValueError:
@@ -151,7 +169,7 @@ def download_source(
     url: str,
     out_dir: Path,
     *,
-    progress_hook=None,
+    progress_hook: ProgressHook | None = None,
 ) -> Path:
     """Download the entire bestaudio stream for ``url`` into ``out_dir``.
 
@@ -178,7 +196,7 @@ def download_source(
                     }
                 )
             except Exception:  # never let a UI hook break the pipeline
-                pass
+                log.debug("source cache-hit progress hook raised", exc_info=True)
         return existing
 
     from yt_dlp import YoutubeDL
@@ -236,7 +254,7 @@ def download_video(
     out_dir: Path,
     *,
     max_height: int | None = None,
-    progress_hook=None,
+    progress_hook: ProgressHook | None = None,
 ) -> Path:
     """Download the video stream for ``url`` into ``out_dir`` for the MP4 export.
 
@@ -260,7 +278,7 @@ def download_video(
                     {"status": "finished", "downloaded_bytes": size, "total_bytes": size}
                 )
             except Exception:  # never let a UI hook break the download
-                pass
+                log.debug("video cache-hit progress hook raised", exc_info=True)
         return existing
 
     from yt_dlp import YoutubeDL
@@ -382,7 +400,7 @@ class SourceFetcher:
             webpage_url=str(info.get("webpage_url", self.url)),
         )
 
-    def download(self, progress_hook=None) -> Path:
+    def download(self, progress_hook: ProgressHook | None = None) -> Path:
         if self._cached is not None:
             log.info("Using cached source audio: %s", self._cached.name)
             if progress_hook:
@@ -391,8 +409,8 @@ class SourceFetcher:
                     progress_hook(
                         {"status": "finished", "downloaded_bytes": size, "total_bytes": size}
                     )
-                except Exception:
-                    pass
+                except Exception:  # never let a UI hook break the download
+                    log.debug("cached-source progress hook raised", exc_info=True)
             self._close()
             return self._cached
 
@@ -434,8 +452,8 @@ class SourceFetcher:
         if self._ydl is not None:
             try:
                 self._ydl.close()
-            except Exception:
-                pass
+            except Exception:  # closing is best-effort; a failure here is benign
+                log.debug("SourceFetcher: ydl.close() raised", exc_info=True)
             self._ydl = None
 
 
@@ -458,8 +476,6 @@ def slice_source(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     duration = end - start
     tmp_path = out_path.with_suffix(".part")
-
-    import subprocess
 
     cmd = [
         "ffmpeg",
@@ -494,8 +510,16 @@ def slice_source(
     ]
     # Capture stderr so a failure (e.g. a not-yet-decodable partial progressive
     # download) carries ffmpeg's actual error instead of leaking it to the
-    # server's inherited stderr and logging a bare "return code 1".
-    proc = subprocess.run(cmd, capture_output=True)
+    # server's inherited stderr and logging a bare "return code 1". The timeout
+    # stops a wedged ffmpeg (corrupt container) from hanging the worker forever.
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, timeout=_FFMPEG_SLICE_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"ffmpeg slice timed out after {_FFMPEG_SLICE_TIMEOUT_SECONDS:.0f}s"
+        ) from exc
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip() or "(no stderr)"
         raise RuntimeError(f"ffmpeg slice failed (exit {proc.returncode}): {detail}")
@@ -509,18 +533,3 @@ def _find_source(out_dir: Path) -> Path | None:
         if p.exists() and p.stat().st_size > 0:
             return p
     return None
-
-
-# Back-compat shim. Old code (or external callers) may still import
-# download_range; we redirect them through download_source + slice_source so
-# the keyframe-drift bug can't sneak back in.
-def download_range(
-    url: str,
-    out_path: Path,
-    *,
-    start: float,
-    end: float,
-) -> Path:
-    source_dir = out_path.parent / "_source"
-    source = download_source(url, source_dir)
-    return slice_source(source, out_path, start=start, end=end)

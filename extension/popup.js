@@ -32,8 +32,9 @@ async function load() {
       cache: "no-store",
     });
     if (resp.ok) caps = await resp.json();
-  } catch (_err) {
-    /* fall through */
+  } catch (err) {
+    // Backend down / wrong URL — fall through and render the offline state.
+    console.debug("[nomusic] capabilities fetch failed", err);
   }
 
   if (caps) {
@@ -81,11 +82,10 @@ async function load() {
       stemsEl.appendChild(row);
     }
 
-    // Heal a stale saved model (e.g. one we've since removed): fall back to the
-    // default and rewrite storage so content.js stops sending the dead value.
-    // Done here, AFTER the stem checkboxes are rebuilt, so persist() reads the
-    // real keep-stems instead of wiping them from a still-empty #stems; awaited
-    // so a storage rejection surfaces instead of being silently dropped.
+    // Persist the healed model AFTER the stem checkboxes are rebuilt, so
+    // persist() reads the real keep-stems instead of wiping them from a
+    // still-empty #stems; awaited so a storage rejection surfaces instead of
+    // being silently dropped.
     if (stored.model && stored.model !== valid) await persist();
   } else {
     $("status").classList.add("bad");

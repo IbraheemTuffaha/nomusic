@@ -1,5 +1,10 @@
 fastapi>=0.110
 uvicorn[standard]>=0.27
+# server.py imports pydantic and starlette directly (request models, background
+# tasks), so they're declared explicitly rather than relied on as transitive
+# FastAPI deps.
+pydantic>=2.0
+starlette>=0.36
 yt-dlp>=2024.10.7
 soundfile>=0.12.1
 numpy>=1.26,<2.3
@@ -11,7 +16,13 @@ numpy>=1.26,<2.3
 # call sites — see backend/engines/mlx_engine.py for the dependency-injection
 # hook.
 torch>=2.2
+# torchaudio is a demucs runtime dependency (not imported by our code). It's
+# pinned explicitly because its version must move in lockstep with torch — a
+# mismatched pair fails to load — so we don't want it floating as a transitive.
 torchaudio>=2.2
 demucs>=4.0.1
 
 pytest>=8.0
+# httpx backs FastAPI's TestClient, used by the HTTP-layer tests in
+# tests/test_server.py (no torch/network needed — the engine is stubbed).
+httpx>=0.27

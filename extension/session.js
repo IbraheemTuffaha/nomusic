@@ -9,7 +9,7 @@ import { AudioScheduler } from "./audio-scheduler.js";
 // ---------------------------------------------------------------------------
 // Session: drives one <video> at a time. Reused if user toggles off and on.
 // ---------------------------------------------------------------------------
-class Session {
+export class Session {
   constructor(video, button) {
     this.video = video;
     this.button = button;
@@ -109,8 +109,9 @@ class Session {
       this.chunkSeconds = caps?.defaults?.chunk_seconds ?? this.chunkSeconds;
       this.chunkOverlapSeconds =
         caps?.defaults?.chunk_overlap_seconds ?? this.chunkOverlapSeconds;
-    } catch (_err) {
+    } catch (err) {
       // capabilities is best-effort; defaults are reasonable.
+      dlog("capabilities fetch failed; using defaults", err?.name || err);
     }
     if (this.disposed) return; // re-check after the second await (see above).
 
@@ -260,9 +261,10 @@ class Session {
   async _resumeProcessing() {
     try {
       await this.requestJob();
-    } catch (_err) {
+    } catch (err) {
       // Backend unreachable on resume; reopening the stream below will
       // surface the failure (204/CLOSED) without crashing playback.
+      dlog("resume requestJob failed", err?.name || err);
     }
     if (this.disposed) return;
     if (!this.eventSource) this._openEventStream();
@@ -390,8 +392,8 @@ class Session {
     });
     try {
       this.video.pause();
-    } catch (_err) {
-      /* element gone */
+    } catch (err) {
+      dlog("buffer pause: video element gone", err?.name || err);
     }
   }
 
@@ -413,8 +415,8 @@ class Session {
       if (p && typeof p.catch === "function") {
         p.catch((err) => dlog("video.play() rejected", err?.name || err));
       }
-    } catch (_err) {
-      /* element gone */
+    } catch (err) {
+      dlog("resume: video element gone", err?.name || err);
     }
   }
 
@@ -524,8 +526,8 @@ class Session {
       try {
         const p = this.video.play();
         if (p && typeof p.catch === "function") p.catch(() => {});
-      } catch (_err) {
-        /* noop */
+      } catch (err) {
+        dlog("dispose: resume video element gone", err?.name || err);
       }
     }
     this.chunks.clear();
@@ -536,5 +538,3 @@ class Session {
     if (!preserveButtonState) this.button.dispose();
   }
 }
-
-export { Session };

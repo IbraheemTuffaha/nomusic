@@ -86,7 +86,7 @@ class JobStatus:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, object]:
         d = asdict(self)
         d["state"] = self.state.value
         return d
@@ -505,6 +505,14 @@ class JobRegistry:
         if hint is not None:
             self._controls[key].prioritize(hint)
 
+    def _set_downloading(self, key: str, fraction: float | None) -> None:
+        """Flip the job to the DOWNLOADING ("Fetching") phase at ``fraction``.
+        Shared by the two download-progress callbacks, which differ only in
+        whether they suppress this update once separation is underway."""
+        self._update(key, state=JobState.DOWNLOADING, phase="downloading",
+                     phase_label=_PHASE_LABELS["downloading"],
+                     phase_progress=fraction)
+
     def _on_download_progress(self, key: str, fraction: float | None) -> None:
         # In progressive mode the download runs concurrently with separation,
         # so download ticks ("Fetching", download %) and separation ticks
@@ -520,9 +528,7 @@ class JobRegistry:
                 JobState.ERROR,
             ):
                 return
-        self._update(key, state=JobState.DOWNLOADING, phase="downloading",
-                     phase_label=_PHASE_LABELS["downloading"],
-                     phase_progress=fraction)
+        self._set_downloading(key, fraction)
 
     def _on_wait_for_download(self, key: str, fraction: float | None) -> None:
         # Separation is blocked waiting for the download to reach this chunk —
@@ -531,9 +537,7 @@ class JobRegistry:
         # "Fetching" is right: playback is genuinely gated on the download, not
         # on separation. Unlike _on_download_progress this isn't suppressed
         # during PROCESSING, because here the download IS the bottleneck.
-        self._update(key, state=JobState.DOWNLOADING, phase="downloading",
-                     phase_label=_PHASE_LABELS["downloading"],
-                     phase_progress=fraction)
+        self._set_downloading(key, fraction)
 
     def _on_separation_progress(
         self,
@@ -543,13 +547,10 @@ class JobRegistry:
     ) -> None:
         done = len(meta.chunks_ready)
         total = max(1, meta.total_chunks)
-        # Smooth the bar inside a chunk: 'separating' = chunk just started
-        # (counts as half done), 'chunk_complete' = chunk fully done.
-        per_chunk = 0.0
-        if phase == "separating":
-            per_chunk = 0.3
-        elif phase == "mixing":
-            per_chunk = 0.7
+        # Smooth the bar inside a chunk: 'separating' = the chunk's GPU pass has
+        # started (count it partly done); 'chunk_complete' lands via the
+        # chunks_ready count itself. The processor only emits those two phases.
+        per_chunk = 0.3 if phase == "separating" else 0.0
         progress = min(1.0, (done + per_chunk) / total)
         self._update(
             key,

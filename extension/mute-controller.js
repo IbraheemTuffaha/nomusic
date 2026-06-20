@@ -8,6 +8,7 @@
 // the owner provides — so this stays decoupled from the Web Audio graph.
 //
 // Extracted from Session (former content.js god-object).
+import { dlog } from "./settings.js";
 
 export class MuteController {
   /** @param video  the host media element to silence.
@@ -82,8 +83,12 @@ export class MuteController {
       if (this.disposed) return;
       try {
         if (this._realGetVolume() !== 0) this._realSetVolume(0);
-      } catch (_err) {
-        /* element detached */
+      } catch (err) {
+        // Element detached from the DOM — there's nothing left to pin, so stop
+        // the per-frame loop instead of throwing on every future frame.
+        dlog("mute assert: element detached; stopping asserter", err?.name || err);
+        this.muteAsserter = null;
+        return;
       }
       this.muteAsserter = requestAnimationFrame(tick);
     };
@@ -171,8 +176,8 @@ export class MuteController {
     if (realVol !== 0) {
       try {
         this._realSetVolume(0);
-      } catch (_err) {
-        /* element gone */
+      } catch (err) {
+        dlog("pin volume: element gone", err?.name || err);
       }
     }
   }
