@@ -663,6 +663,16 @@ class Processor:
         """
 
         def _do(src: Path) -> _ChunkWork:
+            # Pre-flight against the rename race: ``source_for`` may have handed
+            # back the ``.part`` path a beat ago, and a fast download can have
+            # finished (renaming ``.part`` -> final) in the meantime. If the
+            # path has since vanished, the download is done — resolve to the
+            # completed file instead of feeding ffmpeg a path that no longer
+            # exists. This avoids the wasted slice attempt; the outer ``except``
+            # still covers the irreducible window where the rename lands *during*
+            # ffmpeg's open.
+            if dl is not None and not src.exists():
+                src = dl.wait_complete()
             with tempfile.TemporaryDirectory(prefix="nomusic-") as tmp_str:
                 raw = Path(tmp_str) / f"raw_{plan.index:03d}.wav"
                 t0 = time.perf_counter()
