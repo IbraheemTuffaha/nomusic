@@ -4,7 +4,44 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { Session } from "../session.js";
+import { Session, resolveSourceUrl, normalizeWatchUrl } from "../session.js";
+
+// Run `fn` with a mocked MAIN-world bridge: dispatching the resolve event makes
+// `document` answer with `bridgeUrl` on the documentElement attribute, exactly
+// as page-script.js does in the browser. Restores globals afterwards.
+function withBridge(bridgeUrl, fn) {
+  const root = {
+    a: {},
+    setAttribute(k, v) {
+      this.a[k] = v;
+    },
+    getAttribute(k) {
+      return k in this.a ? this.a[k] : null;
+    },
+    removeAttribute(k) {
+      delete this.a[k];
+    },
+  };
+  const prevDoc = globalThis.document;
+  const prevCE = globalThis.CustomEvent;
+  globalThis.CustomEvent = class {
+    constructor(type) {
+      this.type = type;
+    }
+  };
+  globalThis.document = {
+    documentElement: root,
+    dispatchEvent() {
+      root.setAttribute("data-nomusic-source-url", bridgeUrl);
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    globalThis.document = prevDoc;
+    globalThis.CustomEvent = prevCE;
+  }
+}
 
 function makeSession() {
   const s = new Session(/* video */ {}, /* button */ {});
@@ -104,4 +141,31 @@ test("_resumeProcessing keeps the same job_id when the url is unchanged", async 
   assert.equal(s.jobId, "SAME");
   assert.equal(s.fetchedIdx.size, 2); // not cleared; it's the same job
   assert.equal(opened, 1); // reopened the (closed) stream
+});
+
+test("normalizeWatchUrl extracts a clean watch URL and strips extra params", () => {
+  assert.equal(
+    normalizeWatchUrl("https://www.youtube.com/watch?v=ABC123&t=42s&list=PLx"),
+    "https://www.youtube.com/watch?v=ABC123",
+  );
+});
+
+test("normalizeWatchUrl returns null for non-watch / empty inputs", () => {
+  assert.equal(normalizeWatchUrl("https://www.youtube.com/feed/history"), null);
+  assert.equal(normalizeWatchUrl(""), null);
+  assert.equal(normalizeWatchUrl(null), null);
+});
+
+test("resolveSourceUrl uses the bridge's playing-video URL (miniplayer case)", () => {
+  // location.href is the page being browsed; the bridge reports the real video.
+  withBridge("https://www.youtube.com/watch?v=MINI42&t=10s", () => {
+    assert.equal(resolveSourceUrl(), "https://www.youtube.com/watch?v=MINI42");
+  });
+});
+
+test("resolveSourceUrl falls back to the page URL when the bridge has no answer", () => {
+  // Non-YouTube page (no player): bridge answers empty -> use location.href.
+  withBridge("", () => {
+    assert.equal(resolveSourceUrl(), location.href);
+  });
 });
