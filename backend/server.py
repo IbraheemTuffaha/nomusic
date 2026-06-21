@@ -13,7 +13,7 @@ live in :mod:`routes` (system / jobs / media):
   POST /process/{job_id}/prioritize {from_chunk} -> {applied}
   GET  /status/{job_id}      -> JobStatus
   GET  /events/{job_id}      -> text/event-stream (SSE status updates)
-  GET  /chunk/{job_id}/{idx} -> audio/wav (404 if not yet ready)
+  GET  /chunk/{job_id}/{idx} -> audio/ogg (425 if not yet ready)
   GET  /audio/{job_id}       -> audio/ogg (concatenated track; ?format=mp3 transcodes)
   GET  /video/{job_id}       -> video/mp4 (original video, stripped audio muxed in)
   GET  /video/{job_id}/progress -> {phase, percent} for the export in flight

@@ -70,7 +70,7 @@ DownloadProgressCb = Callable[[float | None], None]
 
 # (info, plans, meta) fired once the probe completes — gives jobs.py enough
 # data to surface title / duration / total_chunks in /status.
-ProbedCb = Callable[["VideoMetadata", list, CacheMeta], None]
+ProbedCb = Callable[["VideoMetadata", "list[ChunkPlan]", CacheMeta], None]
 
 # Returns the next chunk index to process, or ``None`` when the work queue
 # is exhausted. When the caller supplies one, the processor lets it drive
@@ -953,10 +953,9 @@ def _encode_opus(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
         str(out_path),
     ]
     try:
-        subprocess.run(
+        proc = subprocess.run(
             cmd,
             input=wav_buf.getvalue(),
-            check=True,
             capture_output=True,
             timeout=_OPUS_ENCODE_TIMEOUT_SECONDS,
         )
@@ -964,3 +963,8 @@ def _encode_opus(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
         raise RuntimeError(
             f"opus encode timed out after {_OPUS_ENCODE_TIMEOUT_SECONDS:.0f}s"
         ) from exc
+    # Decode stderr into the error (mirrors slice_source / _run_ffmpeg) so an
+    # encode failure carries ffmpeg's actual message, not a bare exit code.
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip() or "(no stderr)"
+        raise RuntimeError(f"opus encode failed (exit {proc.returncode}): {detail}")
