@@ -33,6 +33,16 @@ from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
+
+class DownloadCancelled(Exception):
+    """Raised to unwind a download that's being cancelled — from the yt-dlp
+    progress hook (which aborts the running download) and from the progressive
+    source's per-chunk wait. Distinct from a real download error so callers can
+    tell an intentional abort from a failure: the retry-clean path in
+    ``SourceFetcher.download`` re-raises it instead of restarting the download.
+    """
+
+
 # yt-dlp progress-hook callback. yt-dlp invokes it with a status dict whose keys
 # vary by phase — at minimum ``status`` ("downloading"/"finished"), plus
 # ``downloaded_bytes``, ``total_bytes`` / ``total_bytes_estimate``, ``speed``,
@@ -431,6 +441,12 @@ class SourceFetcher:
                 "SourceFetcher: same-session download OK (no re-extract), %.1fs",
                 time.monotonic() - t0,
             )
+        except DownloadCancelled:
+            # An intentional abort (the progress hook raised), not a download
+            # failure — propagate it cleanly instead of logging a traceback and
+            # restarting the very download we're trying to stop.
+            self._close()
+            raise
         except Exception:
             log.warning(
                 "SourceFetcher: same-session download failed; retrying clean",

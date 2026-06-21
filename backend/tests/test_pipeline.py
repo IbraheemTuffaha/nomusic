@@ -346,6 +346,40 @@ def test_progressive_source_cancel_unblocks_source_for(tmp_path):
         dl.source_for(plan, overlap=0.5)
 
 
+def test_source_fetcher_download_propagates_cancel_without_retry(tmp_path, monkeypatch):
+    # When the progress hook raises DownloadCancelled to abort an in-flight
+    # download, SourceFetcher.download must propagate it — NOT catch it in the
+    # retry-clean handler and start a fresh download of the very thing we're
+    # cancelling (which is what produced the stray re-download + traceback on a
+    # page-close mid-download).
+    from pipeline import downloader
+    from pipeline.downloader import DownloadCancelled, SourceFetcher
+
+    class _FakeYDL:
+        def add_progress_hook(self, hook):
+            pass
+
+        def process_ie_result(self, info, download):
+            raise DownloadCancelled()
+
+        def close(self):
+            pass
+
+    retried: list[bool] = []
+    monkeypatch.setattr(
+        downloader, "download_source", lambda *a, **k: retried.append(True)
+    )
+
+    f = SourceFetcher("https://example.com/v", tmp_path)
+    f._ydl = _FakeYDL()
+    f._info = {"id": "v"}
+    f._cached = None
+
+    with pytest.raises(DownloadCancelled):
+        f.download(progress_hook=None)
+    assert retried == []  # no clean-retry download was kicked off
+
+
 def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
     # A prior run already probed this job and processed some chunks; a resume
     # (after idle-abandon or a page refresh) must NOT pay the yt-dlp probe

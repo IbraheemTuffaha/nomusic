@@ -37,6 +37,7 @@ from engines.base import Engine
 
 from .cache import CacheMeta, JobCache
 from .downloader import (
+    DownloadCancelled as _DownloadCancelled,
     SourceFetcher,
     VideoMetadata,
     download_source,
@@ -159,13 +160,6 @@ def plan_chunks(
 # being approximate (VBR), so we never slice a chunk whose tail hasn't landed.
 _PROGRESSIVE_MARGIN_SECONDS = 3.0
 _PROGRESSIVE_POLL_SECONDS = 0.15
-
-
-class _DownloadCancelled(Exception):
-    """Raised to unwind a progressive download that's being cancelled — from the
-    yt-dlp progress hook (which aborts the running download) and from
-    ``source_for`` (which releases a chunk wait). Distinct from a real download
-    error so the caller can tell an intentional abort from a failure."""
 
 
 class _ProgressiveSource:
