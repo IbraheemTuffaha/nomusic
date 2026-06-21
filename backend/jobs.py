@@ -24,7 +24,7 @@ from typing import Callable, Optional
 
 from config import SETTINGS
 from pipeline.cache import CacheMeta, JobCache
-from pipeline.processor import Processor
+from pipeline.processor import Processor, RunHooks
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +59,15 @@ _PHASE_LABELS: dict[str, str] = {
     "ready": "Ready",
     "error": "Error",
 }
+
+# States in which a job's worker is still live, so a duplicate /process should
+# adopt the running job rather than spawn a second worker for the same key.
+_LIVE_JOB_STATES = (
+    JobState.QUEUED,
+    JobState.PROBING,
+    JobState.DOWNLOADING,
+    JobState.PROCESSING,
+)
 
 
 @dataclass
@@ -221,23 +230,13 @@ class JobRegistry:
 
         with self._lock:
             existing = self._jobs.get(key)
-            if (
-                existing
-                and existing.state
-                in (
-                    JobState.QUEUED,
-                    JobState.PROBING,
-                    JobState.DOWNLOADING,
-                    JobState.PROCESSING,
-                )
-                and key not in self._abandoning
-            ):
+            if self._is_live_duplicate(existing, key):
                 # A returning/duplicate client. Restart the idle clock so the
                 # worker doesn't abandon the job in the window before this
-                # client's /events stream (re)connects, then hand back the
-                # live job. Skipped when the job is mid-abandon (``_abandoning``)
-                # so a /process landing during the unwind respawns a fresh
-                # worker instead of adopting one that's about to vanish.
+                # client's /events stream (re)connects, then hand back the live
+                # job. (``_is_live_duplicate`` excludes a job mid-abandon, so a
+                # /process landing during the unwind respawns a fresh worker
+                # instead of adopting one that's about to vanish.)
                 self._last_disconnect_at[key] = time.time()
                 return existing
 
@@ -246,32 +245,9 @@ class JobRegistry:
             # chunk boundary.
             self._abandoning.discard(key)
 
-            if existing_meta and existing_meta.complete:
-                initial_state = JobState.READY
-                progress = 1.0
-                # Replay is a "use" of the cache entry; renew its TTL by
-                # bumping meta.json's mtime so the hourly sweep doesn't
-                # reap a video the user is actively re-watching.
-                self.cache.touch(key)
-            else:
-                initial_state = JobState.QUEUED
-                progress = 0.0
-            status = JobStatus(
-                job_id=key,
-                cache_key=key,
-                state=initial_state,
-                phase=initial_state.value,
-                phase_progress=progress,
-                phase_label=_PHASE_LABELS[initial_state.value],
-                chunks_ready=len(existing_meta.chunks_ready) if existing_meta else 0,
-                ready_chunks=sorted(existing_meta.chunks_ready) if existing_meta else [],
-                total_chunks=existing_meta.total_chunks if existing_meta else 0,
-                duration_seconds=existing_meta.duration_seconds if existing_meta else 0.0,
-                title=existing_meta.title if existing_meta else "",
-            )
+            status = self._build_submit_status(key, existing_meta)
             self._jobs[key] = status
-
-            if initial_state == JobState.READY:
+            if status.state == JobState.READY:
                 return status
 
             t = threading.Thread(
@@ -283,6 +259,51 @@ class JobRegistry:
             self._threads[key] = t
             t.start()
             return status
+
+    def _is_live_duplicate(self, existing: Optional[JobStatus], key: str) -> bool:
+        """True when ``existing`` is a still-running worker for ``key`` that a new
+        submit should adopt instead of replacing.
+
+        Excludes a job that has already committed to abandoning (``_abandoning``)
+        so a /process landing during an idle-unwind respawns a fresh worker
+        rather than adopting one about to vanish. Must be called under
+        ``self._lock`` (reads ``_abandoning``)."""
+        return (
+            existing is not None
+            and existing.state in _LIVE_JOB_STATES
+            and key not in self._abandoning
+        )
+
+    def _build_submit_status(
+        self, key: str, existing_meta: Optional[CacheMeta]
+    ) -> JobStatus:
+        """Build the initial JobStatus for a freshly admitted job: READY when the
+        cache is already complete, else QUEUED. Must be called under ``self._lock``.
+
+        A complete cache means an instant replay; that counts as a "use" of the
+        entry, so we renew its TTL (bump meta.json's mtime) to keep the hourly
+        sweep from reaping a video the user is actively re-watching.
+        """
+        if existing_meta and existing_meta.complete:
+            self.cache.touch(key)
+            initial_state = JobState.READY
+            progress = 1.0
+        else:
+            initial_state = JobState.QUEUED
+            progress = 0.0
+        return JobStatus(
+            job_id=key,
+            cache_key=key,
+            state=initial_state,
+            phase=initial_state.value,
+            phase_progress=progress,
+            phase_label=_PHASE_LABELS[initial_state.value],
+            chunks_ready=len(existing_meta.chunks_ready) if existing_meta else 0,
+            ready_chunks=sorted(existing_meta.chunks_ready) if existing_meta else [],
+            total_chunks=existing_meta.total_chunks if existing_meta else 0,
+            duration_seconds=existing_meta.duration_seconds if existing_meta else 0.0,
+            title=existing_meta.title if existing_meta else "",
+        )
 
     def get(self, job_id: str) -> Optional[JobStatus]:
         with self._lock:
@@ -405,21 +426,23 @@ class JobRegistry:
                         url,
                         model=model,
                         keep_stems=keep_stems,
-                        on_probed=lambda info, plans, meta: self._on_probed(
-                            key, info, plans, meta
-                        ),
-                        on_progress=lambda meta, phase: self._on_separation_progress(
-                            key, meta, phase
-                        ),
-                        on_download_progress=lambda p: self._on_download_progress(
-                            key, p
-                        ),
-                        next_chunk_provider=self._make_chunk_provider(key),
-                        abort_check=lambda: self._raise_if_abandoned(
-                            key, SETTINGS.idle_timeout_seconds
-                        ),
-                        on_wait_for_download=lambda frac: self._on_wait_for_download(
-                            key, frac
+                        hooks=RunHooks(
+                            on_probed=lambda info, plans, meta: self._on_probed(
+                                key, info, plans, meta
+                            ),
+                            on_progress=lambda meta, phase: self._on_separation_progress(
+                                key, meta, phase
+                            ),
+                            on_download_progress=lambda p: self._on_download_progress(
+                                key, p
+                            ),
+                            next_chunk_provider=self._make_chunk_provider(key),
+                            abort_check=lambda: self._raise_if_abandoned(
+                                key, SETTINGS.idle_timeout_seconds
+                            ),
+                            on_wait_for_download=lambda frac: self._on_wait_for_download(
+                                key, frac
+                            ),
                         ),
                     )
                 meta = self.cache.load_meta(key)

@@ -22,7 +22,6 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -31,10 +30,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-# Make sibling modules importable when this file is invoked as a script.
+# Directory holding the flat backend modules (config, jobs, engines, …).
+# Running ``python backend/server.py`` puts this directory on sys.path
+# automatically — Python prepends the executed script's directory — so the
+# sibling ``from config import …`` imports below resolve with no manual sys.path
+# insert. _BACKEND_DIR is still needed by the uvicorn reloader, which re-imports
+# "server" in a watcher subprocess and so needs the dir on PYTHONPATH (main()).
 _BACKEND_DIR = Path(__file__).resolve().parent
-if str(_BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(_BACKEND_DIR))
 
 from fastapi import FastAPI, HTTPException, Request, Response  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402

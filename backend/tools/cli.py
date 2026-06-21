@@ -1,7 +1,7 @@
 """Command-line driver for local testing.
 
-Usage (run from the ``backend/`` directory, matching the sibling-import
-bootstrap below):
+Run from the ``backend/`` directory so the flat sibling modules import — ``-m``
+puts the current directory on sys.path:
     .venv/bin/python -m tools.cli <url> [--model M] [--stems vocals,other]
 
 Runs the full pipeline (download -> separate -> chunk -> cache) without touching
@@ -12,18 +12,12 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
 import time
-from pathlib import Path
 
-_BACKEND_DIR = Path(__file__).resolve().parent.parent
-if str(_BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(_BACKEND_DIR))
-
-from config import SETTINGS  # noqa: E402
-from engines import get_engine  # noqa: E402
-from pipeline.cache import JobCache  # noqa: E402
-from pipeline.processor import Processor  # noqa: E402
+from config import SETTINGS
+from engines import get_engine
+from pipeline.cache import JobCache
+from pipeline.processor import Processor, RunHooks
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,7 +65,10 @@ def main() -> int:
         )
 
     key = processor.run(
-        args.url, model=model, keep_stems=keep_stems, on_progress=on_progress
+        args.url,
+        model=model,
+        keep_stems=keep_stems,
+        hooks=RunHooks(on_progress=on_progress),
     )
     meta = cache.load_meta(key)
     print(f"\ncache key:  {key}")
