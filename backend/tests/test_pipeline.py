@@ -670,6 +670,7 @@ def test_abandon_all_pushes_terminal_event_to_open_streams():
         snap = q.get_nowait()
         assert snap["state"] == "error"
         assert snap["job_id"] == "k1"
+        assert snap["error"] == "cache cleared"
     finally:
         loop.close()
 
