@@ -214,6 +214,10 @@ class _ProgressiveSource:
     def is_done(self) -> bool:
         return self._done.is_set()
 
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
     def cancel(self) -> None:
         """Ask the background download to stop. Idempotent; safe to call after
         completion (a no-op then). The download thread aborts at its next
@@ -730,8 +734,14 @@ class Processor:
 
         try:
             return _do(source_path)
+        except _DownloadCancelled:
+            raise  # intentional abort — not a slice failure; propagate quietly.
         except Exception:
             if dl is None:
+                raise
+            if dl.cancelled:
+                # The run is aborting and cancelled the download mid-slice;
+                # propagate rather than mislabelling it a benign rename race.
                 raise
             if dl.is_done():
                 # The download completed (and renamed the .part out from under
