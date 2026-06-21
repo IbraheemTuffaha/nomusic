@@ -53,6 +53,7 @@ async function load() {
 
     const select = $("model");
     select.innerHTML = "";
+    select.disabled = false; // re-enable after any prior offline render
     const models = caps.engine?.supported_models || [];
     const defaultModel = caps.engine?.default_model;
     for (const m of models) {
@@ -101,6 +102,14 @@ async function load() {
     $("statusText").textContent = "backend not reachable";
     $("err").textContent =
       "Start the backend: backend/.venv/bin/python backend/server.py";
+    // Disable the model/stem controls while offline. persist() already skips
+    // writing them when capsLoaded is false (so saved selections survive), but
+    // disabling stops the user making an edit here that would be silently
+    // dropped — and flashSaved() then only ever fires for a real write.
+    $("model").disabled = true;
+    for (const cb of $("stems").querySelectorAll('input[type="checkbox"]')) {
+      cb.disabled = true;
+    }
   }
 }
 
