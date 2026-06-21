@@ -21,7 +21,7 @@ def healthz() -> dict[str, bool]:
 
 
 @router.get("/capabilities")
-def capabilities(request: Request) -> JsonDict:
+def get_capabilities(request: Request) -> JsonDict:
     engine = request.app.state.engine
     caps = engine.capabilities()
     return {

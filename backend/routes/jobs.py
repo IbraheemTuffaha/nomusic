@@ -10,10 +10,13 @@ routes accept request bodies.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
+import socket
 from collections.abc import AsyncIterator
 from typing import Optional
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
@@ -40,6 +43,58 @@ _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 _SSE_DISCONNECT_POLL_SECONDS = 1.0
 
 
+def _resolve_host_ip_candidates(host: str) -> list:
+    """Every IP ``host`` could resolve to, for the SSRF block-list check.
+
+    Checking only ``ipaddress.ip_address(host)`` was bypassable: it parses just
+    canonical IPv4/IPv6, so decimal (``2130706433``), hex (``0x7f000001``), octal
+    (``0177.0.0.1``) and short-form (``127.1``) literals — and plain hostnames
+    that simply resolve to an internal IP — sailed through and yt-dlp would then
+    fetch e.g. 127.0.0.1 or the cloud-metadata address. We normalise all of those
+    to the real address instead. Raises ``ValueError`` for a hostname that won't
+    resolve (yt-dlp couldn't fetch it anyway).
+    """
+    try:
+        return [ipaddress.ip_address(host)]  # canonical literal
+    except ValueError:
+        pass
+    try:
+        # inet_aton normalises the non-canonical IPv4 encodings above
+        # (decimal/hex/octal/short-form) with no DNS lookup.
+        return [ipaddress.ip_address(socket.inet_aton(host))]
+    except OSError:
+        pass
+    # A real hostname: resolve it the way the fetch will.
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError, ValueError):
+        raise ValueError("url host could not be resolved")
+    candidates: list = []
+    for info in infos:
+        try:
+            candidates.append(ipaddress.ip_address(info[4][0]))
+        except ValueError:
+            # A non-IP addrinfo entry (not expected for SOCK_STREAM); skip it but
+            # log so a silent drop is at least traceable.
+            log.debug("skipping unparseable resolved address %r", info[4][0])
+    return candidates
+
+
+def _is_blocked_host_ip(ip) -> bool:
+    """True if ``ip`` is an internal/special address the backend must not fetch."""
+    # Unwrap IPv4-mapped IPv6 (::ffff:127.0.0.1) so the v4 rules apply.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_unspecified
+        or ip.is_multicast
+    )
+
+
 class ProcessRequest(BaseModel):
     url: str = Field(..., min_length=1)
     model: Optional[str] = None
@@ -52,11 +107,8 @@ class ProcessRequest(BaseModel):
         # so an unvalidated URL is an SSRF / local-file-read primitive: yt-dlp
         # will happily open file:// paths or fetch internal hosts and serve the
         # result back via /audio and /video. This tool only ever strips public
-        # web videos, so reject anything that isn't a public http(s) URL.
-        import ipaddress
-        import socket
-        from urllib.parse import urlsplit
-
+        # web videos, so reject anything that isn't a public http(s) URL whose
+        # host doesn't resolve to an internal address.
         v = v.strip()
         parts = urlsplit(v)
         if parts.scheme not in ("http", "https"):
@@ -67,53 +119,8 @@ class ProcessRequest(BaseModel):
         lowered = host.lower()
         if lowered == "localhost" or lowered.endswith(".localhost"):
             raise ValueError("url host is not allowed")
-
-        # Collect every IP the host could become, then block the internal ones.
-        # Checking only ipaddress.ip_address(host) was bypassable: it parses just
-        # canonical IPv4/IPv6, so decimal (http://2130706433/), hex
-        # (0x7f000001), octal (0177.0.0.1) and short-form (127.1) literals — and
-        # plain hostnames that simply resolve to an internal IP — sailed through
-        # and yt-dlp would then fetch e.g. 127.0.0.1 or the cloud-metadata
-        # address. We normalise all of those to the real address instead.
-        candidates: list = []
-        try:
-            candidates.append(ipaddress.ip_address(host))  # canonical literal
-        except ValueError:
-            try:
-                # inet_aton normalises the non-canonical IPv4 encodings above
-                # (decimal/hex/octal/short-form) with no DNS lookup.
-                candidates.append(ipaddress.ip_address(socket.inet_aton(host)))
-            except OSError:
-                # A real hostname: resolve it the way the fetch will. We reject
-                # an unresolvable host (yt-dlp couldn't fetch it anyway) rather
-                # than letting it through unchecked.
-                try:
-                    infos = socket.getaddrinfo(
-                        host, None, type=socket.SOCK_STREAM
-                    )
-                except (socket.gaierror, UnicodeError, ValueError):
-                    raise ValueError("url host could not be resolved")
-                for info in infos:
-                    try:
-                        candidates.append(ipaddress.ip_address(info[4][0]))
-                    except ValueError:
-                        # A non-IP addrinfo entry (not expected for SOCK_STREAM);
-                        # skip it but log so a silent drop is at least traceable.
-                        log.debug("skipping unparseable resolved address %r", info[4][0])
-                        continue
-
-        for ip in candidates:
-            # Unwrap IPv4-mapped IPv6 (::ffff:127.0.0.1) so the v4 rules apply.
-            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-                ip = ip.ipv4_mapped
-            if (
-                ip.is_loopback
-                or ip.is_private
-                or ip.is_link_local
-                or ip.is_reserved
-                or ip.is_unspecified
-                or ip.is_multicast
-            ):
+        for ip in _resolve_host_ip_candidates(host):
+            if _is_blocked_host_ip(ip):
                 raise ValueError("url host is not allowed")
         return v
 
