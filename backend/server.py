@@ -138,6 +138,7 @@ class ProcessRequest(BaseModel):
         # result back via /audio and /video. This tool only ever strips public
         # web videos, so reject anything that isn't a public http(s) URL.
         import ipaddress
+        import socket
         from urllib.parse import urlsplit
 
         v = v.strip()
@@ -150,18 +151,51 @@ class ProcessRequest(BaseModel):
         lowered = host.lower()
         if lowered == "localhost" or lowered.endswith(".localhost"):
             raise ValueError("url host is not allowed")
+
+        # Collect every IP the host could become, then block the internal ones.
+        # Checking only ipaddress.ip_address(host) was bypassable: it parses just
+        # canonical IPv4/IPv6, so decimal (http://2130706433/), hex
+        # (0x7f000001), octal (0177.0.0.1) and short-form (127.1) literals — and
+        # plain hostnames that simply resolve to an internal IP — sailed through
+        # and yt-dlp would then fetch e.g. 127.0.0.1 or the cloud-metadata
+        # address. We normalise all of those to the real address instead.
+        candidates: list = []
         try:
-            ip = ipaddress.ip_address(host)
+            candidates.append(ipaddress.ip_address(host))  # canonical literal
         except ValueError:
-            ip = None  # a hostname, not a literal IP — allowed.
-        if ip is not None and (
-            ip.is_loopback
-            or ip.is_private
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            raise ValueError("url host is not allowed")
+            try:
+                # inet_aton normalises the non-canonical IPv4 encodings above
+                # (decimal/hex/octal/short-form) with no DNS lookup.
+                candidates.append(ipaddress.ip_address(socket.inet_aton(host)))
+            except OSError:
+                # A real hostname: resolve it the way the fetch will. We reject
+                # an unresolvable host (yt-dlp couldn't fetch it anyway) rather
+                # than letting it through unchecked.
+                try:
+                    infos = socket.getaddrinfo(
+                        host, None, type=socket.SOCK_STREAM
+                    )
+                except (socket.gaierror, UnicodeError, ValueError):
+                    raise ValueError("url host could not be resolved")
+                for info in infos:
+                    try:
+                        candidates.append(ipaddress.ip_address(info[4][0]))
+                    except ValueError:
+                        continue
+
+        for ip in candidates:
+            # Unwrap IPv4-mapped IPv6 (::ffff:127.0.0.1) so the v4 rules apply.
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            if (
+                ip.is_loopback
+                or ip.is_private
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_unspecified
+                or ip.is_multicast
+            ):
+                raise ValueError("url host is not allowed")
         return v
 
     @field_validator("keep_stems")

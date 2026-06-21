@@ -83,10 +83,26 @@ def test_process_requires_url(client):
     assert client.post("/process", json={}).status_code == 422
 
 
-def test_process_request_url_validator():
+def test_process_request_url_validator(monkeypatch):
     # A page can drive /process, so the URL is an SSRF / local-file primitive:
     # only public http(s) URLs are allowed. (Unit-level so no worker is spawned.)
+    import socket as _socket
+
     from pydantic import ValidationError
+
+    # Hermetic DNS: hostnames resolve to whatever we map here (default public),
+    # so the test never touches the network. Literal/encoded IP hosts are
+    # checked without resolution, so they don't depend on this stub.
+    resolved = {
+        "evil-loopback.test": "127.0.0.1",      # a name that points at loopback
+        "evil-metadata.test": "169.254.169.254",  # ...or the metadata endpoint
+    }
+
+    def _fake_getaddrinfo(host, *args, **kwargs):
+        ip = resolved.get(host, "93.184.216.34")  # default: a real public IP
+        return [(_socket.AF_INET, _socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+    monkeypatch.setattr(_socket, "getaddrinfo", _fake_getaddrinfo)
 
     assert server.ProcessRequest(url="https://www.youtube.com/watch?v=abc").url
     assert server.ProcessRequest(url="http://example.com/v").url
@@ -98,6 +114,14 @@ def test_process_request_url_validator():
         "http://192.168.1.5/x",  # private network (SSRF)
         "http://169.254.169.254/latest/meta-data",  # link-local metadata
         "http://[::1]/x",
+        "http://[::ffff:127.0.0.1]/x",  # IPv4-mapped IPv6 loopback
+        "http://2130706433/x",          # decimal-encoded 127.0.0.1
+        "http://0x7f000001/x",          # hex-encoded 127.0.0.1
+        "http://0177.0.0.1/x",          # octal-encoded 127.0.0.1
+        "http://127.1/x",               # short-form 127.0.0.1
+        "http://2852039166/x",          # decimal-encoded 169.254.169.254
+        "http://evil-loopback.test/x",  # hostname resolving to loopback
+        "http://evil-metadata.test/x",  # hostname resolving to metadata IP
     ):
         with pytest.raises(ValidationError):
             server.ProcessRequest(url=bad)
@@ -105,7 +129,14 @@ def test_process_request_url_validator():
 
 def test_process_rejects_non_public_url_returns_422(client):
     # The HTTP layer surfaces a rejected URL as a 422 (before any worker spawns).
-    for url in ("file:///etc/passwd", "http://127.0.0.1/x", "http://localhost/x"):
+    # The encoded-loopback form is the regression that motivated tightening the
+    # validator; it must 422 like the canonical loopback literal does.
+    for url in (
+        "file:///etc/passwd",
+        "http://127.0.0.1/x",
+        "http://localhost/x",
+        "http://2130706433/x",
+    ):
         resp = client.post("/process", json={"url": url, "keep_stems": ["vocals"]})
         assert resp.status_code == 422, url
 
