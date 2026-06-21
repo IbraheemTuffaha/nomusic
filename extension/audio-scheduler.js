@@ -202,10 +202,7 @@ export class AudioScheduler {
     src._nomusicStartedAt = when;
     src._nomusicOffsetAtStart = offset;
     src._nomusicPlayDur = playDur;
-    src.onended = () => {
-      this.activeSources.delete(src);
-      if (this._srcByIdx.get(idx) === src) this._srcByIdx.delete(idx);
-    };
+    src.onended = () => this._onSourceEnded(src, idx);
     try {
       src.start(when, offset, playDur);
     } catch (err) {
@@ -318,6 +315,24 @@ export class AudioScheduler {
     return null;
   }
 
+  /** A scheduled source finished. Drop it from the active sets, and — if it
+   *  ended naturally with nothing left playing — pull in the next look-ahead
+   *  window immediately. reschedule() only schedules chunks within 30s of the
+   *  clock, and chunks are exactly stride-length, so the window's last source
+   *  ends precisely when the next chunk should begin; without this the only
+   *  catch-up is the ~250ms sync tick, which drops up to a tick of audio at
+   *  every ~30s boundary on fully-buffered (cached/finished) playback. */
+  _onSourceEnded(src, idx) {
+    this.activeSources.delete(src);
+    if (this._srcByIdx.get(idx) === src) this._srcByIdx.delete(idx);
+    // Stopped by us (seek/pause/rate change): the matching handler already
+    // reschedules, so don't double up — and don't fight a pause.
+    if (src._nomusicStopped) return;
+    if (!this.disposed && !this.video.paused && this.activeSources.size === 0) {
+      this.reschedule();
+    }
+  }
+
   reschedule() {
     if (this.disposed) return;
     this.stopAll();
@@ -338,6 +353,9 @@ export class AudioScheduler {
 
   stopAll() {
     for (const src of this.activeSources) {
+      // Mark before stopping so the (async) onended knows this was an
+      // intentional stop and must not trigger a boundary continuation.
+      src._nomusicStopped = true;
       try {
         src.stop();
       } catch (err) {

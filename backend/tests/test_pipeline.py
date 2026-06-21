@@ -40,12 +40,77 @@ def test_plan_chunks_covers_full_duration():
     assert plans[1].start < plans[0].end
 
 
+def test_plan_chunks_covers_tail_shorter_than_overlap():
+    # Regression: with stride-length play windows, a duration whose remainder
+    # past the last full stride is <= overlap_seconds used to drop the final
+    # chunk (count was ceil((duration - overlap)/stride)), leaving the tail with
+    # no playback audio — and that short result got cached + spliced into every
+    # export. Production defaults: chunk=10, overlap=0.5 -> stride=9.5.
+    # 95.3 / 9.5 = 10.03, so the 11th chunk (covering 95.0..95.3) is required.
+    plans = plan_chunks(duration=95.3, chunk_seconds=10.0, overlap_seconds=0.5)
+    assert len(plans) == 11
+    assert math.isclose(plans[-1].play_end, 95.3, abs_tol=1e-6)
+    # Full, gap-free coverage of the timeline.
+    coverage = sum(p.play_end - p.play_start for p in plans)
+    assert math.isclose(coverage, 95.3, rel_tol=1e-6, abs_tol=1e-6)
+    # No degenerate (zero-length) final chunk.
+    assert plans[-1].play_end > plans[-1].play_start
+
+
+def test_plan_chunks_exact_multiple_has_no_extra_chunk():
+    # When duration is an exact multiple of the stride, the count must not gain
+    # a spurious zero-length chunk from float rounding. stride = 9.5, so 95.0 is
+    # exactly 10 strides.
+    plans = plan_chunks(duration=95.0, chunk_seconds=10.0, overlap_seconds=0.5)
+    assert len(plans) == 10
+    assert math.isclose(plans[-1].play_end, 95.0, abs_tol=1e-6)
+
+
 def test_plan_chunks_rejects_overlap_eq_chunk():
     try:
         plan_chunks(duration=10.0, chunk_seconds=2.0, overlap_seconds=2.0)
     except ValueError:
         return
     raise AssertionError("expected ValueError for overlap == chunk")
+
+
+def test_mix_stems_gain_is_uniform_when_peak_would_clip():
+    # When the loudness boost would push the peak past unity, the gain must stay
+    # a single uniform factor (capped by headroom), NOT the old whole-chunk tanh
+    # that attenuated quiet samples and pumped levels at chunk seams. Here the
+    # kept stem peaks at 0.9 and the full mix is 2x as loud, so the naive 2x
+    # boost would clip; headroom caps it to 0.99/0.9 = 1.1.
+    vocals = np.array([[0.9, 0.9], [0.3, 0.3], [0.1, 0.1]], dtype=np.float32)
+    stems = {
+        "vocals": vocals,
+        "other": vocals.copy(),  # full mix = 2x vocals -> full/kept RMS = 2
+        "drums": np.zeros_like(vocals),
+        "bass": np.zeros_like(vocals),
+    }
+    out = Processor._mix_stems(stems, ["vocals"])
+    # Uniform gain: every sample scaled by the same factor (no nonlinearity).
+    ratios = out[vocals != 0] / vocals[vocals != 0]
+    assert np.allclose(ratios, ratios[0], rtol=1e-5), ratios
+    # ...and that factor parks the peak just under full scale, not below it.
+    assert abs(float(np.abs(out).max()) - 0.99) < 1e-4
+    assert np.isclose(ratios[0], 1.1, rtol=1e-4)
+
+
+def test_mix_stems_clips_only_already_hot_samples():
+    # A chunk already past full scale before any boost (boost can't help without
+    # attenuating) gets a plain per-sample clip — the hot sample is clamped, the
+    # quiet ones are left exactly as-is (no global gain change).
+    vocals = np.array([[1.5, 1.5], [0.1, 0.1]], dtype=np.float32)
+    stems = {
+        "vocals": vocals,
+        "other": np.zeros_like(vocals),  # full mix == kept -> boost = 1.0
+        "drums": np.zeros_like(vocals),
+        "bass": np.zeros_like(vocals),
+    }
+    out = Processor._mix_stems(stems, ["vocals"])
+    assert float(np.abs(out).max()) <= 0.999 + 1e-6
+    assert np.isclose(out[0, 0], 0.999, atol=1e-4)  # hot sample clamped
+    assert np.isclose(out[1, 0], 0.1, atol=1e-6)    # quiet sample untouched
 
 
 class _FakeEngine(Engine):
@@ -258,6 +323,61 @@ def test_processor_progressive_produces_correct_chunks(tmp_path, monkeypatch):
         assert path.exists()
         info = sf.info(str(path))
         assert abs(info.duration - (plan.play_end - plan.play_start)) < 0.05
+
+
+def test_progressive_source_cancel_unblocks_source_for(tmp_path):
+    # An abort must release a source_for() that's blocked waiting for bytes, so
+    # an abandoned/failed run doesn't keep the GPU lock until the download lands
+    # (and the orphaned yt-dlp keeps going). cancel() makes the wait raise.
+    from pipeline.processor import (
+        ChunkPlan,
+        _DownloadCancelled,
+        _ProgressiveSource,
+    )
+
+    dl = _ProgressiveSource(
+        "fake://v", tmp_path, duration=100.0, ui_hook=None, fetcher=None
+    )
+    # Never start the download thread: available_seconds() stays 0, so source_for
+    # would otherwise block until the (nonexistent) download advances.
+    dl.cancel()
+    plan = ChunkPlan(index=5, start=50.0, end=60.0, play_start=50.0, play_end=60.0)
+    with pytest.raises(_DownloadCancelled):
+        dl.source_for(plan, overlap=0.5)
+
+
+def test_source_fetcher_download_propagates_cancel_without_retry(tmp_path, monkeypatch):
+    # When the progress hook raises DownloadCancelled to abort an in-flight
+    # download, SourceFetcher.download must propagate it — NOT catch it in the
+    # retry-clean handler and start a fresh download of the very thing we're
+    # cancelling (which is what produced the stray re-download + traceback on a
+    # page-close mid-download).
+    from pipeline import downloader
+    from pipeline.downloader import DownloadCancelled, SourceFetcher
+
+    class _FakeYDL:
+        def add_progress_hook(self, hook):
+            pass
+
+        def process_ie_result(self, info, download):
+            raise DownloadCancelled()
+
+        def close(self):
+            pass
+
+    retried: list[bool] = []
+    monkeypatch.setattr(
+        downloader, "download_source", lambda *a, **k: retried.append(True)
+    )
+
+    f = SourceFetcher("https://example.com/v", tmp_path)
+    f._ydl = _FakeYDL()
+    f._info = {"id": "v"}
+    f._cached = None
+
+    with pytest.raises(DownloadCancelled):
+        f.download(progress_hook=None)
+    assert retried == []  # no clean-retry download was kicked off
 
 
 def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
@@ -557,6 +677,40 @@ def test_abandon_all_signals_workers_and_clears_state():
     assert registry._subscribers == {}
     assert registry._last_disconnect_at == {}
     assert registry._abandoning == {"k1", "k2"}
+
+
+def test_abandon_all_pushes_terminal_event_to_open_streams():
+    # /cache/clear must send a terminal event to each open /events stream so the
+    # client's EventSource closes instead of hanging on keep-alives forever.
+    import asyncio
+
+    from jobs import JobRegistry, JobState, JobStatus
+
+    registry = JobRegistry(processor=None, cache=None)
+    loop = asyncio.new_event_loop()
+    try:
+        registry.attach_loop(loop)
+        q: asyncio.Queue = asyncio.Queue()
+        registry._jobs["k1"] = JobStatus(job_id="k1", state=JobState.PROCESSING)
+        registry._subscribers["k1"] = [q]
+
+        registry.abandon_all()
+
+        # Run the loop briefly so the scheduled cross-thread put_nowait executes.
+        loop.call_soon(loop.stop)
+        loop.run_forever()
+
+        assert not q.empty(), "open stream got no terminal event"
+        snap = q.get_nowait()
+        assert snap["state"] == "error"
+        assert snap["job_id"] == "k1"
+        assert snap["error"] == "cache cleared"
+    finally:
+        loop.close()
+
+    # State maps are still wiped (same as the no-subscriber path).
+    assert registry._jobs == {}
+    assert registry._subscribers == {}
 
 
 def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):

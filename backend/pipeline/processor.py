@@ -37,6 +37,7 @@ from engines.base import Engine
 
 from .cache import CacheMeta, JobCache
 from .downloader import (
+    DownloadCancelled as _DownloadCancelled,
     SourceFetcher,
     VideoMetadata,
     download_source,
@@ -128,7 +129,15 @@ def plan_chunks(
         )
 
     stride = chunk_seconds - overlap_seconds
-    total = max(1, math.ceil((duration - overlap_seconds) / stride))
+    # Each chunk plays exactly ``stride`` video-seconds (play_end = play_start +
+    # stride), so covering the whole timeline needs ceil(duration / stride)
+    # windows. (The older ``(duration - overlap_seconds)`` numerator matched a
+    # scheme where play windows were a full chunk_seconds long; with
+    # stride-length windows it drops the final chunk whenever ``duration mod
+    # stride`` lands in (0, overlap_seconds], leaving the tail with no playback
+    # audio.) The tiny epsilon keeps a duration that is an exact multiple of the
+    # stride from spilling into an extra zero-length chunk on float rounding.
+    total = max(1, math.ceil(duration / stride - 1e-9))
     plans: list[ChunkPlan] = []
     for i in range(total):
         play_start = i * stride
@@ -180,6 +189,10 @@ class _ProgressiveSource:
         self._final: Optional[Path] = None
         self._error: Optional[BaseException] = None
         self._done = threading.Event()
+        # Set to abort the download (orphaned yt-dlp on idle-abandon, or a run
+        # that's failing/unwinding). Checked in the progress hook and the
+        # per-chunk wait so both the network half and a blocked decode release.
+        self._cancel = threading.Event()
         self._logged_size = False
         self._thread = threading.Thread(
             target=self._run, name="nomusic-progressive-dl", daemon=True
@@ -195,7 +208,21 @@ class _ProgressiveSource:
     def is_done(self) -> bool:
         return self._done.is_set()
 
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def cancel(self) -> None:
+        """Ask the background download to stop. Idempotent; safe to call after
+        completion (a no-op then). The download thread aborts at its next
+        progress callback and any chunk waiting in ``source_for`` is released."""
+        self._cancel.set()
+
     def _hook(self, d: dict) -> None:
+        # Raising from a yt-dlp progress hook aborts the download — that's how a
+        # cancel reaches the network thread.
+        if self._cancel.is_set():
+            raise _DownloadCancelled()
         try:
             if self._ui_hook:
                 self._ui_hook(d)
@@ -278,6 +305,8 @@ class _ProgressiveSource:
         needed = plan.end + overlap + _PROGRESSIVE_MARGIN_SECONDS
         waits = 0
         while not self._done.is_set() and self.available_seconds() < needed:
+            if self._cancel.is_set():
+                raise _DownloadCancelled()
             self.raise_if_error()
             if abort_check:
                 abort_check()
@@ -616,8 +645,20 @@ class Processor:
                     write_futures.pop(0).result()
             for f in write_futures:
                 f.result()
+        except BaseException:
+            # Abandon (idle), engine failure, or any other abort: stop the
+            # background download so it doesn't keep running (orphaned yt-dlp)
+            # and so a decode thread blocked in source_for waiting for bytes is
+            # released — otherwise the GPU lock stays held until the download
+            # happens to land.
+            if dl is not None:
+                dl.cancel()
+            raise
         finally:
-            decode_pool.shutdown(wait=True)
+            # cancel_futures drops decodes still queued behind a cancel; the
+            # in-flight one is released by dl.cancel() above. Writes drain
+            # (wait, no cancel) so any already-separated chunk still lands.
+            decode_pool.shutdown(wait=True, cancel_futures=True)
             write_pool.shutdown(wait=True)
             _log_duty()
 
@@ -687,8 +728,14 @@ class Processor:
 
         try:
             return _do(source_path)
+        except _DownloadCancelled:
+            raise  # intentional abort — not a slice failure; propagate quietly.
         except Exception:
             if dl is None:
+                raise
+            if dl.cancelled:
+                # The run is aborting and cancelled the download mid-slice;
+                # propagate rather than mislabelling it a benign rename race.
                 raise
             if dl.is_done():
                 # The download completed (and renamed the .part out from under
@@ -776,14 +823,23 @@ class Processor:
         # which is below the threshold where typical listeners notice level
         # shifts at scene boundaries.
         boost = min(2.0, max(1.0, full_rms / kept_rms))
-        if boost > 1.0:
+
+        # Fold headroom into the gain instead of soft-clipping after the fact.
+        # The old approach rescaled the WHOLE chunk by 1/peak and ran it through
+        # tanh — a nonlinearity that attenuates quiet samples too, so a chunk
+        # that happened to peak high dropped several dB below its neighbours
+        # (audible loudness pumping at the 10 s seams). Capping the boost so the
+        # peak can't exceed ~unity keeps the gain a single uniform factor across
+        # the chunk, so adjacent chunks stay level-matched.
+        peak = float(np.abs(mix).max() or 1.0)
+        boost = max(1.0, min(boost, 0.99 / peak))
+        if boost != 1.0:
             mix = mix * boost
 
-        # Soft-clip if the boost pushed past unity. tanh preserves loud-
-        # passage character without audible square-wave clipping.
-        peak = float(np.abs(mix).max() or 1.0)
-        if peak > 0.99:
-            mix = np.tanh(mix / peak) * 0.99
+        # Safety clip only for the rare chunk already past full scale before any
+        # boost (boost can't fix that without attenuating). Clamps isolated
+        # samples without touching the rest of the chunk.
+        np.clip(mix, -0.999, 0.999, out=mix)
         return mix
 
     def _write_chunk(

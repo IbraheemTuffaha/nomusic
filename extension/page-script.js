@@ -55,3 +55,30 @@
     },
   });
 })();
+
+// Bridge: answer the content script's request for the currently-playing
+// video's URL. The isolated content-script world can't call YouTube's player
+// API, but this MAIN-world script can. The content script dispatches
+// `nomusic:resolve-source-url` on document and reads the answer back from a
+// documentElement attribute synchronously (event dispatch runs listeners
+// inline). This is how starting nomusic from the miniplayer captures the video
+// that's playing rather than the page the user is browsing — window.location
+// points at the latter. Non-YouTube pages have no player here, so the attribute
+// is set empty and the content script falls back to the page URL.
+(function () {
+  if (window.__nomusicSourceUrlBridge) return;
+  window.__nomusicSourceUrlBridge = true;
+
+  document.addEventListener("nomusic:resolve-source-url", () => {
+    let url = "";
+    try {
+      const player = document.getElementById("movie_player");
+      const id = player && player.getVideoData && player.getVideoData().video_id;
+      if (id) url = "https://www.youtube.com/watch?v=" + id;
+      else if (player && player.getVideoUrl) url = player.getVideoUrl() || "";
+    } catch (err) {
+      console.debug("[nomusic] resolve-source-url failed", err);
+    }
+    document.documentElement.setAttribute("data-nomusic-source-url", url);
+  });
+})();

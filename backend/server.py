@@ -76,6 +76,39 @@ _STREAM_BLOCK_BYTES = 65536
 _FFMPEG_TIMEOUT_SECONDS = 3600.0
 
 
+def _raise_open_file_limit() -> None:
+    """Lift this process's open-file soft limit toward its hard limit.
+
+    The MP3/MP4 export opens one ffmpeg ``-i`` input per chunk (pipeline/export.py),
+    so a long video — a 45-min track is ~285 chunks at the default 9.5 s stride —
+    can blow past the macOS default soft limit of 256 file descriptors and fail
+    the export with an opaque ffmpeg error. ffmpeg inherits this process's
+    rlimits, so raising the limit here covers the spawned subprocess too.
+    Best-effort: any failure just leaves the default in place.
+    """
+    try:
+        import resource
+    except ImportError:
+        return  # non-POSIX (Windows): no rlimits, and unsupported anyway.
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):
+        return
+    # 8192 is comfortably above any realistic chunk count and well under macOS's
+    # per-process ceiling (kern.maxfilesperproc); macOS also rejects an infinite
+    # NOFILE, so cap to the concrete hard limit when it isn't unlimited.
+    target = 8192
+    if hard != resource.RLIM_INFINITY:
+        target = min(target, hard)
+    if soft >= target:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        log.info("Raised open-file soft limit %d -> %d", soft, target)
+    except (ValueError, OSError):
+        log.debug("could not raise open-file limit from %d", soft, exc_info=True)
+
+
 def _configure_logging() -> None:
     """Set up root logging once, at app/CLI startup rather than import time.
 
@@ -95,6 +128,75 @@ class ProcessRequest(BaseModel):
     url: str = Field(..., min_length=1)
     model: Optional[str] = None
     keep_stems: Optional[list[str]] = None
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: str) -> str:
+        # A web page can drive /process (the content script posts the page URL),
+        # so an unvalidated URL is an SSRF / local-file-read primitive: yt-dlp
+        # will happily open file:// paths or fetch internal hosts and serve the
+        # result back via /audio and /video. This tool only ever strips public
+        # web videos, so reject anything that isn't a public http(s) URL.
+        import ipaddress
+        import socket
+        from urllib.parse import urlsplit
+
+        v = v.strip()
+        parts = urlsplit(v)
+        if parts.scheme not in ("http", "https"):
+            raise ValueError("url must be an http(s) URL")
+        host = parts.hostname
+        if not host:
+            raise ValueError("url must include a host")
+        lowered = host.lower()
+        if lowered == "localhost" or lowered.endswith(".localhost"):
+            raise ValueError("url host is not allowed")
+
+        # Collect every IP the host could become, then block the internal ones.
+        # Checking only ipaddress.ip_address(host) was bypassable: it parses just
+        # canonical IPv4/IPv6, so decimal (http://2130706433/), hex
+        # (0x7f000001), octal (0177.0.0.1) and short-form (127.1) literals — and
+        # plain hostnames that simply resolve to an internal IP — sailed through
+        # and yt-dlp would then fetch e.g. 127.0.0.1 or the cloud-metadata
+        # address. We normalise all of those to the real address instead.
+        candidates: list = []
+        try:
+            candidates.append(ipaddress.ip_address(host))  # canonical literal
+        except ValueError:
+            try:
+                # inet_aton normalises the non-canonical IPv4 encodings above
+                # (decimal/hex/octal/short-form) with no DNS lookup.
+                candidates.append(ipaddress.ip_address(socket.inet_aton(host)))
+            except OSError:
+                # A real hostname: resolve it the way the fetch will. We reject
+                # an unresolvable host (yt-dlp couldn't fetch it anyway) rather
+                # than letting it through unchecked.
+                try:
+                    infos = socket.getaddrinfo(
+                        host, None, type=socket.SOCK_STREAM
+                    )
+                except (socket.gaierror, UnicodeError, ValueError):
+                    raise ValueError("url host could not be resolved")
+                for info in infos:
+                    try:
+                        candidates.append(ipaddress.ip_address(info[4][0]))
+                    except ValueError:
+                        continue
+
+        for ip in candidates:
+            # Unwrap IPv4-mapped IPv6 (::ffff:127.0.0.1) so the v4 rules apply.
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            if (
+                ip.is_loopback
+                or ip.is_private
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_unspecified
+                or ip.is_multicast
+            ):
+                raise ValueError("url host is not allowed")
+        return v
 
     @field_validator("keep_stems")
     @classmethod
@@ -321,6 +423,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     _configure_logging()
+    _raise_open_file_limit()
     app = FastAPI(title="nomusic", version="0.2.0", lifespan=lifespan)
 
     # SECURITY INVARIANT: allow_origins='*' with no auth is only safe because
