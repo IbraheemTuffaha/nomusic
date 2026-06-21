@@ -141,6 +141,56 @@ def test_process_rejects_non_public_url_returns_422(client):
         assert resp.status_code == 422, url
 
 
+def test_raise_open_file_limit_lifts_soft_toward_target(monkeypatch):
+    # macOS-style low soft, high hard: soft is raised to the 8192 target while
+    # the hard limit is passed through untouched.
+    import resource
+
+    recorded = {}
+    monkeypatch.setattr(resource, "getrlimit", lambda which: (256, 1_000_000))
+    monkeypatch.setattr(
+        resource, "setrlimit", lambda which, limits: recorded.__setitem__("l", limits)
+    )
+    server._raise_open_file_limit()
+    assert recorded["l"] == (8192, 1_000_000)
+
+
+def test_raise_open_file_limit_caps_at_finite_hard(monkeypatch):
+    # The soft limit can't exceed the hard limit, so the target is clamped to it.
+    import resource
+
+    recorded = {}
+    monkeypatch.setattr(resource, "getrlimit", lambda which: (256, 512))
+    monkeypatch.setattr(
+        resource, "setrlimit", lambda which, limits: recorded.__setitem__("l", limits)
+    )
+    server._raise_open_file_limit()
+    assert recorded["l"] == (512, 512)
+
+
+def test_raise_open_file_limit_noop_when_soft_already_high(monkeypatch):
+    # Already at/above the target: no setrlimit call (don't lower it, don't churn).
+    import resource
+
+    called = []
+    monkeypatch.setattr(resource, "getrlimit", lambda which: (8192, 8192))
+    monkeypatch.setattr(resource, "setrlimit", lambda which, limits: called.append(limits))
+    server._raise_open_file_limit()
+    assert called == []
+
+
+def test_raise_open_file_limit_is_best_effort(monkeypatch):
+    # A setrlimit failure (e.g. sandboxed host) must not propagate out of startup.
+    import resource
+
+    def boom(which, limits):
+        raise OSError("denied")
+
+    monkeypatch.setattr(resource, "getrlimit", lambda which: (256, 1_000_000))
+    monkeypatch.setattr(resource, "setrlimit", boom)
+    server._raise_open_file_limit()  # must not raise
+
+
 def test_chunk_unknown_job_is_404(client):
     assert client.get("/chunk/nope/0").status_code == 404
 
