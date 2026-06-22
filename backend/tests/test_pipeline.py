@@ -24,7 +24,7 @@ from pipeline.export import (
     mux_video_cmd,
     snapshot_chunk_files,
 )
-from pipeline.processor import Processor, plan_chunks
+from pipeline.processor import Processor, RunHooks, plan_chunks
 
 
 def test_plan_chunks_covers_full_duration():
@@ -230,7 +230,7 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
         "fake://video",
         model="fake",
         keep_stems=["vocals", "other"],
-        on_progress=_progress,
+        hooks=RunHooks(on_progress=_progress),
     )
 
     meta = cache.load_meta(key)
@@ -426,7 +426,7 @@ def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
         ),
     )
 
-    k, meta, info, returned_plans, fetcher = processor.prepare(
+    k, meta, info, returned_plans, fetcher = processor.prepare_job(
         "fake://video", model="fake", keep_stems=["vocals"]
     )
     assert k == key

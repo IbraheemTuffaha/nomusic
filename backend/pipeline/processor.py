@@ -70,7 +70,7 @@ DownloadProgressCb = Callable[[float | None], None]
 
 # (info, plans, meta) fired once the probe completes — gives jobs.py enough
 # data to surface title / duration / total_chunks in /status.
-ProbedCb = Callable[["VideoMetadata", list, CacheMeta], None]
+ProbedCb = Callable[["VideoMetadata", "list[ChunkPlan]", CacheMeta], None]
 
 # Returns the next chunk index to process, or ``None`` when the work queue
 # is exhausted. When the caller supplies one, the processor lets it drive
@@ -78,6 +78,35 @@ ProbedCb = Callable[["VideoMetadata", list, CacheMeta], None]
 # seeked-to position first, loop back to earlier chunks after". When None,
 # the processor uses its own internal FIFO over the plan list.
 NextChunkProvider = Callable[[], Optional[int]]
+
+
+@dataclass
+class RunHooks:
+    """Optional caller-supplied observation + control hooks for :meth:`Processor.run`.
+
+    Bundles the run's hook surface so the orchestrator takes one ``hooks``
+    argument instead of a long tail of optional callbacks. All default to
+    ``None`` (no-op): jobs.py wires the live ones to drive /status and chunk
+    ordering, while the CLI and most tests pass none.
+
+    * ``on_probed`` — fired once the probe resolves (title/duration/total_chunks).
+    * ``on_progress`` — separation progress (``meta``, ``phase``).
+    * ``on_download_progress`` — source-download fraction 0..1 (``None`` if size
+      unknown).
+    * ``next_chunk_provider`` — caller-driven chunk ordering (e.g. seek-first);
+      when ``None`` the processor uses a FIFO over remaining chunks.
+    * ``abort_check`` — raises to abort; polled during long waits (the
+      progressive-download gate has no chunk boundary to abort at otherwise).
+    * ``on_wait_for_download`` — fired while a chunk blocks on the progressive
+      download, with the current download fraction.
+    """
+
+    on_probed: ProbedCb | None = None
+    on_progress: ProgressCb | None = None
+    on_download_progress: DownloadProgressCb | None = None
+    next_chunk_provider: NextChunkProvider | None = None
+    abort_check: Callable[[], None] | None = None
+    on_wait_for_download: Callable[[float | None], None] | None = None
 
 
 @dataclass
@@ -347,7 +376,7 @@ class Processor:
 
     # -- planning ------------------------------------------------------------
 
-    def prepare(
+    def prepare_job(
         self,
         url: str,
         *,
@@ -433,28 +462,28 @@ class Processor:
         *,
         model: str,
         keep_stems: list[str],
-        on_probed: ProbedCb | None = None,
-        on_progress: ProgressCb | None = None,
-        on_download_progress: DownloadProgressCb | None = None,
-        next_chunk_provider: NextChunkProvider | None = None,
-        abort_check: Callable[[], None] | None = None,
-        on_wait_for_download: Callable[[float | None], None] | None = None,
+        hooks: RunHooks | None = None,
     ) -> str:
         """Run the full chunked pipeline. Returns the cache key.
 
         Safe to call on an already-cached job: missing chunks are filled in,
         and a fully-cached job returns immediately.
 
-        ``next_chunk_provider`` lets the caller drive chunk order (e.g.
-        prioritize chunks near the user's seek position); when None the
-        processor falls back to a simple FIFO over remaining chunks.
-
-        ``abort_check``, when supplied, is called periodically during any wait
-        (notably the progressive-download gate); it should raise to abort the
-        run. The provider raising is the normal abort path between chunks, but
-        a long download has no chunk boundary, so this gives one there too.
+        ``hooks`` carries the optional observation + control callbacks (probe,
+        progress, chunk ordering, abort); see :class:`RunHooks`. The CLI and
+        tests usually pass none; jobs.py wires the live ones.
         """
-        key, meta, info, plans, fetcher = self.prepare(
+        hooks = hooks or RunHooks()
+        # Unpack into locals so the pipeline body below reads unchanged — RunHooks
+        # only collapses the long optional-callback tail in the signature.
+        on_probed = hooks.on_probed
+        on_progress = hooks.on_progress
+        on_download_progress = hooks.on_download_progress
+        next_chunk_provider = hooks.next_chunk_provider
+        abort_check = hooks.abort_check
+        on_wait_for_download = hooks.on_wait_for_download
+
+        key, meta, info, plans, fetcher = self.prepare_job(
             url, model=model, keep_stems=keep_stems
         )
         if on_probed:
@@ -924,10 +953,9 @@ def _encode_opus(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
         str(out_path),
     ]
     try:
-        subprocess.run(
+        proc = subprocess.run(
             cmd,
             input=wav_buf.getvalue(),
-            check=True,
             capture_output=True,
             timeout=_OPUS_ENCODE_TIMEOUT_SECONDS,
         )
@@ -935,3 +963,8 @@ def _encode_opus(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
         raise RuntimeError(
             f"opus encode timed out after {_OPUS_ENCODE_TIMEOUT_SECONDS:.0f}s"
         ) from exc
+    # Decode stderr into the error (mirrors slice_source / _run_ffmpeg) so an
+    # encode failure carries ffmpeg's actual message, not a bare exit code.
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip() or "(no stderr)"
+        raise RuntimeError(f"opus encode failed (exit {proc.returncode}): {detail}")

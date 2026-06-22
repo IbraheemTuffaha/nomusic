@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 import server
 from engines.base import Engine, EngineCapabilities, SeparationResult
+from routes.jobs import ProcessRequest
 
 
 class _CapsOnlyEngine(Engine):
@@ -104,8 +105,8 @@ def test_process_request_url_validator(monkeypatch):
 
     monkeypatch.setattr(_socket, "getaddrinfo", _fake_getaddrinfo)
 
-    assert server.ProcessRequest(url="https://www.youtube.com/watch?v=abc").url
-    assert server.ProcessRequest(url="http://example.com/v").url
+    assert ProcessRequest(url="https://www.youtube.com/watch?v=abc").url
+    assert ProcessRequest(url="http://example.com/v").url
     for bad in (
         "file:///etc/passwd",   # local-file read via yt-dlp
         "ftp://example.com/x",  # non-http(s) scheme
@@ -124,7 +125,7 @@ def test_process_request_url_validator(monkeypatch):
         "http://evil-metadata.test/x",  # hostname resolving to metadata IP
     ):
         with pytest.raises(ValidationError):
-            server.ProcessRequest(url=bad)
+            ProcessRequest(url=bad)
 
 
 def test_process_rejects_non_public_url_returns_422(client):

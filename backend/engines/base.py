@@ -51,8 +51,8 @@ class Engine(ABC):
     """Source-separation engine contract.
 
     An engine wraps a single backend (MLX, ONNX, ...). It is responsible for
-    loading model weights, running inference, and writing per-stem WAVs to a
-    directory chosen by the caller.
+    loading model weights and running inference, returning the separated stems
+    as in-memory arrays (see :class:`SeparationResult`) — no disk I/O.
     """
 
     @abstractmethod

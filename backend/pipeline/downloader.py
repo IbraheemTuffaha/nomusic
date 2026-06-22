@@ -67,6 +67,21 @@ _BYTES_PER_KB = 1024
 _BYTES_PER_MB = _BYTES_PER_KB * _BYTES_PER_KB
 
 
+def _emit_finished_progress(progress_hook: ProgressHook | None, size_bytes: int) -> None:
+    """Synthesize a yt-dlp ``finished`` progress event for a cache hit, so a
+    caller driving a UI bar jumps to 100% without special-casing the no-download
+    path. Best-effort: a hook that raises must not break the (already-complete)
+    fetch."""
+    if not progress_hook:
+        return
+    try:
+        progress_hook(
+            {"status": "finished", "downloaded_bytes": size_bytes, "total_bytes": size_bytes}
+        )
+    except Exception:  # never let a UI hook break the pipeline
+        log.debug("cache-hit progress hook raised", exc_info=True)
+
+
 def _common_opts() -> dict[str, Any]:
     """Options shared by ``probe`` and the source/video download helpers.
 
@@ -194,19 +209,7 @@ def download_source(
     existing = _find_source(out_dir)
     if existing is not None:
         log.info("Using cached source audio: %s", existing.name)
-        if progress_hook:
-            # Synthesize a "finished" event so callers driving a UI bar can
-            # jump to 100% on a cache hit without special-casing.
-            try:
-                progress_hook(
-                    {
-                        "status": "finished",
-                        "downloaded_bytes": existing.stat().st_size,
-                        "total_bytes": existing.stat().st_size,
-                    }
-                )
-            except Exception:  # never let a UI hook break the pipeline
-                log.debug("source cache-hit progress hook raised", exc_info=True)
+        _emit_finished_progress(progress_hook, existing.stat().st_size)
         return existing
 
     from yt_dlp import YoutubeDL
@@ -281,14 +284,7 @@ def download_video(
     existing = _find_video(out_dir)
     if existing is not None:
         log.info("Using cached video: %s", existing.name)
-        if progress_hook:
-            try:
-                size = existing.stat().st_size
-                progress_hook(
-                    {"status": "finished", "downloaded_bytes": size, "total_bytes": size}
-                )
-            except Exception:  # never let a UI hook break the download
-                log.debug("video cache-hit progress hook raised", exc_info=True)
+        _emit_finished_progress(progress_hook, existing.stat().st_size)
         return existing
 
     from yt_dlp import YoutubeDL
@@ -413,14 +409,7 @@ class SourceFetcher:
     def download(self, progress_hook: ProgressHook | None = None) -> Path:
         if self._cached is not None:
             log.info("Using cached source audio: %s", self._cached.name)
-            if progress_hook:
-                try:
-                    size = self._cached.stat().st_size
-                    progress_hook(
-                        {"status": "finished", "downloaded_bytes": size, "total_bytes": size}
-                    )
-                except Exception:  # never let a UI hook break the download
-                    log.debug("cached-source progress hook raised", exc_info=True)
+            _emit_finished_progress(progress_hook, self._cached.stat().st_size)
             self._close()
             return self._cached
 
