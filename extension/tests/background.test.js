@@ -36,7 +36,7 @@ test("onInstalled seeds only the missing storage defaults", async () => {
   const written = getWritten();
   assert.ok(written, "expected a storage.set for the missing defaults");
   assert.ok(!("model" in written), "must not overwrite an existing value");
-  assert.equal(written.backendUrl, "http://127.0.0.1:8723");
+  assert.equal(written.backendUrl, "https://nomusic.example.com");
   assert.equal(written.autoStart, false);
 });
 

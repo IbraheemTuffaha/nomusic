@@ -2,7 +2,11 @@
 // chrome.storage drives the popup; this content-script copy is read on every
 // request. Imported by session.js, button.js, and the content.js entry (main.js).
 
-export const DEFAULT_BACKEND = "http://127.0.0.1:8723";
+// The shipped default lives in config.js so the popup, service worker, and this
+// content-script copy can't drift. Re-exported here so existing importers keep
+// working unchanged.
+export { DEFAULT_BACKEND } from "./config.js";
+import { DEFAULT_BACKEND } from "./config.js";
 export const SYNC_TOLERANCE_S = 0.08;
 export const SYNC_CHECK_MS = 250;
 

@@ -5,6 +5,7 @@
   "type": "module",
   "description": "nomusic browser extension (loaded unpacked; not bundled). `type: module` lets the content-script ES modules and the node:test unit suite share .js files.",
   "scripts": {
-    "test": "node --test --import ./tests/setup.js tests/*.test.js"
+    "test": "node --test --import ./tests/setup.js tests/*.test.js",
+    "pack": "rm -rf dist && mkdir -p dist && zip -r dist/nomusic-$npm_package_version.zip . -x 'tests/*' 'dist/*' 'package.json' '.gitignore' '*.DS_Store'"
   }
 }
