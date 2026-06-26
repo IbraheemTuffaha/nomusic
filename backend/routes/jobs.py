@@ -10,20 +10,22 @@ routes accept request bodies.
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import logging
-import socket
+import time
 from collections.abc import AsyncIterator
 from typing import Optional
-from urllib.parse import urlsplit
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from config import SETTINGS
 from engines.base import DEMUCS_STEMS
+from jobs import JobRejected
+from netsec import validate_public_url
+from ratelimit import default_rl, process_rl, rate_limit, sse_counter
+from security import JobId, client_ip, enforce_origin, require_edge
 
 from . import JsonDict
 
@@ -43,86 +45,20 @@ _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 _SSE_DISCONNECT_POLL_SECONDS = 1.0
 
 
-def _resolve_host_ip_candidates(host: str) -> list:
-    """Every IP ``host`` could resolve to, for the SSRF block-list check.
-
-    Checking only ``ipaddress.ip_address(host)`` was bypassable: it parses just
-    canonical IPv4/IPv6, so decimal (``2130706433``), hex (``0x7f000001``), octal
-    (``0177.0.0.1``) and short-form (``127.1``) literals — and plain hostnames
-    that simply resolve to an internal IP — sailed through and yt-dlp would then
-    fetch e.g. 127.0.0.1 or the cloud-metadata address. We normalise all of those
-    to the real address instead. Raises ``ValueError`` for a hostname that won't
-    resolve (yt-dlp couldn't fetch it anyway).
-    """
-    try:
-        return [ipaddress.ip_address(host)]  # canonical literal
-    except ValueError:
-        pass
-    try:
-        # inet_aton normalises the non-canonical IPv4 encodings above
-        # (decimal/hex/octal/short-form) with no DNS lookup.
-        return [ipaddress.ip_address(socket.inet_aton(host))]
-    except OSError:
-        pass
-    # A real hostname: resolve it the way the fetch will.
-    try:
-        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except (socket.gaierror, UnicodeError, ValueError):
-        raise ValueError("url host could not be resolved")
-    candidates: list = []
-    for info in infos:
-        try:
-            candidates.append(ipaddress.ip_address(info[4][0]))
-        except ValueError:
-            # A non-IP addrinfo entry (not expected for SOCK_STREAM); skip it but
-            # log so a silent drop is at least traceable.
-            log.debug("skipping unparseable resolved address %r", info[4][0])
-    return candidates
-
-
-def _is_blocked_host_ip(ip) -> bool:
-    """True if ``ip`` is an internal/special address the backend must not fetch."""
-    # Unwrap IPv4-mapped IPv6 (::ffff:127.0.0.1) so the v4 rules apply.
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
-    return (
-        ip.is_loopback
-        or ip.is_private
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_unspecified
-        or ip.is_multicast
-    )
-
-
 class ProcessRequest(BaseModel):
-    url: str = Field(..., min_length=1)
+    url: str = Field(..., min_length=1, max_length=SETTINGS.max_url_length)
     model: Optional[str] = None
-    keep_stems: Optional[list[str]] = None
+    keep_stems: Optional[list[str]] = Field(None, max_length=SETTINGS.max_keep_stems)
 
     @field_validator("url")
     @classmethod
     def _validate_url(cls, v: str) -> str:
         # A web page can drive /process (the content script posts the page URL),
-        # so an unvalidated URL is an SSRF / local-file-read primitive: yt-dlp
-        # will happily open file:// paths or fetch internal hosts and serve the
-        # result back via /audio and /video. This tool only ever strips public
-        # web videos, so reject anything that isn't a public http(s) URL whose
-        # host doesn't resolve to an internal address.
-        v = v.strip()
-        parts = urlsplit(v)
-        if parts.scheme not in ("http", "https"):
-            raise ValueError("url must be an http(s) URL")
-        host = parts.hostname
-        if not host:
-            raise ValueError("url must include a host")
-        lowered = host.lower()
-        if lowered == "localhost" or lowered.endswith(".localhost"):
-            raise ValueError("url host is not allowed")
-        for ip in _resolve_host_ip_candidates(host):
-            if _is_blocked_host_ip(ip):
-                raise ValueError("url host is not allowed")
-        return v
+        # so an unvalidated URL is an SSRF / local-file-read primitive. The single
+        # gate in :mod:`netsec` enforces scheme + (public-mode) host allowlist +
+        # internal-IP block-list, and is reused verbatim at /video time on the
+        # stored URL. ``UrlNotAllowed`` subclasses ValueError → pydantic 422.
+        return validate_public_url(v)
 
     @field_validator("keep_stems")
     @classmethod
@@ -134,14 +70,22 @@ class ProcessRequest(BaseModel):
             raise ValueError(f"unknown stems: {bad}; allowed: {DEMUCS_STEMS}")
         if not v:
             raise ValueError("keep_stems must not be empty")
-        return v
+        # De-dup while preserving order so a client can't pad the request.
+        return list(dict.fromkeys(v))
 
 
 class PrioritizeRequest(BaseModel):
     from_chunk: int = Field(..., ge=0)
 
 
-@router.post("/process")
+@router.post(
+    "/process",
+    dependencies=[
+        Depends(require_edge),
+        Depends(enforce_origin),
+        Depends(rate_limit(process_rl)),
+    ],
+)
 def process(req: ProcessRequest, request: Request) -> JsonDict:
     engine = request.app.state.engine
     registry = request.app.state.registry
@@ -158,15 +102,35 @@ def process(req: ProcessRequest, request: Request) -> JsonDict:
         model = caps.default_model
     keep_stems = list(req.keep_stems or SETTINGS.default_keep_stems)
     try:
-        status = registry.submit(req.url, model=model, keep_stems=keep_stems)
+        status = registry.submit(
+            req.url, model=model, keep_stems=keep_stems, client_ip=client_ip(request)
+        )
+    except JobRejected as exc:
+        # Admission cap hit (global / per-IP / disk floor): a transient "busy",
+        # not a client error. 429 + Retry-After so the extension can back off.
+        raise HTTPException(
+            status_code=429,
+            detail="server busy; try again shortly",
+            headers={"Retry-After": "10"},
+        ) from exc
     except Exception as exc:
         log.exception("submit failed")
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Generic message (F20): the real cause is in the server log.
+        raise HTTPException(status_code=400, detail="could not start job") from exc
     return status.to_dict()
 
 
-@router.post("/process/{job_id}/prioritize")
-def prioritize(job_id: str, req: PrioritizeRequest, request: Request) -> dict[str, bool]:
+@router.post(
+    "/process/{job_id}/prioritize",
+    dependencies=[
+        Depends(require_edge),
+        Depends(enforce_origin),
+        Depends(rate_limit(default_rl)),
+    ],
+)
+def prioritize(
+    job_id: JobId, req: PrioritizeRequest, request: Request
+) -> dict[str, bool]:
     """Re-order the worker's pending chunks so ``from_chunk`` is next.
 
     Fire-and-forget from the client's perspective. Returns ``applied``
@@ -179,8 +143,11 @@ def prioritize(job_id: str, req: PrioritizeRequest, request: Request) -> dict[st
     return {"applied": ok}
 
 
-@router.get("/status/{job_id}")
-def status(job_id: str, request: Request) -> JsonDict:
+@router.get(
+    "/status/{job_id}",
+    dependencies=[Depends(require_edge), Depends(rate_limit(default_rl))],
+)
+def status(job_id: JobId, request: Request) -> JsonDict:
     registry = request.app.state.registry
     status = registry.get(job_id)
     if status is None:
@@ -188,8 +155,8 @@ def status(job_id: str, request: Request) -> JsonDict:
     return status.to_dict()
 
 
-@router.get("/events/{job_id}")
-async def events(job_id: str, request: Request) -> Response:
+@router.get("/events/{job_id}", dependencies=[Depends(require_edge)])
+async def events(job_id: JobId, request: Request) -> Response:
     """Server-Sent Events stream of a job's status.
 
     Replaces the extension's old /status polling: the client opens one
@@ -218,9 +185,18 @@ async def events(job_id: str, request: Request) -> Response:
             one_shot(), media_type="text/event-stream", headers=_SSE_HEADERS
         )
 
+    # Cap concurrent streams per job / per IP / globally (F10) so a client can't
+    # exhaust the event loop by holding connections open. No-op in dev.
+    ip = client_ip(request)
+    if SETTINGS.public and not sse_counter.acquire(job_id, ip):
+        raise HTTPException(
+            status_code=429, detail="too many streams", headers={"Retry-After": "5"}
+        )
+
     queue = registry.subscribe(job_id)
 
     async def stream() -> AsyncIterator[str]:
+        start = time.monotonic()
         try:
             # Emit the current state right away so the client paints
             # without waiting for the next change. Re-read after subscribe
@@ -244,6 +220,15 @@ async def events(job_id: str, request: Request) -> Response:
             while True:
                 if await request.is_disconnected():
                     return
+                # Hard lifetime cap (F10): a held/slowloris stream self-closes so
+                # it can't pin a connection forever. The absolute job deadline
+                # (jobs.py) separately bounds the worker itself.
+                if (
+                    SETTINGS.public
+                    and SETTINGS.sse_max_lifetime_seconds > 0
+                    and time.monotonic() - start > SETTINGS.sse_max_lifetime_seconds
+                ):
+                    return
                 try:
                     update = await asyncio.wait_for(
                         queue.get(), timeout=_SSE_DISCONNECT_POLL_SECONDS
@@ -260,6 +245,8 @@ async def events(job_id: str, request: Request) -> Response:
                     return
         finally:
             registry.unsubscribe(job_id, queue)
+            if SETTINGS.public:
+                sse_counter.release(job_id, ip)
 
     return StreamingResponse(
         stream(), media_type="text/event-stream", headers=_SSE_HEADERS

@@ -4,10 +4,11 @@ The HTTP layer is intentionally thin: clients POST a job, then poll
 ``/status/{id}`` and pull ready chunks. All state lives here so server.py stays
 small and the worker stays testable without spinning up uvicorn.
 
-Concurrency model: one background ``threading.Thread`` per job. The MLX engine
-holds the GPU exclusively (Apple unified memory; demucs serializes anyway), so
-we serialize *runs* across jobs with a global lock; multiple jobs queue up
-rather than fighting for the GPU.
+Concurrency model: one background ``threading.Thread`` per job, bounded by an
+admission cap (``max_inflight_jobs`` + per-IP) so a flood of /process calls can't
+spawn unbounded threads. Only the GPU *inference* call is serialized (by the
+engine's own lock); probe/download/decode run concurrently across admitted jobs,
+so one slow source no longer stalls everyone behind a whole-pipeline lock.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import shutil
 import threading
 import time
 import traceback
@@ -31,10 +33,16 @@ log = logging.getLogger(__name__)
 
 class WorkerAbandoned(Exception):
     """Raised from the chunk provider when a job has had no SSE subscriber for
-    longer than ``idle_timeout_seconds``. It propagates up through
-    ``Processor.run`` and out of ``with self._gpu_lock:``, so the GPU lock is
-    released naturally on the way out and the worker thread exits. The client
-    re-spawns the job from disk-cached progress on its next click."""
+    longer than ``idle_timeout_seconds`` (or has blown its absolute deadline, or
+    a cache clear flagged it). It propagates up through ``Processor.run`` and the
+    worker thread exits, releasing the engine's inference lock naturally on the
+    way out. The client re-spawns the job from disk-cached progress on its next
+    click."""
+
+
+class JobRejected(Exception):
+    """Raised by ``submit`` when admission caps (global inflight, per-IP, or the
+    disk floor) refuse a new job. The HTTP layer maps it to 429."""
 
 
 class JobState(str, Enum):
@@ -170,8 +178,13 @@ class JobRegistry:
         # ``abandon_all`` (cache clear). The provider checks it first thing.
         self._abandoning: set[str] = set()
         self._lock = threading.Lock()
-        # One job runs at a time on the engine; further jobs block here.
-        self._gpu_lock = threading.Lock()
+        # Admission bookkeeping (F1): keys with a live/queued worker, and a
+        # per-client-IP count, so submit() can refuse new work past the caps
+        # instead of spawning unbounded daemon threads. Inference itself is
+        # serialized inside the engine, not here.
+        self._inflight: set[str] = set()
+        self._ip_counts: dict[str, int] = collections.defaultdict(int)
+        self._ip_by_key: dict[str, str] = {}
 
     # -- SSE subscription ----------------------------------------------------
 
@@ -213,6 +226,7 @@ class JobRegistry:
         *,
         model: str,
         keep_stems: list[str],
+        client_ip: str = "local",
     ) -> JobStatus:
         # No probe here: the yt-dlp metadata call takes 3-6s on YouTube
         # because of the JS challenge, and blocking /process on it made the
@@ -246,9 +260,28 @@ class JobRegistry:
             self._abandoning.discard(key)
 
             status = self._build_submit_status(key, existing_meta)
-            self._jobs[key] = status
             if status.state == JobState.READY:
+                # Instant replay of a complete cache entry — no worker spawned,
+                # so it doesn't count against admission.
+                self._jobs[key] = status
                 return status
+
+            # About to spawn a worker for genuinely new/resumed work: enforce the
+            # admission caps (F1) and the free-disk floor (F7). All no-ops unless
+            # public. Checked under the lock so the counts can't race a sibling
+            # submit. JobRejected unwinds the lock cleanly (no state mutated yet).
+            if SETTINGS.public:
+                if len(self._inflight) >= SETTINGS.max_inflight_jobs:
+                    raise JobRejected("server at capacity")
+                if self._ip_counts.get(client_ip, 0) >= SETTINGS.max_jobs_per_ip:
+                    raise JobRejected("too many concurrent jobs")
+                if shutil.disk_usage(self.cache.root).free < SETTINGS.free_disk_floor_bytes:
+                    raise JobRejected("insufficient disk")
+
+            self._jobs[key] = status
+            self._inflight.add(key)
+            self._ip_counts[client_ip] += 1
+            self._ip_by_key[key] = client_ip
 
             t = threading.Thread(
                 target=self._run,
@@ -361,8 +394,8 @@ class JobRegistry:
         and drop all in-memory job state. Used by /cache/clear so wiping the
         cache out from under live workers doesn't leave them mid-pipeline
         writing into directories that no longer exist — instead each worker
-        unwinds cleanly out of the GPU lock via ``WorkerAbandoned`` and runs
-        its own ``finally`` cleanup.
+        unwinds cleanly via ``WorkerAbandoned`` and runs its own ``finally``
+        cleanup.
 
         Each open /events stream is sent a terminal ``error`` snapshot before
         its queue is dropped, so the stream closes itself instead of hanging on
@@ -389,6 +422,9 @@ class JobRegistry:
             self._jobs.clear()
             self._subscribers.clear()
             self._last_disconnect_at.clear()
+            self._inflight.clear()
+            self._ip_counts.clear()
+            self._ip_by_key.clear()
         loop = self._loop
         if pending and loop is not None and not loop.is_closed():
             for q, snapshot in pending:
@@ -416,35 +452,32 @@ class JobRegistry:
         abandoned = False
         try:
             try:
-                with self._gpu_lock:
-                    # Stay in QUEUED while waiting for the GPU lock. Only flip
-                    # to PROBING once we actually own it, so a second
-                    # concurrent job honestly reports "Queued" instead of
-                    # falsely showing "Inspecting video" while really blocked.
-                    self._enter_phase(key, JobState.PROBING, progress=None)
-                    self.processor.run(
-                        url,
-                        model=model,
-                        keep_stems=keep_stems,
-                        hooks=RunHooks(
-                            on_probed=lambda info, plans, meta: self._on_probed(
-                                key, info, plans, meta
-                            ),
-                            on_progress=lambda meta, phase: self._on_separation_progress(
-                                key, meta, phase
-                            ),
-                            on_download_progress=lambda p: self._on_download_progress(
-                                key, p
-                            ),
-                            next_chunk_provider=self._make_chunk_provider(key),
-                            abort_check=lambda: self._raise_if_abandoned(
-                                key, SETTINGS.idle_timeout_seconds
-                            ),
-                            on_wait_for_download=lambda frac: self._on_wait_for_download(
-                                key, frac
-                            ),
+                # Probe/download/decode run concurrently across admitted jobs; the
+                # engine serializes only the GPU inference call (engine._infer_lock).
+                self._enter_phase(key, JobState.PROBING, progress=None)
+                self.processor.run(
+                    url,
+                    model=model,
+                    keep_stems=keep_stems,
+                    hooks=RunHooks(
+                        on_probed=lambda info, plans, meta: self._on_probed(
+                            key, info, plans, meta
                         ),
-                    )
+                        on_progress=lambda meta, phase: self._on_separation_progress(
+                            key, meta, phase
+                        ),
+                        on_download_progress=lambda p: self._on_download_progress(
+                            key, p
+                        ),
+                        next_chunk_provider=self._make_chunk_provider(key),
+                        abort_check=lambda: self._raise_if_abandoned(
+                            key, SETTINGS.idle_timeout_seconds
+                        ),
+                        on_wait_for_download=lambda frac: self._on_wait_for_download(
+                            key, frac
+                        ),
+                    ),
+                )
                 meta = self.cache.load_meta(key)
                 chunks_ready = len(meta.chunks_ready) if meta else 0
                 ready_chunks = sorted(meta.chunks_ready) if meta else []
@@ -460,8 +493,7 @@ class JobRegistry:
                 log.info("Job %s ready", key)
             except WorkerAbandoned:
                 # Listed before the generic handler so an idle-abandon isn't
-                # mistaken for a failure. The GPU lock has already released via
-                # the with-block unwind; just flag it for finally to clean up.
+                # mistaken for a failure; just flag it for finally to clean up.
                 abandoned = True
                 # ``%gs`` renders 30.0 as "30s" (not "30.0s") so the value
                 # matches the grep documented in the verification steps.
@@ -472,12 +504,16 @@ class JobRegistry:
                 )
             except Exception as exc:
                 log.exception("Job %s failed", key)
-                self._enter_phase(
-                    key,
-                    JobState.ERROR,
-                    progress=1.0,
-                    error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}",
+                # The full traceback always goes to the server log (above). On a
+                # public deployment, surface only a generic message to the client
+                # so internal paths / stack frames don't leak (F20); keep the
+                # verbose detail in local/dev for fast debugging.
+                detail = (
+                    "processing failed"
+                    if SETTINGS.public
+                    else f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}"
                 )
+                self._enter_phase(key, JobState.ERROR, progress=1.0, error=detail)
         finally:
             # The control + any orphaned priority hint are only meaningful
             # while a worker is consuming chunks; drop them unconditionally.
@@ -495,6 +531,17 @@ class JobRegistry:
                     self._subscribers.pop(key, None)
                     self._last_disconnect_at.pop(key, None)
                     self._abandoning.discard(key)
+                    # Release this worker's admission slot (F1) so the global +
+                    # per-IP caps free up. Guarded by the same "still our key"
+                    # check, so a racing fresh worker's slot is left intact.
+                    self._inflight.discard(key)
+                    ip = self._ip_by_key.pop(key, None)
+                    if ip is not None:
+                        remaining = self._ip_counts.get(ip, 0) - 1
+                        if remaining > 0:
+                            self._ip_counts[ip] = remaining
+                        else:
+                            self._ip_counts.pop(ip, None)
                     # The terminal _update(READY/ERROR) above already enqueued
                     # its snapshot to every open stream, so dropping
                     # _subscribers here loses nothing; each stream still drains
@@ -621,7 +668,7 @@ class JobRegistry:
         raises ``WorkerAbandoned`` when nobody has been streaming status for
         longer than ``idle_timeout_seconds``. The idle check runs here — at the
         chunk boundary — so abandoning costs at most one in-flight chunk and
-        unwinds cleanly out of the GPU lock.
+        unwinds cleanly between chunks.
         """
         idle_timeout = SETTINGS.idle_timeout_seconds
 
@@ -637,13 +684,28 @@ class JobRegistry:
 
     def _raise_if_abandoned(self, key: str, idle_timeout: float) -> None:
         """Raise ``WorkerAbandoned`` if the job has been flagged (idle decision
-        on a prior call, or a cache clear) or has now gone idle. The whole
-        check + flag-set happens under the lock so it can't interleave with a
-        submit() deciding whether to adopt the job. Shared by the chunk
-        provider and the progressive-download abort hook so a pause that lands
-        mid-download still releases the GPU promptly."""
+        on a prior call, or a cache clear), has blown its absolute deadline, or
+        has now gone idle. The whole check + flag-set happens under the lock so
+        it can't interleave with a submit() deciding whether to adopt the job.
+        Shared by the chunk provider and the progressive-download abort hook so a
+        pause (or a runaway job) that lands mid-download still unwinds promptly."""
         with self._lock:
             if key in self._abandoning:
+                raise WorkerAbandoned
+            # Absolute deadline (F2): a wedged download/separation can't be kept
+            # alive indefinitely by an open /events stream, so this is checked
+            # BEFORE the subscriber early-return below.
+            status = self._jobs.get(key)
+            if (
+                status is not None
+                and SETTINGS.job_deadline_seconds > 0
+                and time.time() - status.created_at >= SETTINGS.job_deadline_seconds
+            ):
+                log.warning(
+                    "Job %s exceeded deadline (%gs); abandoning",
+                    key, SETTINGS.job_deadline_seconds,
+                )
+                self._abandoning.add(key)
                 raise WorkerAbandoned
             if idle_timeout <= 0:
                 return

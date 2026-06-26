@@ -498,7 +498,33 @@ class Processor:
         # Download the full source once. Each chunk is sliced from this file
         # so cuts are sample-accurate (yt-dlp's per-range download cuts at the
         # nearest preceding keyframe, which drifts by 5-10 s on AAC/Opus).
+        # Absolute download deadline (public mode): a slow trickle that never
+        # reaches a chunk boundary is otherwise only bounded by the much larger
+        # job deadline. ``_DownloadCancelled`` unwinds the download cleanly.
+        _dl_deadline = (
+            time.monotonic() + SETTINGS.download_deadline_seconds
+            if SETTINGS.public and SETTINGS.download_deadline_seconds > 0
+            else None
+        )
+
+        def _check_download_deadline() -> None:
+            if _dl_deadline is not None and time.monotonic() > _dl_deadline:
+                raise _DownloadCancelled()
+
+        def _abort_with_deadline() -> None:
+            # Combined per-poll check for the progressive wait: job abandon/idle
+            # (WorkerAbandoned) plus the download deadline (DownloadCancelled).
+            if abort_check:
+                abort_check()
+            _check_download_deadline()
+
         def _yt_hook(d: dict) -> None:
+            # Enforce the download deadline from the yt-dlp progress callback so a
+            # blocking (non-progressive) download is bounded too; raising here
+            # aborts the download. (In progressive mode this hook is wrapped by
+            # _ProgressiveSource, which swallows exceptions, so the deadline there
+            # is enforced via _abort_with_deadline in source_for instead.)
+            _check_download_deadline()
             if not on_download_progress:
                 return
             try:
@@ -521,7 +547,7 @@ class Processor:
             )
             dl.start()
             source_for = lambda plan: dl.source_for(
-                plan, self.chunk_overlap_seconds, abort_check, on_wait_for_download
+                plan, self.chunk_overlap_seconds, _abort_with_deadline, on_wait_for_download
             )
         elif fetcher is not None:
             # First run: download from the session that already extracted info.

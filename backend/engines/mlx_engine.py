@@ -66,6 +66,11 @@ class MLXEngine(Engine):
         # or a low-VRAM GPU. The per-job GPU lock doesn't cover this: warmup runs
         # outside it.
         self._load_lock = threading.Lock()
+        # Serializes the actual GPU inference call. Probe + download + decode now
+        # run concurrently across the (admission-capped) jobs; only the GPU pass
+        # is exclusive, so one slow source no longer blocks every other user
+        # behind a whole-pipeline lock (the old jobs._gpu_lock).
+        self._infer_lock = threading.Lock()
         self._factory = separator_factory or _make_separator
         self._device = _pick_device()
 
@@ -147,9 +152,11 @@ class MLXEngine(Engine):
         for i, p in enumerate(prepared):
             x[i, :, : lengths[i]] = p.wav
 
-        # Time only the inference call — the real accelerator work.
+        # Time only the inference call — the real accelerator work. The infer
+        # lock makes the GPU pass exclusive across jobs (one GPU, demucs
+        # serializes anyway) without holding any lock during probe/download/decode.
         t_gpu0 = time.perf_counter()
-        with torch.no_grad():
+        with self._infer_lock, torch.no_grad():
             estimates = apply_model(
                 model, x, device=self._device, shifts=0, split=True,
                 overlap=0.25, progress=False, num_workers=0,
