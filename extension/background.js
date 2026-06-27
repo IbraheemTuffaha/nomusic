@@ -1,14 +1,16 @@
-// Background service worker.
+// Background service worker (ES module — see manifest "type": "module").
 //
-// Today this is intentionally tiny: the content script talks to the local
-// backend directly, so the worker just owns the storage defaults and answers
-// the popup's "is the backend up?" probe.
+// Today this is intentionally tiny: the content script talks to the backend
+// directly, so the worker just owns the storage defaults and answers the
+// popup's "is the backend up?" probe.
 //
-// Reasons to put logic here later: cross-tab job sharing, a periodic backend
-// health check, or migrating away from a localhost origin.
+// Reasons to put logic here later: cross-tab job sharing or a periodic backend
+// health check.
+
+import { DEFAULT_BACKEND } from "./config.js";
 
 const DEFAULTS = {
-  backendUrl: "http://127.0.0.1:8723",
+  backendUrl: DEFAULT_BACKEND,
   model: null, // null -> backend's default
   keepStems: null, // null -> backend's default
   autoStart: false,

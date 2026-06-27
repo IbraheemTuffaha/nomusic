@@ -46,4 +46,7 @@ def test_routers_expose_expected_paths():
     assert "/video/{job_id}/progress" in media_paths
 
     system_paths = {r.path for r in system.router.routes}
-    assert {"/healthz", "/capabilities", "/cache", "/cache/clear"} <= system_paths
+    assert {"/healthz", "/capabilities"} <= system_paths
+    # Cache stats/clear live on the admin router (token-gated in public mode).
+    admin_paths = {r.path for r in system.admin.routes}
+    assert {"/cache", "/cache/clear"} <= admin_paths

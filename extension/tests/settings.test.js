@@ -11,7 +11,11 @@ import {
 } from "../settings.js";
 
 test("default constants are sane", () => {
-  assert.equal(DEFAULT_BACKEND, "http://127.0.0.1:8723");
+  // Shipped default is the public HTTPS backend (placeholder host swapped at
+  // package time). Re-exported from config.js so the popup/SW/content scripts
+  // can't drift.
+  assert.equal(DEFAULT_BACKEND, "https://nomusic.example.com");
+  assert.ok(DEFAULT_BACKEND.startsWith("https://"));
   assert.ok(SYNC_TOLERANCE_S > 0 && SYNC_TOLERANCE_S < 1);
   assert.ok(SYNC_CHECK_MS >= 50);
   assert.equal(settings.backendUrl, DEFAULT_BACKEND);

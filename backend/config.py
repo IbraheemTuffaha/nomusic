@@ -8,6 +8,7 @@ free so it can be imported by tests and tools.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +34,22 @@ def _env_bool(key: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_tuple(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Comma-separated list override, e.g. NOMUSIC_ALLOWED_URL_HOSTS=youtube.com,vimeo.com.
+    Unset → the default tuple; empty string → an empty tuple."""
+    raw = os.environ.get(f"NOMUSIC_{key}")
+    if raw is None:
+        return default
+    return tuple(s.strip().lower() for s in raw.split(",") if s.strip())
+
+
+def _env_int_tuple(key: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw = os.environ.get(f"NOMUSIC_{key}")
+    if raw is None:
+        return default
+    return tuple(int(s.strip()) for s in raw.split(",") if s.strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     host: str = field(default_factory=lambda: _env("HOST", "127.0.0.1"))
@@ -40,10 +57,12 @@ class Settings:
 
     engine_name: str = field(default_factory=lambda: _env("ENGINE", "mlx"))
 
+    # Resolved to an absolute path at startup: cheap argv hygiene so a relative
+    # NOMUSIC_CACHE_DIR can't make cache paths depend on the worker's cwd.
     cache_dir: Path = field(
         default_factory=lambda: Path(
             _env("CACHE_DIR", str(Path.home() / ".cache" / "nomusic"))
-        )
+        ).resolve()
     )
 
     # Stems to keep in the final mix. Default = ``vocals`` only, because
@@ -137,6 +156,159 @@ class Settings:
     progressive_download: bool = field(
         default_factory=lambda: _env_bool("PROGRESSIVE", True)
     )
+
+    # ---- Public-deployment hardening ------------------------------------
+    # Master toggle. With NOMUSIC_PUBLIC unset (the default — local/dev use),
+    # every gate below is a no-op and the server behaves exactly as the
+    # localhost-only tool did. Set NOMUSIC_PUBLIC=1 on the internet-facing
+    # (Cloudflare-tunnelled) deployment to activate auth/rate-limit/quota/CORS
+    # hardening. See docs/remote-deployment/.
+    public: bool = field(default_factory=lambda: _env_bool("PUBLIC", False))
+
+    # Secret the owner holds for destructive/admin endpoints (/cache, /cache/clear).
+    # Empty in public mode ⇒ those endpoints fail closed (404). Never shipped in
+    # the extension.
+    admin_token: str = field(default_factory=lambda: _env("ADMIN_TOKEN", ""))
+    # Optional shared secret injected by the Cloudflare tunnel (header
+    # X-Nomusic-Tunnel). When set in public mode, a request that didn't traverse
+    # the tunnel (e.g. a LAN-direct hit to :8723) is rejected.
+    tunnel_secret: str = field(default_factory=lambda: _env("TUNNEL_SECRET", ""))
+    # The published extension's chrome-extension://<id> origin, allowed through
+    # CORS in public mode (the popup/service-worker fetch with this Origin).
+    extension_origin: str = field(default_factory=lambda: _env("EXTENSION_ORIGIN", ""))
+
+    # Concurrency / admission caps (public mode).
+    max_inflight_jobs: int = field(
+        default_factory=lambda: _env_int("MAX_INFLIGHT_JOBS", 3)
+    )
+    max_jobs_per_ip: int = field(
+        default_factory=lambda: _env_int("MAX_JOBS_PER_IP", 2)
+    )
+    max_video_exports: int = field(
+        default_factory=lambda: _env_int("MAX_VIDEO_EXPORTS", 1)
+    )
+    max_audio_transcodes: int = field(
+        default_factory=lambda: _env_int("MAX_AUDIO_TRANSCODES", 2)
+    )
+    max_sse_per_job: int = field(default_factory=lambda: _env_int("MAX_SSE_PER_JOB", 4))
+    max_sse_per_ip: int = field(default_factory=lambda: _env_int("MAX_SSE_PER_IP", 20))
+    max_sse_global: int = field(default_factory=lambda: _env_int("MAX_SSE_GLOBAL", 200))
+    sse_max_lifetime_seconds: float = field(
+        default_factory=lambda: _env_float("SSE_MAX_LIFETIME_SECONDS", 1800.0)
+    )
+
+    # Per-IP request-rate caps (requests/minute, public mode).
+    rate_process_per_min: int = field(
+        default_factory=lambda: _env_int("RATE_PROCESS_PER_MIN", 6)
+    )
+    rate_video_per_min: int = field(
+        default_factory=lambda: _env_int("RATE_VIDEO_PER_MIN", 4)
+    )
+    rate_default_per_min: int = field(
+        default_factory=lambda: _env_int("RATE_DEFAULT_PER_MIN", 120)
+    )
+
+    # Hard deadlines (seconds) so one slow/hanging source can't pin resources.
+    job_deadline_seconds: float = field(
+        default_factory=lambda: _env_float("JOB_DEADLINE_SECONDS", 1800.0)
+    )
+    download_deadline_seconds: float = field(
+        default_factory=lambda: _env_float("DOWNLOAD_DEADLINE_SECONDS", 900.0)
+    )
+
+    # Media size / duration ceilings (public mode).
+    max_duration_seconds: float = field(
+        default_factory=lambda: _env_float("MAX_DURATION_SECONDS", 5400.0)
+    )
+    max_source_filesize: int = field(
+        default_factory=lambda: _env_int("MAX_SOURCE_BYTES", 600_000_000)
+    )
+    max_video_filesize: int = field(
+        default_factory=lambda: _env_int("MAX_VIDEO_BYTES", 4_000_000_000)
+    )
+
+    # Disk-fill defense: keep the cache under this size (LRU evict) and never let
+    # free space drop below the floor before admitting a new job.
+    cache_max_bytes: int = field(
+        default_factory=lambda: _env_int("CACHE_MAX_BYTES", 40_000_000_000)
+    )
+    free_disk_floor_bytes: int = field(
+        default_factory=lambda: _env_int("FREE_DISK_FLOOR_BYTES", 5_000_000_000)
+    )
+
+    # Request-shape caps (public mode).
+    max_request_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_REQUEST_BYTES", 8192)
+    )
+    max_url_length: int = field(
+        default_factory=lambda: _env_int("MAX_URL_LENGTH", 2048)
+    )
+    max_keep_stems: int = field(default_factory=lambda: _env_int("MAX_KEEP_STEMS", 8))
+    allowed_video_heights: tuple[int, ...] = field(
+        default_factory=lambda: _env_int_tuple(
+            "ALLOWED_VIDEO_HEIGHTS", (360, 480, 720, 1080)
+        )
+    )
+
+    # Positive host + extractor allowlist for /process URLs (public mode), so the
+    # box can't be turned into an open download proxy. YouTube + Facebook (§0).
+    allowed_url_hosts: tuple[str, ...] = field(
+        default_factory=lambda: _env_tuple(
+            "ALLOWED_URL_HOSTS",
+            (
+                "youtube.com",
+                "youtu.be",
+                "m.youtube.com",
+                "music.youtube.com",
+                "www.facebook.com",
+                "facebook.com",
+                "m.facebook.com",
+                "fb.watch",
+            ),
+        )
+    )
+    allowed_extractors: tuple[str, ...] = field(
+        default_factory=lambda: _env_tuple(
+            "ALLOWED_EXTRACTORS", ("youtube", "youtube:tab", "facebook")
+        )
+    )
+
+    # Base domains the curated content scripts run on, used to build the CORS
+    # origin allowlist (the page Origin of an extension content-script fetch is
+    # e.g. https://www.youtube.com). Kept separate from allowed_url_hosts (which
+    # is the yt-dlp download allowlist) because they answer different questions.
+    allowed_origin_hosts: tuple[str, ...] = field(
+        default_factory=lambda: _env_tuple(
+            "ALLOWED_ORIGIN_HOSTS",
+            ("youtube.com", "youtube-nocookie.com", "youtu.be", "facebook.com", "fb.watch"),
+        )
+    )
+
+    @property
+    def cors_origins(self) -> list[str]:
+        """Static origins for CORSMiddleware. Non-public: '*' (localhost dev).
+        Public: just the extension origin (curated sites are matched by
+        :attr:`cors_origin_regex`, since their subdomains vary)."""
+        if not self.public:
+            return list(self.allow_origins)
+        return [self.extension_origin] if self.extension_origin else []
+
+    @property
+    def cors_origin_regex(self) -> str | None:
+        """Regex matching the curated sites' page origins (any subdomain over
+        https) in public mode; ``None`` in dev so the static list applies."""
+        if not self.public or not self.allowed_origin_hosts:
+            return None
+        hosts = "|".join(re.escape(h) for h in self.allowed_origin_hosts)
+        return rf"^https://([a-z0-9-]+\.)*({hosts})$"
+
+    def is_origin_allowed(self, origin: str) -> bool:
+        """True if ``origin`` is the extension origin or a curated-site origin.
+        Used by the server-side Origin gate (CORS can't stop side effects)."""
+        if self.extension_origin and origin == self.extension_origin:
+            return True
+        rx = self.cors_origin_regex
+        return bool(rx and re.match(rx, origin))
 
 
 SETTINGS = Settings()

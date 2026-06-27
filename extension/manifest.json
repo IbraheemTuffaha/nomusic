@@ -1,25 +1,37 @@
 {
   "manifest_version": 3,
   "name": "nomusic",
-  "version": "0.1.0",
-  "description": "Strip music from videos on YouTube, Facebook, and the rest of the web using a local source-separation backend.",
-  "permissions": ["storage", "activeTab"],
+  "version": "0.2.0",
+  "description": "Removes the background music from the video you're watching and plays a vocals-only version of its audio in sync with the video.",
+  "permissions": ["storage"],
   "host_permissions": [
-    "http://127.0.0.1:8723/*"
+    "https://nomusic.example.com/*"
+  ],
+  "optional_host_permissions": [
+    "*://*/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://*.youtube-nocookie.com/*",
+        "*://*.facebook.com/*"
+      ],
       "js": ["page-script.js"],
       "run_at": "document_start",
       "all_frames": true,
       "world": "MAIN"
     },
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://*.youtube-nocookie.com/*",
+        "*://*.facebook.com/*"
+      ],
       "js": ["content.js"],
       "css": ["content.css"],
       "run_at": "document_idle",
@@ -46,6 +58,7 @@
     {
       "resources": [
         "icons/button.png",
+        "config.js",
         "main.js",
         "settings.js",
         "session.js",
@@ -55,7 +68,11 @@
         "stretch.js",
         "third_party/soundtouch/*.js"
       ],
-      "matches": ["<all_urls>"]
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://*.youtube-nocookie.com/*",
+        "*://*.facebook.com/*"
+      ]
     }
   ]
 }

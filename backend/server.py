@@ -31,16 +31,19 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from config import SETTINGS
 from engines import get_engine
 from jobs import JobRegistry
+from middleware import MaxBodySizeMiddleware, SecurityHeadersMiddleware
 from pipeline.cache import JobCache
 from pipeline.processor import Processor
 from routes.jobs import router as jobs_router
 from routes.media import router as media_router
+from routes.system import admin as admin_router
 from routes.system import router as system_router
 
 # Directory holding the flat backend modules; needed by the uvicorn reloader
@@ -125,6 +128,16 @@ def _start_cache_ttl_sweeper(cache: JobCache) -> None:
                         removed,
                         freed,
                     )
+                # Public mode also enforces a hard size cap (F7): TTL alone can't
+                # stop a burst of distinct URLs filling the disk between sweeps.
+                if SETTINGS.public and SETTINGS.cache_max_bytes > 0:
+                    ev_removed, ev_freed = cache.evict_to_fit(SETTINGS.cache_max_bytes)
+                    if ev_removed:
+                        log.info(
+                            "Cache LRU evict: removed %d entries, freed %d bytes",
+                            ev_removed,
+                            ev_freed,
+                        )
             except Exception:
                 # Daemon loop: one failed sweep must not kill the thread, or the
                 # cache would stop being reclaimed for the server's lifetime.
@@ -197,28 +210,47 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     _configure_logging()
     _raise_open_file_limit()
-    app = FastAPI(title="nomusic", version="0.2.0", lifespan=lifespan)
+    # Hide the interactive docs / OpenAPI schema on a public host so the full
+    # API surface isn't advertised to anonymous clients. Kept on in dev.
+    docs_kwargs = (
+        {"docs_url": None, "redoc_url": None, "openapi_url": None}
+        if SETTINGS.public
+        else {}
+    )
+    app = FastAPI(title="nomusic", version="0.2.0", lifespan=lifespan, **docs_kwargs)
 
-    # SECURITY INVARIANT: allow_origins='*' with no auth is only safe because
-    # the server binds to 127.0.0.1 (see SETTINGS.host / config.py) — it's
-    # reachable only from this machine, so any origin reaching it is already
-    # local. If you ever change the bind to a non-loopback address, you MUST add
-    # authentication and tighten allow_origins; the two settings are coupled.
-    #
-    # ``allow_private_network=True`` opts into Chrome's Private Network
-    # Access flow: a fetch from a public origin (youtube.com) to a private
-    # IP (127.0.0.1) gets an extra preflight with
-    # ``Access-Control-Request-Private-Network: true`` and the response
-    # must echo ``Access-Control-Allow-Private-Network: true``. Without it
-    # Chrome silently drops the request even when regular CORS is correct.
+    # SECURITY MODEL. The app always binds to 127.0.0.1 (see SETTINGS.host).
+    #   * Dev/local (NOMUSIC_PUBLIC unset): the only reachable client is this
+    #     machine, so allow_origins='*' with no auth is safe, and
+    #     allow_private_network=True opts into Chrome's Private Network Access
+    #     flow (a fetch from youtube.com to 127.0.0.1 needs the response to echo
+    #     Access-Control-Allow-Private-Network: true).
+    #   * Public (NOMUSIC_PUBLIC=1): the loopback socket is exposed to the
+    #     internet via a Cloudflare *named tunnel* (cloudflared dials out; no
+    #     inbound port). So the hardening is active: identity is CF-Connecting-IP,
+    #     destructive ops require NOMUSIC_ADMIN_TOKEN, requests are rate-limited
+    #     and admission-capped, CORS is locked to the extension + curated-site
+    #     origins, and allow_private_network is OFF (irrelevant on a public host).
+    # See docs/remote-deployment/ for the full study.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=list(SETTINGS.allow_origins),
+        allow_origins=SETTINGS.cors_origins,
+        allow_origin_regex=SETTINGS.cors_origin_regex,
         allow_credentials=False,
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-        allow_headers=["*"],
-        allow_private_network=True,
+        allow_methods=["GET", "POST", "OPTIONS"],  # no DELETE (unused)
+        allow_headers=["Content-Type", "X-Admin-Token"],
+        allow_private_network=not SETTINGS.public,
     )
+    # Reject oversized bodies up front, and add conservative response headers.
+    app.add_middleware(MaxBodySizeMiddleware)
+    app.add_middleware(SecurityHeadersMiddleware)
+
+    @app.exception_handler(Exception)
+    async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
+        # Last-resort handler so an unexpected error never leaks a traceback to
+        # the client. The full detail is logged; the client gets a generic 500.
+        log.exception("unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={"detail": "internal error"})
 
     engine = get_engine(SETTINGS.engine_name)
     cache = JobCache(SETTINGS.cache_dir)
@@ -243,6 +275,7 @@ def create_app() -> FastAPI:
     _start_engine_warmup(engine)
 
     app.include_router(system_router)
+    app.include_router(admin_router)
     app.include_router(jobs_router)
     app.include_router(media_router)
     return app
@@ -289,6 +322,8 @@ def main() -> None:
             reload_dirs=[str(_BACKEND_DIR)],
             log_level="info",
             access_log=False,
+            server_header=False,
+            date_header=False,
         )
     else:
         uvicorn.run(
@@ -297,6 +332,8 @@ def main() -> None:
             port=SETTINGS.port,
             log_level="info",
             access_log=False,
+            server_header=False,
+            date_header=False,
         )
 
 

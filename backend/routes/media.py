@@ -17,10 +17,12 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
+from config import SETTINGS
+from netsec import validate_public_url
 from pipeline import downloader
 from pipeline.cache import CHUNK_MEDIA_TYPE
 from pipeline.export import (
@@ -31,12 +33,49 @@ from pipeline.export import (
     video_codec,
     video_duration,
 )
+from ratelimit import (
+    audio_transcode_gate,
+    rate_limit,
+    video_export_gate,
+    video_rl,
+)
+from security import ChunkIdx, JobId, require_edge
 
 from . import JsonDict
 
 log = logging.getLogger("nomusic.server")
 
 router = APIRouter()
+
+
+def _ffmpeg_fail_detail(raw: str) -> str:
+    """Client-facing detail for an ffmpeg failure. Public mode hides ffmpeg's
+    stderr (which can carry paths/versions); the full text is always logged."""
+    return "media processing failed" if SETTINGS.public else f"ffmpeg failed: {raw}"
+
+
+def _ffmpeg_timeout_detail() -> str:
+    return (
+        "media processing timed out"
+        if SETTINGS.public
+        else f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS:.0f}s"
+    )
+
+
+def _snap_height(max_height: Optional[int]) -> Optional[int]:
+    """Normalize a requested export height. ``None``/<=0 → best available. In
+    public mode, snap to the nearest allowlisted height so ~4000 possible values
+    collapse to ≤len(allowed) cache keys (F8); in dev, keep the old 144–4320
+    clamp. video() and video_progress() must snap identically so their progress
+    keys match."""
+    if max_height is None or max_height <= 0:
+        return None
+    if SETTINGS.public:
+        heights = SETTINGS.allowed_video_heights
+        if heights and max_height not in heights:
+            return min(heights, key=lambda h: abs(h - max_height))
+        return max_height
+    return max(144, min(4320, max_height))
 
 # Block size (64 KiB) for streaming concatenated audio chunks to the client.
 _STREAM_BLOCK_BYTES = 65536
@@ -61,13 +100,12 @@ def _run_ffmpeg(cmd: list[str]) -> None:
     except subprocess.TimeoutExpired as exc:
         log.error("ffmpeg timed out after %.0fs", _FFMPEG_TIMEOUT_SECONDS)
         raise HTTPException(
-            status_code=500,
-            detail=f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS:.0f}s",
+            status_code=500, detail=_ffmpeg_timeout_detail()
         ) from exc
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip() or "(no stderr)"
         log.error("ffmpeg failed (exit %d): %s", proc.returncode, detail)
-        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {detail}")
+        raise HTTPException(status_code=500, detail=_ffmpeg_fail_detail(detail))
 
 
 def _run_ffmpeg_progress(cmd: list[str], total_seconds: float, on_pct) -> None:
@@ -120,15 +158,12 @@ def _run_ffmpeg_progress(cmd: list[str], total_seconds: float, on_pct) -> None:
             watchdog.cancel()
         if timed_out.is_set():
             log.error("ffmpeg timed out after %.0fs", _FFMPEG_TIMEOUT_SECONDS)
-            raise HTTPException(
-                status_code=500,
-                detail=f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS:.0f}s",
-            )
+            raise HTTPException(status_code=500, detail=_ffmpeg_timeout_detail())
         if proc.returncode != 0:
             errf.seek(0)
             detail = errf.read().decode("utf-8", "replace").strip() or "(no stderr)"
             log.error("ffmpeg failed (exit %d): %s", proc.returncode, detail)
-            raise HTTPException(status_code=500, detail=f"ffmpeg failed: {detail}")
+            raise HTTPException(status_code=500, detail=_ffmpeg_fail_detail(detail))
 
 
 # --- MP4 export progress (polled by the extension while it prepares a video) --
@@ -167,8 +202,8 @@ class _ExportProgress:
 _export_progress = _ExportProgress()
 
 
-@router.get("/chunk/{job_id}/{chunk_idx}")
-def chunk(job_id: str, chunk_idx: int, request: Request) -> FileResponse:
+@router.get("/chunk/{job_id}/{chunk_idx}", dependencies=[Depends(require_edge)])
+def chunk(job_id: JobId, chunk_idx: ChunkIdx, request: Request) -> FileResponse:
     cache = request.app.state.cache
     meta = cache.load_meta(job_id)
     if meta is None:
@@ -193,8 +228,8 @@ def chunk(job_id: str, chunk_idx: int, request: Request) -> FileResponse:
     )
 
 
-@router.get("/audio/{job_id}")
-def audio(job_id: str, request: Request, format: str = "opus") -> Response:
+@router.get("/audio/{job_id}", dependencies=[Depends(require_edge)])
+def audio(job_id: JobId, request: Request, format: str = "opus") -> Response:
     """On-demand concatenation of every chunk into a single track.
 
     We no longer keep a precomputed full file on disk (cut storage in
@@ -240,7 +275,10 @@ def audio(job_id: str, request: Request, format: str = "opus") -> Response:
         tmp_dir = Path(tempfile.mkdtemp(prefix="nomusic-mp3-"))
         try:
             out = tmp_dir / "full.mp3"
-            _run_ffmpeg(mp3_transcode_cmd(chunk_files, out))
+            # Bound concurrent transcodes (F9) so they can't monopolize the
+            # threadpool and starve status/chunk requests. No-op in dev.
+            with audio_transcode_gate.slot():
+                _run_ffmpeg(mp3_transcode_cmd(chunk_files, out))
         except BaseException:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
@@ -273,8 +311,11 @@ def audio(job_id: str, request: Request, format: str = "opus") -> Response:
     )
 
 
-@router.get("/video/{job_id}")
-def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Response:
+@router.get(
+    "/video/{job_id}",
+    dependencies=[Depends(require_edge), Depends(rate_limit(video_rl))],
+)
+def video(job_id: JobId, request: Request, max_height: Optional[int] = None) -> Response:
     """Original video with its audio replaced by the music-stripped track.
 
     The pipeline never downloads video, so we pull the video stream on
@@ -289,12 +330,9 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
     menu, and polls ``/video/{job_id}/progress`` to show the live percent.
     """
     cache = request.app.state.cache
-    # 0/negative → best available. Clamp to a sane range so the value can't
-    # come back as a pathological format selector.
-    if max_height is not None and max_height <= 0:
-        max_height = None
-    if max_height is not None:
-        max_height = max(144, min(4320, max_height))
+    # Best-available, or (public) snapped to an allowlisted height so the
+    # per-height video cache can't be blown up into thousands of keys (F8).
+    max_height = _snap_height(max_height)
 
     meta = cache.load_meta(job_id)
     if meta is None:
@@ -302,74 +340,93 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
     if not meta.complete:
         raise HTTPException(status_code=425, detail="full audio not ready")
 
+    # Re-validate the STORED url on this delayed outbound fetch (F12/F27): the
+    # submit-time SSRF gate may predate a policy tightening, and /video is the
+    # one place a cached job triggers a fresh download.
+    try:
+        validate_public_url(meta.url)
+    except ValueError:
+        # ``UrlNotAllowed`` (policy reject) subclasses ValueError, but
+        # ``validate_public_url`` also raises a bare ValueError when the host
+        # can't be resolved (DNS failure); both map to a 404 here rather than
+        # escaping to the generic 500 handler.
+        raise HTTPException(status_code=404)
+
     chunk_files = snapshot_chunk_files(cache, job_id, meta.total_chunks)
     if not chunk_files:
         raise HTTPException(status_code=425, detail="full audio not ready")
 
     progress_key = _export_progress.key(job_id, max_height)
-    _export_progress.set(progress_key, "downloading", 0.0)
-    tmp_dir: Optional[Path] = None
-    try:
-        # --- Phase 1: fetch the video stream (cached per url+resolution) ---
-        def _dl_hook(d: dict[str, object]) -> None:
-            if d.get("status") == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate")
-                got = d.get("downloaded_bytes")
-                if total and got is not None:
-                    _export_progress.set(progress_key, "downloading", 100.0 * got / total)
-            elif d.get("status") == "finished":
-                _export_progress.set(progress_key, "downloading", 100.0)
-
+    # Bound concurrent heavy exports (F8/F9/F12): cap how many download+mux ops
+    # run at once so they can't starve the threadpool. 503s when full; no-op in
+    # dev. Held across the whole build, released before the file is streamed.
+    with video_export_gate.slot():
+        _export_progress.set(progress_key, "downloading", 0.0)
+        tmp_dir: Optional[Path] = None
         try:
-            video_path = downloader.download_video(
-                meta.url,
-                cache.video_dir(meta.url, max_height),
-                max_height=max_height,
-                progress_hook=_dl_hook,
-            )
-        except Exception as exc:
-            # yt-dlp failures are the user's URL going stale / network
-            # issues, not a server bug — surface them as a 502.
-            log.warning("video download failed for %s", job_id, exc_info=True)
-            raise HTTPException(status_code=502, detail=f"video download failed: {exc}")
+            # --- Phase 1: fetch the video stream (cached per url+resolution) ---
+            def _dl_hook(d: dict[str, object]) -> None:
+                if d.get("status") == "downloading":
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                    got = d.get("downloaded_bytes")
+                    if total and got is not None:
+                        _export_progress.set(
+                            progress_key, "downloading", 100.0 * got / total
+                        )
+                elif d.get("status") == "finished":
+                    _export_progress.set(progress_key, "downloading", 100.0)
 
-        # --- Phase 2: mux the stripped audio over the video ---
-        _export_progress.set(progress_key, "encoding", 0.0)
-        tmp_dir = Path(tempfile.mkdtemp(prefix="nomusic-mp4-"))
-        out = tmp_dir / "full.mp4"
-        total_seconds = video_duration(video_path)
+            try:
+                video_path = downloader.download_video(
+                    meta.url,
+                    cache.video_dir(meta.url, max_height),
+                    max_height=max_height,
+                    progress_hook=_dl_hook,
+                )
+            except Exception as exc:
+                # yt-dlp failures are the user's URL going stale / network
+                # issues, not a server bug — surface them as a 502 with a generic
+                # message (F20); the real cause is logged.
+                log.warning("video download failed for %s", job_id, exc_info=True)
+                raise HTTPException(status_code=502, detail="video download failed")
 
-        def _enc_pct(frac: float) -> None:
-            _export_progress.set(progress_key, "encoding", 100.0 * frac)
-
-        # Copy H.264/HEVC straight through (fast, lossless); re-encode
-        # VP9/AV1 to H.264 so the MP4 plays in QuickTime/Safari too.
-        reencode = video_codec(video_path) not in MP4_COPYABLE_VCODECS
-        try:
-            _run_ffmpeg_progress(
-                mux_video_cmd(video_path, chunk_files, out, reencode_video=reencode),
-                total_seconds, _enc_pct,
-            )
-        except HTTPException:
-            if reencode:
-                raise  # already re-encoding; nothing left to fall back to
-            # A copy we expected to work didn't — re-encode as a fallback.
-            log.warning(
-                "video mux (copy) failed for %s; retrying with H.264 re-encode",
-                job_id,
-            )
-            # The retry's progress restarts at 0; reset the published
-            # percent so the poller doesn't see it jump backward mid-export.
+            # --- Phase 2: mux the stripped audio over the video ---
             _export_progress.set(progress_key, "encoding", 0.0)
-            _run_ffmpeg_progress(
-                mux_video_cmd(video_path, chunk_files, out, reencode_video=True),
-                total_seconds, _enc_pct,
-            )
-    except BaseException:
-        _export_progress.clear(progress_key)
-        if tmp_dir is not None:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
+            tmp_dir = Path(tempfile.mkdtemp(prefix="nomusic-mp4-"))
+            out = tmp_dir / "full.mp4"
+            total_seconds = video_duration(video_path)
+
+            def _enc_pct(frac: float) -> None:
+                _export_progress.set(progress_key, "encoding", 100.0 * frac)
+
+            # Copy H.264/HEVC straight through (fast, lossless); re-encode
+            # VP9/AV1 to H.264 so the MP4 plays in QuickTime/Safari too.
+            reencode = video_codec(video_path) not in MP4_COPYABLE_VCODECS
+            try:
+                _run_ffmpeg_progress(
+                    mux_video_cmd(video_path, chunk_files, out, reencode_video=reencode),
+                    total_seconds, _enc_pct,
+                )
+            except HTTPException:
+                if reencode:
+                    raise  # already re-encoding; nothing left to fall back to
+                # A copy we expected to work didn't — re-encode as a fallback.
+                log.warning(
+                    "video mux (copy) failed for %s; retrying with H.264 re-encode",
+                    job_id,
+                )
+                # The retry's progress restarts at 0; reset the published
+                # percent so the poller doesn't see it jump backward mid-export.
+                _export_progress.set(progress_key, "encoding", 0.0)
+                _run_ffmpeg_progress(
+                    mux_video_cmd(video_path, chunk_files, out, reencode_video=True),
+                    total_seconds, _enc_pct,
+                )
+        except BaseException:
+            _export_progress.clear(progress_key)
+            if tmp_dir is not None:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
 
     _export_progress.set(progress_key, "done", 100.0)
 
@@ -385,16 +442,13 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
     )
 
 
-@router.get("/video/{job_id}/progress")
-def video_progress(job_id: str, max_height: Optional[int] = None) -> JsonDict:
+@router.get("/video/{job_id}/progress", dependencies=[Depends(require_edge)])
+def video_progress(job_id: JobId, max_height: Optional[int] = None) -> JsonDict:
     """Current MP4-export progress for the extension's download menu.
 
     Returns ``{"phase": "downloading"|"encoding"|"done"|"idle", "percent":
     0..100}``. ``idle`` means no export is in flight for this (job,
     resolution) — the extension stops polling once its download fetch
-    resolves, so a stale entry never lingers."""
-    if max_height is not None and max_height <= 0:
-        max_height = None
-    if max_height is not None:
-        max_height = max(144, min(4320, max_height))
-    return _export_progress.get(_export_progress.key(job_id, max_height))
+    resolves, so a stale entry never lingers. The height is snapped exactly as
+    in :func:`video` so the progress key matches."""
+    return _export_progress.get(_export_progress.key(job_id, _snap_height(max_height)))

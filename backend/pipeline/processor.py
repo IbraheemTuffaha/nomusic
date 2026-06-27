@@ -25,6 +25,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -189,6 +190,12 @@ def plan_chunks(
 # being approximate (VBR), so we never slice a chunk whose tail hasn't landed.
 _PROGRESSIVE_MARGIN_SECONDS = 3.0
 _PROGRESSIVE_POLL_SECONDS = 0.15
+# How long a guarded exit waits for the background download thread to actually
+# terminate after ``cancel()``. ``cancel()`` only sets the event; a stalled
+# socket is bounded by the download's ``socket_timeout`` (30s), so this covers
+# that plus margin. The lock isn't released until the thread is gone, so a
+# waiting same-url_key job can't race the orphan into ``sources/<url_key>``.
+_PROGRESSIVE_JOIN_TIMEOUT_SECONDS = 35.0
 
 
 class _ProgressiveSource:
@@ -246,6 +253,20 @@ class _ProgressiveSource:
         completion (a no-op then). The download thread aborts at its next
         progress callback and any chunk waiting in ``source_for`` is released."""
         self._cancel.set()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        """Block until the background download thread has terminated (or
+        ``timeout`` elapses). Pair with ``cancel()`` on a guarded exit so the
+        per-url_key lock isn't released while an orphaned download is still
+        writing into ``sources/<url_key>``. On the success path the thread is
+        already done, so this returns immediately."""
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            log.warning(
+                "progressive: download thread still running after %.0fs join; "
+                "releasing source guard with the download not yet stopped",
+                timeout if timeout is not None else 0.0,
+            )
 
     def _hook(self, d: dict) -> None:
         # Raising from a yt-dlp progress hook aborts the download — that's how a
@@ -373,8 +394,54 @@ class Processor:
         self.chunk_overlap_seconds = chunk_overlap_seconds
         self.keep_source_after_complete = keep_source_after_complete
         self.progressive = progressive
+        # Serialize jobs that share a source dir. Two jobs for the same URL but
+        # different (model, stems) have distinct cache keys — so they aren't
+        # deduped and aren't capped together — yet both resolve to the same
+        # ``sources/<url_key>`` dir (cache.url_key is url-only). The per-url_key
+        # lock below makes them run the source-using body one-at-a-time; jobs
+        # for *different* URLs still run concurrently. ``_source_refs`` tracks
+        # in-flight referencers per url_key so the finisher only drops the
+        # shared source when no waiting same-URL job still needs it.
+        self._source_meta_lock = threading.Lock()
+        self._source_locks: dict[str, threading.Lock] = {}
+        self._source_refs: dict[str, int] = {}
 
     # -- planning ------------------------------------------------------------
+
+    @contextmanager
+    def _source_guard(self, url: str):
+        """Serialize jobs that share ``sources/<url_key>`` end-to-end.
+
+        Yields the url_key. Holds a per-url_key lock for the whole source-using
+        body (download/setup, the chunk loop, and the mark-complete/drop-source
+        decision) so two same-URL jobs with different (model, stems) can't (a)
+        interleave writes into the shared ``source.<ext>`` download or (b) have
+        one ``rmtree`` the source dir while the other is still slicing. Jobs for
+        different URLs hold different locks and run concurrently — the GPU stays
+        serialized only by the engine's infer lock, so the F2 win (whole-pipeline
+        lock removed) holds. Lock ordering is safe: this per-url_key lock is
+        always acquired *before* the engine infer lock, never the reverse.
+
+        The finally releases the per-key lock even on WorkerAbandoned / engine
+        failure, then drops the ref count (deleting both map entries at zero) so
+        the maps don't grow without bound.
+        """
+        k = self.cache.url_key(url)
+        with self._source_meta_lock:
+            self._source_refs[k] = self._source_refs.get(k, 0) + 1
+            lock = self._source_locks.get(k)
+            if lock is None:
+                lock = self._source_locks[k] = threading.Lock()
+        lock.acquire()
+        try:
+            yield k
+        finally:
+            lock.release()
+            with self._source_meta_lock:
+                self._source_refs[k] -= 1
+                if self._source_refs[k] <= 0:
+                    del self._source_refs[k]
+                    del self._source_locks[k]
 
     def prepare_job(
         self,
@@ -495,213 +562,266 @@ class Processor:
                 on_download_progress(1.0)
             return key
 
-        # Download the full source once. Each chunk is sliced from this file
-        # so cuts are sample-accurate (yt-dlp's per-range download cuts at the
-        # nearest preceding keyframe, which drifts by 5-10 s on AAC/Opus).
-        def _yt_hook(d: dict) -> None:
-            if not on_download_progress:
-                return
-            try:
-                if d.get("status") == "downloading":
-                    total = d.get("total_bytes") or d.get("total_bytes_estimate")
-                    done = d.get("downloaded_bytes", 0)
-                    on_download_progress(done / total if total else None)
-                elif d.get("status") == "finished":
-                    on_download_progress(1.0)
-            except Exception:  # never let a UI hook break the pipeline
-                log.debug("download progress hook raised", exc_info=True)
-
-        source_dir = self.cache.source_dir(url)
-        dl: _ProgressiveSource | None = None
-        if self.progressive:
-            # Download on a background thread; ``source_for`` blocks per chunk
-            # until enough of the timeline is on disk to slice it.
-            dl = _ProgressiveSource(
-                url, source_dir, info.duration_seconds, _yt_hook, fetcher=fetcher
-            )
-            dl.start()
-            source_for = lambda plan: dl.source_for(
-                plan, self.chunk_overlap_seconds, abort_check, on_wait_for_download
-            )
-        elif fetcher is not None:
-            # First run: download from the session that already extracted info.
-            full = fetcher.download(progress_hook=_yt_hook)
-            source_for = lambda plan: full
-        else:
-            # Resume: download the full source up front (cached source returns
-            # immediately); every chunk slices from it.
-            full = download_source(url, source_dir, progress_hook=_yt_hook)
-            source_for = lambda plan: full
-
-        plans_by_index = {p.index: p for p in plans}
-        # Default provider: simple FIFO over remaining chunks. Used by the
-        # CLI and tests; jobs.py supplies its own that supports reordering.
-        if next_chunk_provider is None:
-            fallback = deque(
-                p.index for p in plans if p.index not in meta.chunks_ready
-            )
-            next_chunk_provider = lambda: fallback.popleft() if fallback else None
-
-        # ---- Pipelined stages so the GPU runs back-to-back -------------------
-        # decode (producer thread)  →  infer (GPU, THIS thread, batched)  →
-        # mix+write (consumer thread). Chunks are decoded ahead and writes drain
-        # behind, so the per-chunk CPU/IO (~25% of wall, serial before) hides
-        # inside the GPU window; the GPU itself separates several chunks per call
-        # to fill its cores. Only this thread calls the engine (single GPU
-        # stream) and only the write pool touches cache meta (single writer).
-        loop_start = time.perf_counter()
-        total_gpu = 0.0
-        chunks_processed = 0
-        logged_first = False
-
-        def _log_duty() -> None:
-            if not chunks_processed:
-                return
-            loop_wall = time.perf_counter() - loop_start
-            duty = 100.0 * total_gpu / loop_wall if loop_wall > 0 else 0.0
-            # GPU-busy vs the whole processing loop — the headline "how fully are
-            # we using the GPU" number. Logged on completion AND on abandon.
-            log.info(
-                "GPU duty cycle: %.0f%% — %.1fs GPU / %.1fs wall across %d "
-                "chunks (%.1fs idle around/between chunks)",
-                duty, total_gpu, loop_wall, chunks_processed,
-                max(0.0, loop_wall - total_gpu),
+        # Hold the per-url_key source guard across the whole source-using body
+        # (download/setup, the chunk loop, and the mark-complete/drop-source
+        # decision). This serializes a concurrent same-URL job with different
+        # (model, stems) — which shares this ``sources/<url_key>`` dir — so the
+        # two can't race on the shared download or on drop_source. Different-URL
+        # jobs hold different guards and stay concurrent.
+        with self._source_guard(url) as url_key:
+            # Download the full source once. Each chunk is sliced from this file
+            # so cuts are sample-accurate (yt-dlp's per-range download cuts at the
+            # nearest preceding keyframe, which drifts by 5-10 s on AAC/Opus).
+            # Absolute download deadline (public mode): a slow trickle that never
+            # reaches a chunk boundary is otherwise only bounded by the much larger
+            # job deadline. ``_DownloadCancelled`` unwinds the download cleanly.
+            _dl_deadline = (
+                time.monotonic() + SETTINGS.download_deadline_seconds
+                if SETTINGS.public and SETTINGS.download_deadline_seconds > 0
+                else None
             )
 
-        def _next_decoded() -> _ChunkWork | None:
-            """Pick the next pending chunk and decode it (CPU/IO half). Returns a
-            ``_ChunkWork``, or ``None`` when the queue is exhausted. Raises
-            ``WorkerAbandoned`` (from the provider) to abort the run. Runs on the
-            single decode thread, so its skip-check reads are race-free."""
-            nonlocal logged_first
-            while True:
-                idx = next_chunk_provider()  # may raise WorkerAbandoned
-                if idx is None:
-                    return None
-                plan = plans_by_index.get(idx)
-                if plan is None:
-                    log.warning("provider returned unknown chunk index %d", idx)
-                    continue
-                # Race-safety: another caller may have finished this chunk
-                # between picks. Skip if so.
-                current_meta = self.cache.load_meta(key)
-                if (
-                    current_meta
-                    and plan.index in current_meta.chunks_ready
-                    and self.cache.chunk_path(key, plan.index).exists()
-                ):
-                    continue
-                source_path = source_for(plan)
-                if dl is not None and not logged_first:
-                    logged_first = True
-                    log.debug(
-                        "progressive: first chunk %d released with download %s "
-                        "(%.0f/%.0fs on disk)",
-                        plan.index,
-                        "still running" if not dl.is_done() else "already complete",
-                        dl.available_seconds(),
-                        info.duration_seconds,
-                    )
-                return self._decode_chunk(source_path, key, plan, model=model, dl=dl)
+            def _check_download_deadline() -> None:
+                if _dl_deadline is not None and time.monotonic() > _dl_deadline:
+                    raise _DownloadCancelled()
 
-        # Batch up to BATCH chunks per GPU call: a single chunk leaves the GPU
-        # cores partly idle, so we separate a few at once for higher throughput
-        # at identical per-chunk output. Decode stays on one thread (so the
-        # provider's skip-check is race-free) but we keep BATCH decodes queued so
-        # a full batch is usually ready when the GPU frees up.
-        batch_size = max(1, SETTINGS.gpu_batch)
-        decode_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nm-decode")
-        write_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nm-write")
-        write_futures: list = []
-        inflight: deque = deque()
-        stream_done = False
+            def _abort_with_deadline() -> None:
+                # Combined per-poll check for the progressive wait: job abandon/idle
+                # (WorkerAbandoned) plus the download deadline (DownloadCancelled).
+                if abort_check:
+                    abort_check()
+                _check_download_deadline()
 
-        def _refill() -> None:
-            while not stream_done and len(inflight) < batch_size:
-                inflight.append(decode_pool.submit(_next_decoded))
+            def _yt_hook(d: dict) -> None:
+                # Enforce the download deadline from the yt-dlp progress callback so a
+                # blocking (non-progressive) download is bounded too; raising here
+                # aborts the download. (In progressive mode this hook is wrapped by
+                # _ProgressiveSource, which swallows exceptions, so the deadline there
+                # is enforced via _abort_with_deadline in source_for instead.)
+                _check_download_deadline()
+                if not on_download_progress:
+                    return
+                try:
+                    if d.get("status") == "downloading":
+                        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                        done = d.get("downloaded_bytes", 0)
+                        on_download_progress(done / total if total else None)
+                    elif d.get("status") == "finished":
+                        on_download_progress(1.0)
+                except Exception:  # never let a UI hook break the pipeline
+                    log.debug("download progress hook raised", exc_info=True)
 
-        try:
-            _refill()
-            while inflight:
-                # Block for the first ready chunk, then add only chunks that are
-                # ALREADY decoded — never wait to *fill* a batch. So at startup
-                # or right after a seek (one chunk ready) we run a batch of 1 at
-                # minimal latency, while in steady state (decode running ahead of
-                # the GPU) the batch fills to ``batch_size``.
-                batch_works: list[_ChunkWork] = []
-                work = inflight.popleft().result()  # may raise WorkerAbandoned
-                if work is None:
-                    stream_done = True
-                else:
-                    batch_works.append(work)
-                    _refill()
-                    while (
-                        inflight
-                        and len(batch_works) < batch_size
-                        and inflight[0].done()
+            source_dir = self.cache.source_dir(url)
+            dl: _ProgressiveSource | None = None
+            if self.progressive:
+                # Download on a background thread; ``source_for`` blocks per chunk
+                # until enough of the timeline is on disk to slice it.
+                dl = _ProgressiveSource(
+                    url, source_dir, info.duration_seconds, _yt_hook, fetcher=fetcher
+                )
+                dl.start()
+                source_for = lambda plan: dl.source_for(
+                    plan, self.chunk_overlap_seconds, _abort_with_deadline, on_wait_for_download
+                )
+            elif fetcher is not None:
+                # First run: download from the session that already extracted info.
+                full = fetcher.download(progress_hook=_yt_hook)
+                source_for = lambda plan: full
+            else:
+                # Resume: download the full source up front (cached source returns
+                # immediately); every chunk slices from it.
+                full = download_source(url, source_dir, progress_hook=_yt_hook)
+                source_for = lambda plan: full
+
+            plans_by_index = {p.index: p for p in plans}
+            # Default provider: simple FIFO over remaining chunks. Used by the
+            # CLI and tests; jobs.py supplies its own that supports reordering.
+            if next_chunk_provider is None:
+                fallback = deque(
+                    p.index for p in plans if p.index not in meta.chunks_ready
+                )
+                next_chunk_provider = lambda: fallback.popleft() if fallback else None
+
+            # ---- Pipelined stages so the GPU runs back-to-back -------------------
+            # decode (producer thread)  →  infer (GPU, THIS thread, batched)  →
+            # mix+write (consumer thread). Chunks are decoded ahead and writes drain
+            # behind, so the per-chunk CPU/IO (~25% of wall, serial before) hides
+            # inside the GPU window; the GPU itself separates several chunks per call
+            # to fill its cores. Only this thread calls the engine (single GPU
+            # stream) and only the write pool touches cache meta (single writer).
+            loop_start = time.perf_counter()
+            total_gpu = 0.0
+            chunks_processed = 0
+            logged_first = False
+
+            def _log_duty() -> None:
+                if not chunks_processed:
+                    return
+                loop_wall = time.perf_counter() - loop_start
+                duty = 100.0 * total_gpu / loop_wall if loop_wall > 0 else 0.0
+                # GPU-busy vs the whole processing loop — the headline "how fully are
+                # we using the GPU" number. Logged on completion AND on abandon.
+                log.info(
+                    "GPU duty cycle: %.0f%% — %.1fs GPU / %.1fs wall across %d "
+                    "chunks (%.1fs idle around/between chunks)",
+                    duty, total_gpu, loop_wall, chunks_processed,
+                    max(0.0, loop_wall - total_gpu),
+                )
+
+            def _next_decoded() -> _ChunkWork | None:
+                """Pick the next pending chunk and decode it (CPU/IO half). Returns a
+                ``_ChunkWork``, or ``None`` when the queue is exhausted. Raises
+                ``WorkerAbandoned`` (from the provider) to abort the run. Runs on the
+                single decode thread, so its skip-check reads are race-free."""
+                nonlocal logged_first
+                while True:
+                    idx = next_chunk_provider()  # may raise WorkerAbandoned
+                    if idx is None:
+                        return None
+                    plan = plans_by_index.get(idx)
+                    if plan is None:
+                        log.warning("provider returned unknown chunk index %d", idx)
+                        continue
+                    # Race-safety: another caller may have finished this chunk
+                    # between picks. Skip if so.
+                    current_meta = self.cache.load_meta(key)
+                    if (
+                        current_meta
+                        and plan.index in current_meta.chunks_ready
+                        and self.cache.chunk_path(key, plan.index).exists()
                     ):
-                        nxt = inflight.popleft().result()
-                        if nxt is None:
-                            stream_done = True
-                            break
-                        batch_works.append(nxt)
-                        _refill()
-                if not batch_works:
-                    break
-                # GPU stage — this thread only.
-                if on_progress:
-                    m = self.cache.load_meta(key)
-                    if m:
-                        on_progress(m, "separating")
-                ti = time.perf_counter()
-                results = self.engine.infer_batch([w.prepared for w in batch_works])
-                dt = time.perf_counter() - ti
-                for work, result in zip(batch_works, results):
-                    work.result = result
-                    work.prepared = None  # free the decoded input tensor promptly
-                    work.t_infer = dt / len(batch_works)
-                    work.gpu = result.gpu_seconds or 0.0
-                    total_gpu += work.gpu
-                    chunks_processed += 1
-                    # Hand mix+write+record to the consumer; overlaps the next GPU.
-                    write_futures.append(
-                        write_pool.submit(
-                            self._finish_chunk, work, key, keep_stems, on_progress
+                        continue
+                    source_path = source_for(plan)
+                    if dl is not None and not logged_first:
+                        logged_first = True
+                        log.debug(
+                            "progressive: first chunk %d released with download %s "
+                            "(%.0f/%.0fs on disk)",
+                            plan.index,
+                            "still running" if not dl.is_done() else "already complete",
+                            dl.available_seconds(),
+                            info.duration_seconds,
                         )
-                    )
-                # Bound the write backlog and surface any consumer error early.
-                while len(write_futures) > 2 * batch_size:
-                    write_futures.pop(0).result()
-            for f in write_futures:
-                f.result()
-        except BaseException:
-            # Abandon (idle), engine failure, or any other abort: stop the
-            # background download so it doesn't keep running (orphaned yt-dlp)
-            # and so a decode thread blocked in source_for waiting for bytes is
-            # released — otherwise the GPU lock stays held until the download
-            # happens to land.
-            if dl is not None:
-                dl.cancel()
-            raise
-        finally:
-            # cancel_futures drops decodes still queued behind a cancel; the
-            # in-flight one is released by dl.cancel() above. Writes drain
-            # (wait, no cancel) so any already-separated chunk still lands.
-            decode_pool.shutdown(wait=True, cancel_futures=True)
-            write_pool.shutdown(wait=True)
-            _log_duty()
+                    return self._decode_chunk(source_path, key, plan, model=model, dl=dl)
 
-        # Mark complete when every chunk is on disk.
-        all_present = all(
-            self.cache.chunk_path(key, p.index).exists() for p in plans
-        )
-        if all_present:
-            self.cache.mark_complete(key)
-            if not self.keep_source_after_complete:
-                # Source has served its purpose. Re-watches read straight from
-                # the chunk Opus files; only a stems/model change would need
-                # it back, and that re-downloads transparently.
-                self.cache.drop_source(url)
+            # Batch up to BATCH chunks per GPU call: a single chunk leaves the GPU
+            # cores partly idle, so we separate a few at once for higher throughput
+            # at identical per-chunk output. Decode stays on one thread (so the
+            # provider's skip-check is race-free) but we keep BATCH decodes queued so
+            # a full batch is usually ready when the GPU frees up.
+            batch_size = max(1, SETTINGS.gpu_batch)
+            decode_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nm-decode")
+            write_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nm-write")
+            write_futures: list = []
+            inflight: deque = deque()
+            stream_done = False
+
+            def _refill() -> None:
+                while not stream_done and len(inflight) < batch_size:
+                    inflight.append(decode_pool.submit(_next_decoded))
+
+            try:
+                _refill()
+                while inflight:
+                    # Block for the first ready chunk, then add only chunks that are
+                    # ALREADY decoded — never wait to *fill* a batch. So at startup
+                    # or right after a seek (one chunk ready) we run a batch of 1 at
+                    # minimal latency, while in steady state (decode running ahead of
+                    # the GPU) the batch fills to ``batch_size``.
+                    batch_works: list[_ChunkWork] = []
+                    work = inflight.popleft().result()  # may raise WorkerAbandoned
+                    if work is None:
+                        stream_done = True
+                    else:
+                        batch_works.append(work)
+                        _refill()
+                        while (
+                            inflight
+                            and len(batch_works) < batch_size
+                            and inflight[0].done()
+                        ):
+                            nxt = inflight.popleft().result()
+                            if nxt is None:
+                                stream_done = True
+                                break
+                            batch_works.append(nxt)
+                            _refill()
+                    if not batch_works:
+                        break
+                    # GPU stage — this thread only.
+                    if on_progress:
+                        m = self.cache.load_meta(key)
+                        if m:
+                            on_progress(m, "separating")
+                    ti = time.perf_counter()
+                    results = self.engine.infer_batch([w.prepared for w in batch_works])
+                    dt = time.perf_counter() - ti
+                    for work, result in zip(batch_works, results):
+                        work.result = result
+                        work.prepared = None  # free the decoded input tensor promptly
+                        work.t_infer = dt / len(batch_works)
+                        work.gpu = result.gpu_seconds or 0.0
+                        total_gpu += work.gpu
+                        chunks_processed += 1
+                        # Hand mix+write+record to the consumer; overlaps the next GPU.
+                        write_futures.append(
+                            write_pool.submit(
+                                self._finish_chunk, work, key, keep_stems, on_progress
+                            )
+                        )
+                    # Bound the write backlog and surface any consumer error early.
+                    while len(write_futures) > 2 * batch_size:
+                        write_futures.pop(0).result()
+                for f in write_futures:
+                    f.result()
+            except BaseException:
+                # Abandon (idle), engine failure, or any other abort: stop the
+                # background download so it doesn't keep running (orphaned yt-dlp)
+                # and so a decode thread blocked in source_for waiting for bytes is
+                # released — otherwise the GPU lock stays held until the download
+                # happens to land.
+                if dl is not None:
+                    dl.cancel()
+                raise
+            finally:
+                # cancel_futures drops decodes still queued behind a cancel; the
+                # in-flight one is released by dl.cancel() above. Writes drain
+                # (wait, no cancel) so any already-separated chunk still lands.
+                decode_pool.shutdown(wait=True, cancel_futures=True)
+                write_pool.shutdown(wait=True)
+                # Don't release the per-url_key source guard until the background
+                # download thread is actually gone. cancel() only sets the event
+                # (honored at the next progress tick / up to the download's
+                # socket_timeout), so without this join the guard would release
+                # while an orphaned download is still writing into the shared
+                # sources/<url_key> dir — letting a waiting same-url_key job race
+                # it. On success dl is already done so join returns instantly; on
+                # abort the except-block cancel() above has run, so this just
+                # waits out the unwind (bounded). Non-progressive runs (dl is
+                # None) are unaffected.
+                if dl is not None:
+                    dl.cancel()
+                    dl.join(timeout=_PROGRESSIVE_JOIN_TIMEOUT_SECONDS)
+                _log_duty()
+
+            # Mark complete when every chunk is on disk.
+            all_present = all(
+                self.cache.chunk_path(key, p.index).exists() for p in plans
+            )
+            if all_present:
+                self.cache.mark_complete(key)
+                if not self.keep_source_after_complete:
+                    # Source has served its purpose. Re-watches read straight from
+                    # the chunk Opus files; only a stems/model change would need
+                    # it back, and that re-downloads transparently. Drop it only if
+                    # no concurrent same-URL job is still referencing the shared
+                    # source dir — otherwise a waiting same-URL job would be forced
+                    # to re-download. We still hold the guard here, so our own ref
+                    # is counted: <= 1 means we're the sole (last) referencer.
+                    with self._source_meta_lock:
+                        is_last_referencer = self._source_refs.get(url_key, 0) <= 1
+                    if is_last_referencer:
+                        self.cache.drop_source(url)
 
         return key
 
