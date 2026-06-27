@@ -166,7 +166,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     const value = $("backend").value.trim();
     if (value) {
       try {
-        const origin = new URL(value).origin + "/*";
+        // Chrome match patterns don't accept a port, and URL.origin includes
+        // one for non-default ports (e.g. http://host.local:8723). Build the
+        // pattern from protocol + hostname only; host/* covers any port — which
+        // matters because the backend's own default port is 8723.
+        const u = new URL(value);
+        const origin = `${u.protocol}//${u.hostname}/*`;
         await chrome.permissions.request({ origins: [origin] });
       } catch (err) {
         console.debug("[nomusic] backend permission request failed", err);

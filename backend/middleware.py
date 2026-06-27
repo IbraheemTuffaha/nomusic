@@ -29,16 +29,24 @@ class MaxBodySizeMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if SETTINGS.public and request.method in ("POST", "PUT", "PATCH"):
             cl = request.headers.get("content-length")
-            if cl is not None:
-                try:
-                    if int(cl) > SETTINGS.max_request_bytes:
-                        return JSONResponse(
-                            {"detail": "request body too large"}, status_code=413
-                        )
-                except ValueError:
+            if cl is None:
+                # Without a Content-Length the size cap below can't run, and a
+                # Transfer-Encoding: chunked body would otherwise be buffered
+                # whole — bypassing the control entirely. The extension always
+                # sends a Content-Length, so require one (411) rather than let a
+                # bodyless-declared chunked upload slip past the cap.
+                return JSONResponse(
+                    {"detail": "Length Required"}, status_code=411
+                )
+            try:
+                if int(cl) > SETTINGS.max_request_bytes:
                     return JSONResponse(
-                        {"detail": "invalid Content-Length"}, status_code=400
+                        {"detail": "request body too large"}, status_code=413
                     )
+            except ValueError:
+                return JSONResponse(
+                    {"detail": "invalid Content-Length"}, status_code=400
+                )
         return await call_next(request)
 
 

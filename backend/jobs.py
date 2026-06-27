@@ -279,6 +279,22 @@ class JobRegistry:
                     raise JobRejected("insufficient disk")
 
             self._jobs[key] = status
+            # Supersede case: a predecessor worker for this same key may still be
+            # mid-abandon and not have released its admission charge. Once we
+            # install our fresh thread below, that worker's _run finally guard
+            # (`_threads[key] is my_thread`) goes False, so it will never release.
+            # Retract its charge here — before we add ours — so every
+            # ``_ip_counts`` increment keeps exactly one matching decrement;
+            # otherwise the orphaned charge leaks and can permanently 429-lock an
+            # innocent IP. No-op for a genuinely new key.
+            if key in self._inflight:
+                prev_ip = self._ip_by_key.pop(key, None)
+                if prev_ip is not None:
+                    prev_remaining = self._ip_counts.get(prev_ip, 0) - 1
+                    if prev_remaining > 0:
+                        self._ip_counts[prev_ip] = prev_remaining
+                    else:
+                        self._ip_counts.pop(prev_ip, None)
             self._inflight.add(key)
             self._ip_counts[client_ip] += 1
             self._ip_by_key[key] = client_ip
@@ -698,6 +714,7 @@ class JobRegistry:
             status = self._jobs.get(key)
             if (
                 status is not None
+                and SETTINGS.public
                 and SETTINGS.job_deadline_seconds > 0
                 and time.time() - status.created_at >= SETTINGS.job_deadline_seconds
             ):
