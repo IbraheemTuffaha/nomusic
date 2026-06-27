@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 from config import SETTINGS
-from netsec import UrlNotAllowed, validate_public_url
+from netsec import validate_public_url
 from pipeline import downloader
 from pipeline.cache import CHUNK_MEDIA_TYPE
 from pipeline.export import (
@@ -345,7 +345,11 @@ def video(job_id: JobId, request: Request, max_height: Optional[int] = None) -> 
     # one place a cached job triggers a fresh download.
     try:
         validate_public_url(meta.url)
-    except UrlNotAllowed:
+    except ValueError:
+        # ``UrlNotAllowed`` (policy reject) subclasses ValueError, but
+        # ``validate_public_url`` also raises a bare ValueError when the host
+        # can't be resolved (DNS failure); both map to a 404 here rather than
+        # escaping to the generic 500 handler.
         raise HTTPException(status_code=404)
 
     chunk_files = snapshot_chunk_files(cache, job_id, meta.total_chunks)
