@@ -190,6 +190,12 @@ def plan_chunks(
 # being approximate (VBR), so we never slice a chunk whose tail hasn't landed.
 _PROGRESSIVE_MARGIN_SECONDS = 3.0
 _PROGRESSIVE_POLL_SECONDS = 0.15
+# How long a guarded exit waits for the background download thread to actually
+# terminate after ``cancel()``. ``cancel()`` only sets the event; a stalled
+# socket is bounded by the download's ``socket_timeout`` (30s), so this covers
+# that plus margin. The lock isn't released until the thread is gone, so a
+# waiting same-url_key job can't race the orphan into ``sources/<url_key>``.
+_PROGRESSIVE_JOIN_TIMEOUT_SECONDS = 35.0
 
 
 class _ProgressiveSource:
@@ -247,6 +253,20 @@ class _ProgressiveSource:
         completion (a no-op then). The download thread aborts at its next
         progress callback and any chunk waiting in ``source_for`` is released."""
         self._cancel.set()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        """Block until the background download thread has terminated (or
+        ``timeout`` elapses). Pair with ``cancel()`` on a guarded exit so the
+        per-url_key lock isn't released while an orphaned download is still
+        writing into ``sources/<url_key>``. On the success path the thread is
+        already done, so this returns immediately."""
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            log.warning(
+                "progressive: download thread still running after %.0fs join; "
+                "releasing source guard with the download not yet stopped",
+                timeout if timeout is not None else 0.0,
+            )
 
     def _hook(self, d: dict) -> None:
         # Raising from a yt-dlp progress hook aborts the download — that's how a
@@ -769,6 +789,19 @@ class Processor:
                 # (wait, no cancel) so any already-separated chunk still lands.
                 decode_pool.shutdown(wait=True, cancel_futures=True)
                 write_pool.shutdown(wait=True)
+                # Don't release the per-url_key source guard until the background
+                # download thread is actually gone. cancel() only sets the event
+                # (honored at the next progress tick / up to the download's
+                # socket_timeout), so without this join the guard would release
+                # while an orphaned download is still writing into the shared
+                # sources/<url_key> dir — letting a waiting same-url_key job race
+                # it. On success dl is already done so join returns instantly; on
+                # abort the except-block cancel() above has run, so this just
+                # waits out the unwind (bounded). Non-progressive runs (dl is
+                # None) are unaffected.
+                if dl is not None:
+                    dl.cancel()
+                    dl.join(timeout=_PROGRESSIVE_JOIN_TIMEOUT_SECONDS)
                 _log_duty()
 
             # Mark complete when every chunk is on disk.
