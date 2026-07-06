@@ -48,6 +48,13 @@ CHUNK_MEDIA_TYPE = "audio/ogg"
 # The job-dir scans (stats, TTL sweep) skip these and handle them separately.
 _RESERVED_DIRS = frozenset({"sources", "videos"})
 
+# LRU eviction skips entries modified within this window: a live worker keeps its
+# dir's mtime fresh (source download / chunk writes), and the eviction sweeper —
+# which runs off-thread and can't see the Processor's source guard — must not
+# rmtree a directory still in use. Comfortably longer than any inter-write gap in
+# an active job, shorter than the cache TTL.
+_EVICT_MIN_IDLE_SECONDS = 600.0
+
 
 @dataclass
 class CacheMeta:
@@ -349,7 +356,16 @@ class JobCache:
         fill the disk between hourly sweeps — so the hosted deployment also calls
         this each sweep (and the admission path enforces a free-space floor).
         "Least recently used" uses each entry's newest file mtime, matching the
-        TTL sweep's notion of recency (a re-watch touches meta.json)."""
+        TTL sweep's notion of recency (a re-watch touches meta.json).
+
+        Runs on the sweeper thread, which can't see the Processor's per-url_key
+        source guard, so it must NOT rmtree a directory a live worker is writing
+        (source download / chunk writes) — that would reintroduce the
+        rmtree-under-live-reader race the source guard closes for drop_source. A
+        live worker keeps its dir's mtime fresh, so entries modified within
+        ``_EVICT_MIN_IDLE_SECONDS`` are treated as possibly-in-use and skipped;
+        the free-disk floor + admission refusal are the hard backstop if that
+        leaves the cache briefly above the soft cap."""
         if max_bytes <= 0:
             return (0, 0)
 
@@ -365,12 +381,18 @@ class JobCache:
         if total <= max_bytes:
             return (0, 0)
 
+        now = time.time()
         entries.sort(key=lambda e: e[1])  # oldest first
         removed = 0
         freed = 0
-        for child, _, size in entries:
+        skipped_active = False
+        for child, mtime, size in entries:
             if total <= max_bytes:
                 break
+            if mtime > now - _EVICT_MIN_IDLE_SECONDS:
+                # Recently touched -> a live worker may still be writing here.
+                skipped_active = True
+                continue
             shutil.rmtree(child, ignore_errors=True)
             total -= size
             freed += size
@@ -379,6 +401,12 @@ class JobCache:
             log.info(
                 "LRU evict removed %d entries (%d bytes) to fit %d-byte cap",
                 removed, freed, max_bytes,
+            )
+        if skipped_active and total > max_bytes:
+            log.info(
+                "LRU evict left cache above cap (%d > %d): remaining entries are "
+                "too recently active to evict safely",
+                total, max_bytes,
             )
         return (removed, freed)
 
