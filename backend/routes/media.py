@@ -63,18 +63,28 @@ def _ffmpeg_timeout_detail() -> str:
 
 
 def _snap_height(max_height: Optional[int]) -> Optional[int]:
-    """Normalize a requested export height. ``None``/<=0 → best available. In
-    public mode, snap to the nearest allowlisted height so ~4000 possible values
-    collapse to ≤len(allowed) cache keys (F8); in dev, keep the old 144–4320
-    clamp. video() and video_progress() must snap identically so their progress
-    keys match."""
-    if max_height is None or max_height <= 0:
-        return None
+    """Normalize a requested export height. In public mode the result is always a
+    bounded, allowlisted height (F8): a client can neither mint unbounded
+    per-height cache keys nor force a best-available (up-to-8K) download +
+    re-encode. In dev, keep the old ``None``/<=0 → best plus 144–4320 clamp.
+    video() and video_progress() must snap identically so their progress keys
+    match."""
     if SETTINGS.public:
         heights = SETTINGS.allowed_video_heights
-        if heights and max_height not in heights:
-            return min(heights, key=lambda h: abs(h - max_height))
-        return max_height
+        if not heights:
+            # Misconfigured empty allowlist: cap hard at a single safe height
+            # rather than letting an arbitrary client integer (or "best") through.
+            return 1080
+        # "best" (None/<=0) must NOT bypass the allowlist — snapping it to the
+        # true best-available re-opens the F8 8K download + CPU re-encode. Use the
+        # tallest allowed height instead.
+        if max_height is None or max_height <= 0:
+            return max(heights)
+        if max_height in heights:
+            return max_height
+        return min(heights, key=lambda h: abs(h - max_height))
+    if max_height is None or max_height <= 0:
+        return None
     return max(144, min(4320, max_height))
 
 # Block size (64 KiB) for streaming concatenated audio chunks to the client.
