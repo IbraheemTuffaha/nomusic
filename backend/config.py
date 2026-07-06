@@ -260,6 +260,11 @@ class Settings:
                 "youtu.be",
                 "m.youtube.com",
                 "music.youtube.com",
+                # Privacy-embed host: the extension's content scripts run on
+                # (and post page URLs from) youtube-nocookie.com, and yt-dlp's
+                # youtube extractor handles those URLs — so it must be allowed
+                # here too, or public-mode submissions from those pages 422.
+                "youtube-nocookie.com",
                 "www.facebook.com",
                 "facebook.com",
                 "m.facebook.com",
@@ -267,9 +272,16 @@ class Settings:
             ),
         )
     )
+    # yt-dlp extractor allowlist (matched case-insensitively against the IE key).
+    # ``facebook`` alone excludes ``facebook:reel``, so Facebook /reel/ URLs (an
+    # allowlisted host, reachable from the content script) would 404 at extraction
+    # without it. (fb.watch has no curated extractor and needs ``generic``, which
+    # stays disabled; the content scripts never run on fb.watch, so those URLs
+    # aren't submitted in practice.)
     allowed_extractors: tuple[str, ...] = field(
         default_factory=lambda: _env_tuple(
-            "ALLOWED_EXTRACTORS", ("youtube", "youtube:tab", "facebook")
+            "ALLOWED_EXTRACTORS",
+            ("youtube", "youtube:tab", "facebook", "facebook:reel"),
         )
     )
 
