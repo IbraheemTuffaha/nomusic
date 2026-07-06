@@ -352,15 +352,19 @@ def video(job_id: JobId, request: Request, max_height: Optional[int] = None) -> 
 
     # Re-validate the STORED url on this delayed outbound fetch (F12/F27): the
     # submit-time SSRF gate may predate a policy tightening, and /video is the
-    # one place a cached job triggers a fresh download.
-    try:
-        validate_public_url(meta.url)
-    except ValueError:
-        # ``UrlNotAllowed`` (policy reject) subclasses ValueError, but
-        # ``validate_public_url`` also raises a bare ValueError when the host
-        # can't be resolved (DNS failure); both map to a 404 here rather than
-        # escaping to the generic 500 handler.
-        raise HTTPException(status_code=404)
+    # one place a cached job triggers a fresh download. Public-only: the check
+    # does a live DNS resolution, so running it in dev would 404 a fully-cached
+    # export on any transient DNS blip — a behavior change vs pre-PR, which the
+    # no-op-unless-public invariant forbids.
+    if SETTINGS.public:
+        try:
+            validate_public_url(meta.url)
+        except ValueError:
+            # ``UrlNotAllowed`` (policy reject) subclasses ValueError, but
+            # ``validate_public_url`` also raises a bare ValueError when the host
+            # can't be resolved (DNS failure); both map to a 404 here rather than
+            # escaping to the generic 500 handler.
+            raise HTTPException(status_code=404)
 
     chunk_files = snapshot_chunk_files(cache, job_id, meta.total_chunks)
     if not chunk_files:
@@ -395,10 +399,16 @@ def video(job_id: JobId, request: Request, max_height: Optional[int] = None) -> 
                 )
             except Exception as exc:
                 # yt-dlp failures are the user's URL going stale / network
-                # issues, not a server bug — surface them as a 502 with a generic
-                # message (F20); the real cause is logged.
+                # issues, not a server bug — surface them as a 502. Public mode
+                # hides the cause (F20); dev keeps it for fast debugging, matching
+                # jobs.py's gating (the real cause is always logged).
                 log.warning("video download failed for %s", job_id, exc_info=True)
-                raise HTTPException(status_code=502, detail="video download failed")
+                detail = (
+                    "video download failed"
+                    if SETTINGS.public
+                    else f"{type(exc).__name__}: {exc}"
+                )
+                raise HTTPException(status_code=502, detail=detail) from exc
 
             # --- Phase 2: mux the stripped audio over the video ---
             _export_progress.set(progress_key, "encoding", 0.0)

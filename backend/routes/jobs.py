@@ -46,7 +46,7 @@ _SSE_DISCONNECT_POLL_SECONDS = 1.0
 
 
 class ProcessRequest(BaseModel):
-    url: str = Field(..., min_length=1, max_length=SETTINGS.max_url_length)
+    url: str = Field(..., min_length=1)
     model: Optional[str] = None
     keep_stems: Optional[list[str]] = Field(None, max_length=SETTINGS.max_keep_stems)
 
@@ -58,6 +58,12 @@ class ProcessRequest(BaseModel):
         # gate in :mod:`netsec` enforces scheme + (public-mode) host allowlist +
         # internal-IP block-list, and is reused verbatim at /video time on the
         # stored URL. ``UrlNotAllowed`` subclasses ValueError → pydantic 422.
+        #
+        # The length cap is public-only so dev keeps the pre-PR "any length"
+        # behavior (no-op-unless-public invariant); a bounded body is enforced by
+        # MaxBodySizeMiddleware in public mode regardless.
+        if SETTINGS.public and len(v) > SETTINGS.max_url_length:
+            raise ValueError("url is too long")
         return validate_public_url(v)
 
     @field_validator("keep_stems")
@@ -115,8 +121,14 @@ def process(req: ProcessRequest, request: Request) -> JsonDict:
         ) from exc
     except Exception as exc:
         log.exception("submit failed")
-        # Generic message (F20): the real cause is in the server log.
-        raise HTTPException(status_code=400, detail="could not start job") from exc
+        # Public mode hides the cause (F20); dev keeps it for debugging, matching
+        # jobs.py's gating. The real cause is always in the server log.
+        detail = (
+            "could not start job"
+            if SETTINGS.public
+            else f"{type(exc).__name__}: {exc}"
+        )
+        raise HTTPException(status_code=400, detail=detail) from exc
     return status.to_dict()
 
 

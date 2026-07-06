@@ -19,10 +19,12 @@ _SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "Cross-Origin-Resource-Policy": "same-site",
-    # The API serves JSON / media, never HTML documents that load scripts, so a
-    # tight default CSP costs nothing and blunts any reflected-content surprise.
-    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
 }
+# A tight default CSP is right for the public API (JSON/media only), but it would
+# blank the Swagger/ReDoc docs (they load from a CDN) — and those pages exist only
+# in dev, where they're hidden in public mode. So the CSP is public-only, keeping
+# the always-on headers above harmless everywhere and preserving dev /docs.
+_PUBLIC_CSP = "default-src 'none'; frame-ancestors 'none'"
 
 
 class MaxBodySizeMiddleware(BaseHTTPMiddleware):
@@ -55,4 +57,6 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         for name, value in _SECURITY_HEADERS.items():
             response.headers.setdefault(name, value)
+        if SETTINGS.public:
+            response.headers.setdefault("Content-Security-Policy", _PUBLIC_CSP)
         return response
