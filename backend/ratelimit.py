@@ -29,11 +29,25 @@ class _Window:
         self.window = window
         self._hits: dict[str, deque] = defaultdict(deque)
         self._lock = threading.Lock()
+        self._last_sweep = time.monotonic()
+
+    def _sweep(self, now: float) -> None:
+        """Drop buckets whose newest hit has fully expired. Without this, every
+        distinct client IP ever seen leaves a permanent (eventually-empty) bucket,
+        so ``_hits`` grows without bound on a long-lived public server. Held under
+        ``self._lock``; runs at most once per ``window`` so it's cheap amortized."""
+        cutoff = now - self.window
+        dead = [k for k, dq in self._hits.items() if not dq or dq[-1] <= cutoff]
+        for k in dead:
+            del self._hits[k]
 
     def check(self, key: str) -> tuple[bool, int]:
         """Record a hit for ``key``; return ``(allowed, retry_after_seconds)``."""
         now = time.monotonic()
         with self._lock:
+            if now - self._last_sweep >= self.window:
+                self._sweep(now)
+                self._last_sweep = now
             dq = self._hits[key]
             while dq and dq[0] <= now - self.window:
                 dq.popleft()
@@ -97,11 +111,15 @@ class SseCounter:
 
     def acquire(self, job: str, ip: str) -> bool:
         with self._lock:
+            # Read with .get so a rejected acquire doesn't create a 0-count entry
+            # via defaultdict — those never get released and leak unboundedly with
+            # distinct job ids / IPs. Only the success path (below) creates keys,
+            # and release() drops them back at 0.
             if self._global >= SETTINGS.max_sse_global:
                 return False
-            if self._per_job[job] >= SETTINGS.max_sse_per_job:
+            if self._per_job.get(job, 0) >= SETTINGS.max_sse_per_job:
                 return False
-            if self._per_ip[ip] >= SETTINGS.max_sse_per_ip:
+            if self._per_ip.get(ip, 0) >= SETTINGS.max_sse_per_ip:
                 return False
             self._per_job[job] += 1
             self._per_ip[ip] += 1
