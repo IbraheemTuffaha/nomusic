@@ -269,32 +269,45 @@ class JobRegistry:
             # About to spawn a worker for genuinely new/resumed work: enforce the
             # admission caps (F1) and the free-disk floor (F7). All no-ops unless
             # public. Checked under the lock so the counts can't race a sibling
-            # submit. JobRejected unwinds the lock cleanly (no state mutated yet).
+            # submit. JobRejected unwinds the lock cleanly (no admission state
+            # mutated yet).
+            #
+            # Supersede case: a predecessor worker for this same key may still be
+            # mid-abandon and holding its admission charge. Since we're replacing
+            # it, that charge must not count against the caps — otherwise a client
+            # resuming its OWN idle-abandoned job spuriously 429s at the cap even
+            # though the supersede keeps the net count unchanged. Evaluate the caps
+            # against the post-supersede counts, then retract the predecessor's
+            # charge for real once the checks pass.
+            superseding = key in self._inflight
+            prev_ip = self._ip_by_key.get(key) if superseding else None
             if SETTINGS.public:
-                if len(self._inflight) >= SETTINGS.max_inflight_jobs:
+                effective_inflight = len(self._inflight) - (1 if superseding else 0)
+                if effective_inflight >= SETTINGS.max_inflight_jobs:
                     raise JobRejected("server at capacity")
-                if self._ip_counts.get(client_ip, 0) >= SETTINGS.max_jobs_per_ip:
+                effective_ip = self._ip_counts.get(client_ip, 0) - (
+                    1 if prev_ip == client_ip else 0
+                )
+                if effective_ip >= SETTINGS.max_jobs_per_ip:
                     raise JobRejected("too many concurrent jobs")
                 if shutil.disk_usage(self.cache.root).free < SETTINGS.free_disk_floor_bytes:
                     raise JobRejected("insufficient disk")
 
             self._jobs[key] = status
-            # Supersede case: a predecessor worker for this same key may still be
-            # mid-abandon and not have released its admission charge. Once we
-            # install our fresh thread below, that worker's _run finally guard
-            # (`_threads[key] is my_thread`) goes False, so it will never release.
-            # Retract its charge here — before we add ours — so every
-            # ``_ip_counts`` increment keeps exactly one matching decrement;
-            # otherwise the orphaned charge leaks and can permanently 429-lock an
-            # innocent IP. No-op for a genuinely new key.
-            if key in self._inflight:
-                prev_ip = self._ip_by_key.pop(key, None)
-                if prev_ip is not None:
-                    prev_remaining = self._ip_counts.get(prev_ip, 0) - 1
-                    if prev_remaining > 0:
-                        self._ip_counts[prev_ip] = prev_remaining
+            # Retract the superseded predecessor's charge now that admission is
+            # granted. Once we install our fresh thread below, that worker's
+            # _retire_worker guard (`_threads[key] is my_thread`) goes False so it
+            # will never release — so every ``_ip_counts`` increment keeps exactly
+            # one matching decrement; otherwise the orphaned charge leaks and can
+            # permanently 429-lock an innocent IP. No-op for a genuinely new key.
+            if superseding:
+                old_ip = self._ip_by_key.pop(key, None)
+                if old_ip is not None:
+                    old_remaining = self._ip_counts.get(old_ip, 0) - 1
+                    if old_remaining > 0:
+                        self._ip_counts[old_ip] = old_remaining
                     else:
-                        self._ip_counts.pop(prev_ip, None)
+                        self._ip_counts.pop(old_ip, None)
             self._inflight.add(key)
             self._ip_counts[client_ip] += 1
             self._ip_by_key[key] = client_ip
@@ -531,44 +544,56 @@ class JobRegistry:
                 )
                 self._enter_phase(key, JobState.ERROR, progress=1.0, error=detail)
         finally:
-            # The control + any orphaned priority hint are only meaningful
-            # while a worker is consuming chunks; drop them unconditionally.
             with self._lock:
-                self._controls.pop(key, None)
-                self._pending_priority.pop(key, None)
-                # Only retract the shared bookkeeping if we're still the
-                # registered worker for this key. If a submit() raced our
-                # unwind and installed a fresh worker, _threads[key] now points
-                # at that thread, not us — leave its _threads/_subscribers/
-                # _jobs entries alone. Dropping our own handle marks the job as
-                # having no live worker, which is what ``memory_gc`` keys off.
-                if self._threads.get(key) is my_thread:
-                    self._threads.pop(key, None)
-                    self._subscribers.pop(key, None)
-                    self._last_disconnect_at.pop(key, None)
-                    self._abandoning.discard(key)
-                    # Release this worker's admission slot (F1) so the global +
-                    # per-IP caps free up. Guarded by the same "still our key"
-                    # check, so a racing fresh worker's slot is left intact.
-                    self._inflight.discard(key)
-                    ip = self._ip_by_key.pop(key, None)
-                    if ip is not None:
-                        remaining = self._ip_counts.get(ip, 0) - 1
-                        if remaining > 0:
-                            self._ip_counts[ip] = remaining
-                        else:
-                            self._ip_counts.pop(ip, None)
-                    # The terminal _update(READY/ERROR) above already enqueued
-                    # its snapshot to every open stream, so dropping
-                    # _subscribers here loses nothing; each stream still drains
-                    # and closes itself. A stream that opens after this sees the
-                    # terminal state from disk and short-circuits.
-                    if abandoned and self._jobs.get(key) is my_status:
-                        # Drop the JobStatus so a later /process spawns a fresh
-                        # worker (resuming from disk-cached chunks) rather than
-                        # finding a stale entry. Completed/errored jobs are kept
-                        # for /status until memory_gc reclaims them.
-                        self._jobs.pop(key, None)
+                self._retire_worker(key, my_thread, my_status, abandoned)
+
+    def _retire_worker(
+        self,
+        key: str,
+        my_thread: threading.Thread,
+        my_status: Optional[JobStatus],
+        abandoned: bool,
+    ) -> None:
+        """Retract all shared bookkeeping for a finishing worker — but ONLY if we
+        still own ``_threads[key]``.
+
+        If a submit() raced our unwind and installed a fresh worker, ``_threads[key]``
+        now points at that thread and it owns the shared state (including its own
+        ``_controls`` entry, built in ``_on_probed``). Touching anything here would
+        corrupt that successor — in particular, popping ``_controls[key]`` would
+        strip the successor's live chunk control, so its provider returns ``None``,
+        the loop treats the queue as exhausted, and the job flips to READY with
+        chunks permanently missing. So ``_controls``/``_pending_priority`` are
+        retracted under the same ownership guard as everything else, not
+        unconditionally. Must be called holding ``self._lock``."""
+        if self._threads.get(key) is not my_thread:
+            return
+        self._controls.pop(key, None)
+        self._pending_priority.pop(key, None)
+        self._threads.pop(key, None)
+        self._subscribers.pop(key, None)
+        self._last_disconnect_at.pop(key, None)
+        self._abandoning.discard(key)
+        # Release this worker's admission slot (F1) so the global + per-IP caps
+        # free up.
+        self._inflight.discard(key)
+        ip = self._ip_by_key.pop(key, None)
+        if ip is not None:
+            remaining = self._ip_counts.get(ip, 0) - 1
+            if remaining > 0:
+                self._ip_counts[ip] = remaining
+            else:
+                self._ip_counts.pop(ip, None)
+        # The terminal _update(READY/ERROR) above already enqueued its snapshot to
+        # every open stream, so dropping _subscribers here loses nothing; each
+        # stream still drains and closes itself. A stream that opens after this
+        # sees the terminal state from disk and short-circuits.
+        if abandoned and self._jobs.get(key) is my_status:
+            # Drop the JobStatus so a later /process spawns a fresh worker
+            # (resuming from disk-cached chunks) rather than finding a stale
+            # entry. Completed/errored jobs are kept for /status until memory_gc
+            # reclaims them.
+            self._jobs.pop(key, None)
 
     def _enter_phase(
         self,
@@ -605,14 +630,19 @@ class JobRegistry:
             chunks_ready=len(meta.chunks_ready),
             ready_chunks=sorted(meta.chunks_ready),
         )
-        # Now that we know total_chunks, build the per-job control. If a
-        # /prioritize call beat us here, apply the stashed hint now.
+        # Now that we know total_chunks, (re)build OUR per-job control from the
+        # on-disk truth. We always overwrite: a control already present at our
+        # probe time belongs to a superseded predecessor whose pending deque is
+        # missing the chunk it popped-but-never-finished, so adopting it would
+        # silently drop that chunk. Seeding fresh from meta.chunks_ready reincludes
+        # every not-yet-done chunk. _retire_worker only pops _controls[key] while
+        # our thread still owns _threads[key], so this object survives until we
+        # exit. If a /prioritize call beat us here, apply the stashed hint now.
         with self._lock:
-            if key not in self._controls:
-                self._controls[key] = _JobControl(
-                    total_chunks=meta.total_chunks,
-                    done=set(meta.chunks_ready),
-                )
+            self._controls[key] = _JobControl(
+                total_chunks=meta.total_chunks,
+                done=set(meta.chunks_ready),
+            )
             hint = self._pending_priority.pop(key, None)
         if hint is not None:
             self._controls[key].prioritize(hint)
