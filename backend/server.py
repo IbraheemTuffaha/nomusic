@@ -232,6 +232,13 @@ def create_app() -> FastAPI:
     #     and admission-capped, CORS is locked to the extension + curated-site
     #     origins, and allow_private_network is OFF (irrelevant on a public host).
     # See docs/remote-deployment/ for the full study.
+    # Middleware order matters: add_middleware installs each as the new OUTERMOST
+    # layer, so a request flows SecurityHeaders -> CORS -> MaxBodySize -> app and
+    # responses unwind in reverse. MaxBodySize is added FIRST (so it ends up
+    # inside CORS) on purpose: its 411/413/400 rejections then still pass back out
+    # through CORSMiddleware and carry Access-Control-Allow-Origin — otherwise a
+    # browser caller can't read the status and just sees an opaque network error.
+    app.add_middleware(MaxBodySizeMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=SETTINGS.cors_origins,
@@ -241,8 +248,6 @@ def create_app() -> FastAPI:
         allow_headers=["Content-Type", "X-Admin-Token"],
         allow_private_network=not SETTINGS.public,
     )
-    # Reject oversized bodies up front, and add conservative response headers.
-    app.add_middleware(MaxBodySizeMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
 
     @app.exception_handler(Exception)
