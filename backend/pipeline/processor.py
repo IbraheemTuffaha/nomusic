@@ -190,12 +190,19 @@ def plan_chunks(
 # being approximate (VBR), so we never slice a chunk whose tail hasn't landed.
 _PROGRESSIVE_MARGIN_SECONDS = 3.0
 _PROGRESSIVE_POLL_SECONDS = 0.15
+# Poll granularity for a job waiting on the per-url_key source guard: how often it
+# re-checks abort_check (idle-abandon / absolute deadline) while blocked, so a
+# waiter behind a long same-URL job can still be unwound rather than pinning its
+# admission slot indefinitely.
+_SOURCE_GUARD_POLL_SECONDS = 0.5
 # How long a guarded exit waits for the background download thread to actually
-# terminate after ``cancel()``. ``cancel()`` only sets the event; a stalled
-# socket is bounded by the download's ``socket_timeout`` (30s), so this covers
-# that plus margin. The lock isn't released until the thread is gone, so a
-# waiting same-url_key job can't race the orphan into ``sources/<url_key>``.
-_PROGRESSIVE_JOIN_TIMEOUT_SECONDS = 35.0
+# terminate after ``cancel()``. ``cancel()`` only takes effect at the next yt-dlp
+# progress tick, so a stalled read can burn a full ``socket_timeout`` (30s) and
+# then retry (``retries``/``fragment_retries`` = 3); this covers that worst case
+# plus margin. The lock isn't released until the thread is gone, so a waiting
+# same-url_key job can't race the orphan into ``sources/<url_key>`` (that waiter
+# can itself still abort via the source-guard poll above).
+_PROGRESSIVE_JOIN_TIMEOUT_SECONDS = 130.0
 
 
 class _ProgressiveSource:
@@ -409,7 +416,7 @@ class Processor:
     # -- planning ------------------------------------------------------------
 
     @contextmanager
-    def _source_guard(self, url: str):
+    def _source_guard(self, url: str, abort_check: Callable[[], None] | None = None):
         """Serialize jobs that share ``sources/<url_key>`` end-to-end.
 
         Yields the url_key. Holds a per-url_key lock for the whole source-using
@@ -422,6 +429,12 @@ class Processor:
         lock removed) holds. Lock ordering is safe: this per-url_key lock is
         always acquired *before* the engine infer lock, never the reverse.
 
+        ``abort_check`` (if given) is polled while waiting for the lock so a job
+        queued behind a long-running same-URL job can still idle-abandon or hit
+        its absolute deadline — otherwise a bare ``lock.acquire()`` makes a waiter
+        exempt from both while it keeps pinning its admission slot, which a few
+        same-URL requests can weaponize into a capacity DoS.
+
         The finally releases the per-key lock even on WorkerAbandoned / engine
         failure, then drops the ref count (deleting both map entries at zero) so
         the maps don't grow without bound.
@@ -432,14 +445,24 @@ class Processor:
             lock = self._source_locks.get(k)
             if lock is None:
                 lock = self._source_locks[k] = threading.Lock()
-        lock.acquire()
+        acquired = False
         try:
+            while not acquired:
+                acquired = lock.acquire(timeout=_SOURCE_GUARD_POLL_SECONDS)
+                if not acquired and abort_check is not None:
+                    # May raise WorkerAbandoned / _DownloadCancelled to unwind the
+                    # waiter; the finally below still runs and drops our ref.
+                    abort_check()
             yield k
         finally:
-            lock.release()
+            if acquired:
+                lock.release()
             with self._source_meta_lock:
                 self._source_refs[k] -= 1
                 if self._source_refs[k] <= 0:
+                    # Safe to delete: refs==0 means no other thread is between its
+                    # ref-increment and decrement, so nobody holds or waits on this
+                    # lock object.
                     del self._source_refs[k]
                     del self._source_locks[k]
 
@@ -568,7 +591,7 @@ class Processor:
         # (model, stems) — which shares this ``sources/<url_key>`` dir — so the
         # two can't race on the shared download or on drop_source. Different-URL
         # jobs hold different guards and stay concurrent.
-        with self._source_guard(url) as url_key:
+        with self._source_guard(url, abort_check) as url_key:
             # Download the full source once. Each chunk is sliced from this file
             # so cuts are sample-accurate (yt-dlp's per-range download cuts at the
             # nearest preceding keyframe, which drifts by 5-10 s on AAC/Opus).
