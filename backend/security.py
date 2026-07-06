@@ -39,7 +39,9 @@ async def require_edge(request: Request) -> None:
     if not SETTINGS.public or not SETTINGS.tunnel_secret:
         return
     got = request.headers.get("x-nomusic-tunnel", "")
-    if not hmac.compare_digest(got, SETTINGS.tunnel_secret):
+    # Compare as bytes: hmac.compare_digest raises TypeError on a str with any
+    # non-ASCII char, which would escape as a 500 instead of the fail-closed 404.
+    if not hmac.compare_digest(got.encode(), SETTINGS.tunnel_secret.encode()):
         # 404 (not 403) so the origin looks absent to a LAN-direct probe.
         raise HTTPException(status_code=404)
 
@@ -55,7 +57,11 @@ async def require_admin(
     token = SETTINGS.admin_token
     if not token:  # public but unconfigured ⇒ fail closed
         raise HTTPException(status_code=404)
-    if not x_admin_token or not hmac.compare_digest(x_admin_token, token):
+    # Compare as bytes so a non-ASCII header value fails closed (404) rather than
+    # raising TypeError inside compare_digest and surfacing as a 500.
+    if not x_admin_token or not hmac.compare_digest(
+        x_admin_token.encode(), token.encode()
+    ):
         raise HTTPException(status_code=404)
 
 

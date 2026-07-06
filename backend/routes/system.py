@@ -13,15 +13,19 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Request
 
 from config import SETTINGS
-from security import require_admin
+from security import require_admin, require_edge
 
 from . import JsonDict
 
 router = APIRouter()
 
-# Destructive / global-state routes. In public mode every route here requires
-# the admin token (require_admin); in dev it's a no-op so behavior is unchanged.
-admin = APIRouter(dependencies=[Depends(require_admin)])
+# Destructive / global-state routes. In public mode every route here requires the
+# admin token (require_admin) AND the tunnel-secret gate (require_edge), so a
+# LAN-direct probe of the loopback socket sees the same "looks absent" 404 the
+# jobs/media routers already return instead of being able to hammer the admin
+# token off-tunnel. In dev both are no-ops so behavior is unchanged. (/healthz is
+# left ungated as a liveness probe that hits loopback directly and leaks nothing.)
+admin = APIRouter(dependencies=[Depends(require_edge), Depends(require_admin)])
 
 
 @router.get("/healthz")
@@ -29,7 +33,7 @@ def healthz() -> dict[str, bool]:
     return {"ok": True}
 
 
-@router.get("/capabilities")
+@router.get("/capabilities", dependencies=[Depends(require_edge)])
 def get_capabilities(request: Request) -> JsonDict:
     engine = request.app.state.engine
     caps = engine.capabilities()
