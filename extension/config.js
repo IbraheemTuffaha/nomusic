@@ -6,7 +6,9 @@
 // main.js, it is also listed in the manifest's web_accessible_resources.
 //
 // TODO(owner): before packaging for the Chrome Web Store, replace
-// "nomusic.example.com" with your real Cloudflare-tunnel hostname. It MUST match
-// the manifest's host_permissions entry (the extension can only reach hosts it
-// declares). This is the ONLY place the default backend host is written.
+// "nomusic.example.com" with your real Cloudflare-tunnel hostname. This is the
+// single source of truth for RUNTIME code (popup, service worker, content
+// scripts all import it), but the host also appears in manifest.json
+// "host_permissions", popup.html's input placeholder, and the test fixtures --
+// keep those in sync (they can't import this module).
 export const DEFAULT_BACKEND = "https://nomusic.example.com";

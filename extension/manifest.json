@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "nomusic",
   "version": "0.2.0",
+  "minimum_chrome_version": "102",
   "description": "Removes the background music from the video you're watching and plays a vocals-only version of its audio in sync with the video.",
   "permissions": ["storage"],
   "host_permissions": [
