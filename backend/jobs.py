@@ -172,11 +172,17 @@ class JobRegistry:
         self._subscribers: dict[str, list[asyncio.Queue]] = {}
         self._last_disconnect_at: dict[str, float] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
-        # Keys whose worker should stop at its next chunk boundary. Set either
-        # by the idle-abandon decision (atomically, under _lock, so a racing
-        # submit() can't reuse a job that's already given up) or by
-        # ``abandon_all`` (cache clear). The provider checks it first thing.
+        # Keys whose worker should stop at its next chunk boundary. Set by the
+        # idle-abandon decision (atomically, under _lock, so a racing submit()
+        # can't reuse a job that's already given up). The provider checks it.
         self._abandoning: set[str] = set()
+        # Worker THREADS that must abandon, keyed by identity rather than job key.
+        # Used by ``abandon_all`` (cache clear): a per-key flag would be cleared by
+        # a submit() that supersedes the same key before the old worker ever
+        # observes it, so the old worker would run to completion against the wiped
+        # cache and stomp the fresh worker's status. Keying on the thread makes the
+        # signal target exactly the worker that was running, immune to supersede.
+        self._abandon_threads: set[threading.Thread] = set()
         self._lock = threading.Lock()
         # Admission bookkeeping (F1): keys with a live/queued worker, and a
         # per-client-IP count, so submit() can refuse new work past the caps
@@ -437,6 +443,13 @@ class JobRegistry:
         with self._lock:
             for key, status in self._jobs.items():
                 self._abandoning.add(key)
+                # Also flag the running worker by thread identity: the per-key
+                # flag above is cleared by a submit() that supersedes this key
+                # before the worker notices, but the thread flag can't be, so the
+                # worker still abandons instead of running on as a zombie.
+                worker = self._threads.get(key)
+                if worker is not None:
+                    self._abandon_threads.add(worker)
                 subs = self._subscribers.get(key)
                 if not subs:
                     continue
@@ -498,9 +511,11 @@ class JobRegistry:
                         on_download_progress=lambda p: self._on_download_progress(
                             key, p
                         ),
-                        next_chunk_provider=self._make_chunk_provider(key),
+                        next_chunk_provider=self._make_chunk_provider(
+                            key, my_thread
+                        ),
                         abort_check=lambda: self._raise_if_abandoned(
-                            key, SETTINGS.idle_timeout_seconds
+                            key, SETTINGS.idle_timeout_seconds, my_thread
                         ),
                         on_wait_for_download=lambda frac: self._on_wait_for_download(
                             key, frac
@@ -566,6 +581,11 @@ class JobRegistry:
         chunks permanently missing. So ``_controls``/``_pending_priority`` are
         retracted under the same ownership guard as everything else, not
         unconditionally. Must be called holding ``self._lock``."""
+        # Always drop our own thread from the cache-clear abandon set: it's keyed
+        # by thread identity, so this is correct whether or not we still own the
+        # key slot (a superseded zombie returns below without it otherwise leaking
+        # its dead thread object here forever).
+        self._abandon_threads.discard(my_thread)
         if self._threads.get(key) is not my_thread:
             return
         self._controls.pop(key, None)
@@ -707,19 +727,22 @@ class JobRegistry:
 
     # -- prioritization ------------------------------------------------------
 
-    def _make_chunk_provider(self, key: str) -> Callable[[], Optional[int]]:
+    def _make_chunk_provider(
+        self, key: str, my_thread: threading.Thread
+    ) -> Callable[[], Optional[int]]:
         """Build the callable that ``Processor.run`` calls between chunks.
 
         Returns the next chunk index, ``None`` when the queue is exhausted, or
         raises ``WorkerAbandoned`` when nobody has been streaming status for
         longer than ``idle_timeout_seconds``. The idle check runs here — at the
         chunk boundary — so abandoning costs at most one in-flight chunk and
-        unwinds cleanly between chunks.
-        """
+        unwinds cleanly between chunks. ``my_thread`` is the owning worker thread
+        (this callable runs on the decode pool thread, so it can't use
+        ``current_thread()``)."""
         idle_timeout = SETTINGS.idle_timeout_seconds
 
         def provider() -> Optional[int]:
-            self._raise_if_abandoned(key, idle_timeout)
+            self._raise_if_abandoned(key, idle_timeout, my_thread)
             with self._lock:
                 control = self._controls.get(key)
             if control is None:
@@ -728,14 +751,22 @@ class JobRegistry:
 
         return provider
 
-    def _raise_if_abandoned(self, key: str, idle_timeout: float) -> None:
+    def _raise_if_abandoned(
+        self, key: str, idle_timeout: float, my_thread: threading.Thread | None = None
+    ) -> None:
         """Raise ``WorkerAbandoned`` if the job has been flagged (idle decision
         on a prior call, or a cache clear), has blown its absolute deadline, or
         has now gone idle. The whole check + flag-set happens under the lock so
         it can't interleave with a submit() deciding whether to adopt the job.
         Shared by the chunk provider and the progressive-download abort hook so a
-        pause (or a runaway job) that lands mid-download still unwinds promptly."""
+        pause (or a runaway job) that lands mid-download still unwinds promptly.
+
+        ``my_thread`` is the owning worker thread (captured in ``_run`` — NOT
+        ``current_thread()``, since this runs on the decode pool thread), checked
+        against the cache-clear abandon set."""
         with self._lock:
+            if my_thread is not None and my_thread in self._abandon_threads:
+                raise WorkerAbandoned
             if key in self._abandoning:
                 raise WorkerAbandoned
             # Absolute deadline (F2): a wedged download/separation can't be kept

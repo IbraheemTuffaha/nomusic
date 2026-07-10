@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 import config
-from jobs import JobRegistry, JobState, JobStatus, _JobControl
+from jobs import JobRegistry, JobState, JobStatus, WorkerAbandoned, _JobControl
 from pipeline.cache import CacheMeta
 
 
@@ -134,6 +134,50 @@ def _set_settings(**overrides):
     for k, v in overrides.items():
         object.__setattr__(config.SETTINGS, k, v)
     return lambda: [object.__setattr__(config.SETTINGS, k, v) for k, v in saved.items()]
+
+
+def test_cache_clear_abandon_survives_supersede():
+    """A worker flagged by abandon_all must still abandon even after a submit()
+    supersedes its key and clears the per-key abandon flag (the zombie-worker
+    bug): the thread-identity flag can't be cleared by the resubmit."""
+    reg = _registry()
+    key = "0123456789abcdef"
+    t1 = threading.Thread(target=lambda: None)  # the "running" worker
+    reg._threads[key] = t1
+    reg._jobs[key] = _status(key)
+
+    # Cache clear flags the running worker (both per-key and per-thread).
+    reg.abandon_all()
+    assert t1 in reg._abandon_threads
+
+    # A racing resubmit supersedes the key and clears the per-key abandon flag.
+    reg._abandoning.discard(key)
+    assert key not in reg._abandoning
+
+    # The old worker's next abort_check must STILL raise (thread flag intact),
+    # so it can't run on as a zombie and stomp the fresh job's status.
+    with pytest.raises(WorkerAbandoned):
+        reg._raise_if_abandoned(key, idle_timeout=0, my_thread=t1)
+
+    # A different (fresh) worker thread for the same key is NOT abandoned.
+    t2 = threading.Thread(target=lambda: None)
+    reg._raise_if_abandoned(key, idle_timeout=0, my_thread=t2)  # must not raise
+
+
+def test_retire_worker_drops_abandon_thread_even_when_superseded():
+    reg = _registry()
+    key = "0123456789abcdef"
+    t1 = threading.Thread(target=lambda: None)
+    t2 = threading.Thread(target=lambda: None)
+    reg._abandon_threads.add(t1)
+    reg._threads[key] = t2  # t1 was superseded by t2
+
+    with reg._lock:
+        reg._retire_worker(key, my_thread=t1, my_status=None, abandoned=True)
+
+    # t1 removed from the abandon set despite not owning the key slot (no leak).
+    assert t1 not in reg._abandon_threads
+    assert reg._threads[key] is t2  # successor untouched
 
 
 def test_supersede_does_not_spurious_429_for_same_client(monkeypatch):
