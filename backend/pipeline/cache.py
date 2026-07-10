@@ -23,12 +23,18 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# Job/url cache keys are sha256(...)[:16] — exactly 16 lowercase hex chars.
+# A defense-in-depth guard so a malformed key can never escape the cache root via
+# path traversal even if the route-layer validation were bypassed.
+_KEY_RE = re.compile(r"^[0-9a-f]{16}$")
 
 # Bump when the on-disk chunk encoding, sample rate, or directory layout
 # changes. Old entries become invisible to the new code and the TTL sweep
@@ -41,6 +47,13 @@ CHUNK_MEDIA_TYPE = "audio/ogg"
 # Top-level dirs under the cache root that hold url-keyed caches, not jobs.
 # The job-dir scans (stats, TTL sweep) skip these and handle them separately.
 _RESERVED_DIRS = frozenset({"sources", "videos"})
+
+# LRU eviction skips entries modified within this window: a live worker keeps its
+# dir's mtime fresh (source download / chunk writes), and the eviction sweeper —
+# which runs off-thread and can't see the Processor's source guard — must not
+# rmtree a directory still in use. Comfortably longer than any inter-write gap in
+# an active job, shorter than the cache TTL.
+_EVICT_MIN_IDLE_SECONDS = 600.0
 
 
 @dataclass
@@ -108,7 +121,12 @@ class JobCache:
         """Resolve a job dir WITHOUT creating it. Read paths must not mkdir, or
         any request with an unknown ``job_id`` (GET /status, /chunk, /audio,
         the GC re-checking swept keys) leaves a phantom empty dir behind that
-        then inflates ``stats().job_count`` until the TTL sweep reclaims it."""
+        then inflates ``stats().job_count`` until the TTL sweep reclaims it.
+
+        Rejects a key that isn't 16 hex chars (defense in depth against path
+        traversal; the route layer already enforces this shape)."""
+        if not _KEY_RE.fullmatch(key):
+            raise KeyError(f"invalid cache key {key!r}")
         return self.root / key
 
     def source_dir(self, url: str) -> Path:
@@ -327,6 +345,68 @@ class JobCache:
         if removed:
             log.info(
                 "TTL sweep removed %d entries (%d bytes)", removed, freed
+            )
+        return (removed, freed)
+
+    def evict_to_fit(self, max_bytes: int) -> tuple[int, int]:
+        """Delete least-recently-used cache entries until the total on-disk size
+        is at or under ``max_bytes``. Returns ``(entries_removed, bytes_freed)``.
+
+        The TTL sweep can't bound disk on its own — a burst of distinct URLs can
+        fill the disk between hourly sweeps — so the hosted deployment also calls
+        this each sweep (and the admission path enforces a free-space floor).
+        "Least recently used" uses each entry's newest file mtime, matching the
+        TTL sweep's notion of recency (a re-watch touches meta.json).
+
+        Runs on the sweeper thread, which can't see the Processor's per-url_key
+        source guard, so it must NOT rmtree a directory a live worker is writing
+        (source download / chunk writes) — that would reintroduce the
+        rmtree-under-live-reader race the source guard closes for drop_source. A
+        live worker keeps its dir's mtime fresh, so entries modified within
+        ``_EVICT_MIN_IDLE_SECONDS`` are treated as possibly-in-use and skipped;
+        the free-disk floor + admission refusal are the hard backstop if that
+        leaves the cache briefly above the soft cap."""
+        if max_bytes <= 0:
+            return (0, 0)
+
+        entries: list[tuple[Path, float, int]] = []
+        for child in list(self.root.iterdir()):
+            if child.is_dir() and child.name not in _RESERVED_DIRS:
+                entries.append((child, _dir_newest_mtime(child), _dir_bytes(child)))
+        for tree in _RESERVED_DIRS:
+            for child in self._tree_entries(tree):
+                entries.append((child, _dir_newest_mtime(child), _dir_bytes(child)))
+
+        total = sum(size for _, _, size in entries)
+        if total <= max_bytes:
+            return (0, 0)
+
+        now = time.time()
+        entries.sort(key=lambda e: e[1])  # oldest first
+        removed = 0
+        freed = 0
+        skipped_active = False
+        for child, mtime, size in entries:
+            if total <= max_bytes:
+                break
+            if mtime > now - _EVICT_MIN_IDLE_SECONDS:
+                # Recently touched -> a live worker may still be writing here.
+                skipped_active = True
+                continue
+            shutil.rmtree(child, ignore_errors=True)
+            total -= size
+            freed += size
+            removed += 1
+        if removed:
+            log.info(
+                "LRU evict removed %d entries (%d bytes) to fit %d-byte cap",
+                removed, freed, max_bytes,
+            )
+        if skipped_active and total > max_bytes:
+            log.info(
+                "LRU evict left cache above cap (%d > %d): remaining entries are "
+                "too recently active to evict safely",
+                total, max_bytes,
             )
         return (removed, freed)
 

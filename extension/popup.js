@@ -1,5 +1,7 @@
 // Popup logic: surfaces backend health and lets the user tweak settings.
 
+import { DEFAULT_BACKEND } from "./config.js";
+
 const $ = (id) => document.getElementById(id);
 
 const ALL_STEMS = [
@@ -32,7 +34,7 @@ async function load() {
     "model",
     "keepStems",
   ]);
-  $("backend").value = stored.backendUrl || "http://127.0.0.1:8723";
+  $("backend").value = stored.backendUrl || DEFAULT_BACKEND;
 
   let caps = null;
   try {
@@ -101,7 +103,7 @@ async function load() {
     $("status").classList.add("bad");
     $("statusText").textContent = "backend not reachable";
     $("err").textContent =
-      "Start the backend: backend/.venv/bin/python backend/server.py";
+      "Backend unreachable — check your connection, or point Backend URL at your own server.";
     // Disable the model/stem controls while offline. persist() already skips
     // writing them when capsLoaded is false (so saved selections survive), but
     // disabling stops the user making an edit here that would be silently
@@ -113,118 +115,11 @@ async function load() {
   }
 }
 
-function fmtBytes(n) {
-  if (n == null) return "—";
-  if (n < 1024) return `${n} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let v = n / 1024;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2)} ${units[i]}`;
-}
-
-async function refreshCacheSize() {
-  try {
-    const resp = await fetch(`${$("backend").value}/cache`, {
-      cache: "no-store",
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    const total = data.total_bytes || 0;
-    const jobs = data.job_count || 0;
-    const sources = data.source_count || 0;
-    const videos = data.video_count || 0;
-    // videos/ can dwarf the rest (cached multi-GB exports), so surface it in
-    // the breakdown rather than letting the total jump unexplained. Omit the
-    // segment when there are none, to keep the common case uncluttered.
-    const videoSeg = videos ? `, ${videos} video${videos === 1 ? "" : "s"}` : "";
-    $("cacheSize").textContent =
-      total === 0
-        ? "empty"
-        : `${fmtBytes(total)} (${jobs} job${jobs === 1 ? "" : "s"}, ` +
-          `${sources} source${sources === 1 ? "" : "s"}${videoSeg})`;
-    // Keep the button enabled even when empty so a stale "empty" reading
-    // (e.g. backend just restarted) isn't a dead-end. The server treats
-    // clearing an empty cache as a no-op.
-    $("clearCache").disabled = false;
-  } catch (_err) {
-    $("cacheSize").textContent = "unknown";
-    $("clearCache").disabled = false;
-  }
-}
-
-async function refreshCacheTtl() {
-  const el = $("cacheTtl");
-  try {
-    const resp = await fetch(`${$("backend").value}/capabilities`, {
-      cache: "no-store",
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    const ttl = data?.cache?.ttl_days;
-    if (typeof ttl === "number" && ttl > 0) {
-      el.textContent = `auto-deletes after ${ttl} day${ttl === 1 ? "" : "s"}`;
-    } else {
-      el.textContent = "no auto-delete";
-    }
-  } catch (_err) {
-    el.textContent = "";
-  }
-}
-
-// Two-click confirmation. The first click arms the button (red, label
-// changes); the second click within ARM_WINDOW_MS actually clears. This
-// avoids relying on window.confirm(), which Chrome silently suppresses in
-// some extension popup contexts.
-const ARM_WINDOW_MS = 4000;
-let armTimer = null;
-
-function disarm(btn) {
-  btn.classList.remove("armed");
-  btn.textContent = "Clear";
-  if (armTimer) {
-    clearTimeout(armTimer);
-    armTimer = null;
-  }
-}
-
-async function clearCache() {
-  const btn = $("clearCache");
-  if (!btn.classList.contains("armed")) {
-    btn.classList.add("armed");
-    btn.textContent = "Confirm";
-    armTimer = setTimeout(() => disarm(btn), ARM_WINDOW_MS);
-    return;
-  }
-
-  disarm(btn);
-  const sizeEl = $("cacheSize");
-  const prev = sizeEl.textContent;
-  btn.disabled = true;
-  sizeEl.textContent = "clearing…";
-  try {
-    const resp = await fetch(`${$("backend").value}/cache/clear`, {
-      method: "POST",
-    });
-    if (!resp.ok) {
-      const detail = await resp.text().catch(() => "");
-      throw new Error(`HTTP ${resp.status}: ${detail || resp.statusText}`);
-    }
-    const data = await resp.json();
-    $("err").textContent = `freed ${fmtBytes(data.deleted_bytes || 0)}`;
-    setTimeout(() => ($("err").textContent = ""), 2500);
-  } catch (err) {
-    console.error("[nomusic] clear failed", err);
-    $("err").textContent = `clear failed: ${err.message}`;
-    sizeEl.textContent = prev;
-  } finally {
-    btn.disabled = false;
-  }
-  await refreshCacheSize();
-}
+// The cache panel and its "Clear" control were removed for the public build:
+// on a shared hosted backend /cache exposes global usage to every user and
+// /cache/clear is admin-only server-side (it requires NOMUSIC_ADMIN_TOKEN, which
+// the owner holds and the extension never ships). The popup now only reads the
+// backend's /capabilities.
 
 let savedTimer = null;
 function flashSaved() {
@@ -237,7 +132,7 @@ function flashSaved() {
 // Persist the current form state. Called on every change — there's no Save
 // button; the popup auto-saves.
 async function persist() {
-  const backendUrl = $("backend").value.trim() || "http://127.0.0.1:8723";
+  const backendUrl = $("backend").value.trim() || DEFAULT_BACKEND;
   const update = { backendUrl };
   // Only persist model/stems once the backend's capabilities have populated the
   // form. When the backend is unreachable those controls are empty, and writing
@@ -262,13 +157,27 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Stems are recreated by load(); a delegated listener on the container
   // survives those rebuilds, so we bind it once here.
   $("stems").addEventListener("change", persist);
-  // Backend URL commits on blur/Enter (not per keystroke), then we re-check
+  // Backend URL commits on blur/Enter (not per keystroke). The shipped default
+  // host is already in host_permissions; for a self-hosted URL we request the
+  // matching optional host permission (no-ops / returns true if already granted)
+  // BEFORE any other await so the user gesture is still active. Then re-check
   // health and reload the model list for the new backend.
   $("backend").addEventListener("change", async () => {
+    const value = $("backend").value.trim();
+    if (value) {
+      try {
+        // Chrome match patterns don't accept a port, and URL.origin includes
+        // one for non-default ports (e.g. http://host.local:8723). Build the
+        // pattern from protocol + hostname only; host/* covers any port — which
+        // matters because the backend's own default port is 8723.
+        const u = new URL(value);
+        const origin = `${u.protocol}//${u.hostname}/*`;
+        await chrome.permissions.request({ origins: [origin] });
+      } catch (err) {
+        console.debug("[nomusic] backend permission request failed", err);
+      }
+    }
     await persist();
     await load();
   });
-  $("clearCache").addEventListener("click", clearCache);
-  refreshCacheSize();
-  refreshCacheTtl();
 });

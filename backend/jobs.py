@@ -4,10 +4,11 @@ The HTTP layer is intentionally thin: clients POST a job, then poll
 ``/status/{id}`` and pull ready chunks. All state lives here so server.py stays
 small and the worker stays testable without spinning up uvicorn.
 
-Concurrency model: one background ``threading.Thread`` per job. The MLX engine
-holds the GPU exclusively (Apple unified memory; demucs serializes anyway), so
-we serialize *runs* across jobs with a global lock; multiple jobs queue up
-rather than fighting for the GPU.
+Concurrency model: one background ``threading.Thread`` per job, bounded by an
+admission cap (``max_inflight_jobs`` + per-IP) so a flood of /process calls can't
+spawn unbounded threads. Only the GPU *inference* call is serialized (by the
+engine's own lock); probe/download/decode run concurrently across admitted jobs,
+so one slow source no longer stalls everyone behind a whole-pipeline lock.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import shutil
 import threading
 import time
 import traceback
@@ -31,10 +33,16 @@ log = logging.getLogger(__name__)
 
 class WorkerAbandoned(Exception):
     """Raised from the chunk provider when a job has had no SSE subscriber for
-    longer than ``idle_timeout_seconds``. It propagates up through
-    ``Processor.run`` and out of ``with self._gpu_lock:``, so the GPU lock is
-    released naturally on the way out and the worker thread exits. The client
-    re-spawns the job from disk-cached progress on its next click."""
+    longer than ``idle_timeout_seconds`` (or has blown its absolute deadline, or
+    a cache clear flagged it). It propagates up through ``Processor.run`` and the
+    worker thread exits, releasing the engine's inference lock naturally on the
+    way out. The client re-spawns the job from disk-cached progress on its next
+    click."""
+
+
+class JobRejected(Exception):
+    """Raised by ``submit`` when admission caps (global inflight, per-IP, or the
+    disk floor) refuse a new job. The HTTP layer maps it to 429."""
 
 
 class JobState(str, Enum):
@@ -164,14 +172,25 @@ class JobRegistry:
         self._subscribers: dict[str, list[asyncio.Queue]] = {}
         self._last_disconnect_at: dict[str, float] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
-        # Keys whose worker should stop at its next chunk boundary. Set either
-        # by the idle-abandon decision (atomically, under _lock, so a racing
-        # submit() can't reuse a job that's already given up) or by
-        # ``abandon_all`` (cache clear). The provider checks it first thing.
+        # Keys whose worker should stop at its next chunk boundary. Set by the
+        # idle-abandon decision (atomically, under _lock, so a racing submit()
+        # can't reuse a job that's already given up). The provider checks it.
         self._abandoning: set[str] = set()
+        # Worker THREADS that must abandon, keyed by identity rather than job key.
+        # Used by ``abandon_all`` (cache clear): a per-key flag would be cleared by
+        # a submit() that supersedes the same key before the old worker ever
+        # observes it, so the old worker would run to completion against the wiped
+        # cache and stomp the fresh worker's status. Keying on the thread makes the
+        # signal target exactly the worker that was running, immune to supersede.
+        self._abandon_threads: set[threading.Thread] = set()
         self._lock = threading.Lock()
-        # One job runs at a time on the engine; further jobs block here.
-        self._gpu_lock = threading.Lock()
+        # Admission bookkeeping (F1): keys with a live/queued worker, and a
+        # per-client-IP count, so submit() can refuse new work past the caps
+        # instead of spawning unbounded daemon threads. Inference itself is
+        # serialized inside the engine, not here.
+        self._inflight: set[str] = set()
+        self._ip_counts: dict[str, int] = collections.defaultdict(int)
+        self._ip_by_key: dict[str, str] = {}
 
     # -- SSE subscription ----------------------------------------------------
 
@@ -213,6 +232,7 @@ class JobRegistry:
         *,
         model: str,
         keep_stems: list[str],
+        client_ip: str = "local",
     ) -> JobStatus:
         # No probe here: the yt-dlp metadata call takes 3-6s on YouTube
         # because of the JS challenge, and blocking /process on it made the
@@ -246,9 +266,57 @@ class JobRegistry:
             self._abandoning.discard(key)
 
             status = self._build_submit_status(key, existing_meta)
-            self._jobs[key] = status
             if status.state == JobState.READY:
+                # Instant replay of a complete cache entry — no worker spawned,
+                # so it doesn't count against admission.
+                self._jobs[key] = status
                 return status
+
+            # About to spawn a worker for genuinely new/resumed work: enforce the
+            # admission caps (F1) and the free-disk floor (F7). All no-ops unless
+            # public. Checked under the lock so the counts can't race a sibling
+            # submit. JobRejected unwinds the lock cleanly (no admission state
+            # mutated yet).
+            #
+            # Supersede case: a predecessor worker for this same key may still be
+            # mid-abandon and holding its admission charge. Since we're replacing
+            # it, that charge must not count against the caps — otherwise a client
+            # resuming its OWN idle-abandoned job spuriously 429s at the cap even
+            # though the supersede keeps the net count unchanged. Evaluate the caps
+            # against the post-supersede counts, then retract the predecessor's
+            # charge for real once the checks pass.
+            superseding = key in self._inflight
+            prev_ip = self._ip_by_key.get(key) if superseding else None
+            if SETTINGS.public:
+                effective_inflight = len(self._inflight) - (1 if superseding else 0)
+                if effective_inflight >= SETTINGS.max_inflight_jobs:
+                    raise JobRejected("server at capacity")
+                effective_ip = self._ip_counts.get(client_ip, 0) - (
+                    1 if prev_ip == client_ip else 0
+                )
+                if effective_ip >= SETTINGS.max_jobs_per_ip:
+                    raise JobRejected("too many concurrent jobs")
+                if shutil.disk_usage(self.cache.root).free < SETTINGS.free_disk_floor_bytes:
+                    raise JobRejected("insufficient disk")
+
+            self._jobs[key] = status
+            # Retract the superseded predecessor's charge now that admission is
+            # granted. Once we install our fresh thread below, that worker's
+            # _retire_worker guard (`_threads[key] is my_thread`) goes False so it
+            # will never release — so every ``_ip_counts`` increment keeps exactly
+            # one matching decrement; otherwise the orphaned charge leaks and can
+            # permanently 429-lock an innocent IP. No-op for a genuinely new key.
+            if superseding:
+                old_ip = self._ip_by_key.pop(key, None)
+                if old_ip is not None:
+                    old_remaining = self._ip_counts.get(old_ip, 0) - 1
+                    if old_remaining > 0:
+                        self._ip_counts[old_ip] = old_remaining
+                    else:
+                        self._ip_counts.pop(old_ip, None)
+            self._inflight.add(key)
+            self._ip_counts[client_ip] += 1
+            self._ip_by_key[key] = client_ip
 
             t = threading.Thread(
                 target=self._run,
@@ -361,8 +429,8 @@ class JobRegistry:
         and drop all in-memory job state. Used by /cache/clear so wiping the
         cache out from under live workers doesn't leave them mid-pipeline
         writing into directories that no longer exist — instead each worker
-        unwinds cleanly out of the GPU lock via ``WorkerAbandoned`` and runs
-        its own ``finally`` cleanup.
+        unwinds cleanly via ``WorkerAbandoned`` and runs its own ``finally``
+        cleanup.
 
         Each open /events stream is sent a terminal ``error`` snapshot before
         its queue is dropped, so the stream closes itself instead of hanging on
@@ -375,6 +443,13 @@ class JobRegistry:
         with self._lock:
             for key, status in self._jobs.items():
                 self._abandoning.add(key)
+                # Also flag the running worker by thread identity: the per-key
+                # flag above is cleared by a submit() that supersedes this key
+                # before the worker notices, but the thread flag can't be, so the
+                # worker still abandons instead of running on as a zombie.
+                worker = self._threads.get(key)
+                if worker is not None:
+                    self._abandon_threads.add(worker)
                 subs = self._subscribers.get(key)
                 if not subs:
                     continue
@@ -389,6 +464,9 @@ class JobRegistry:
             self._jobs.clear()
             self._subscribers.clear()
             self._last_disconnect_at.clear()
+            self._inflight.clear()
+            self._ip_counts.clear()
+            self._ip_by_key.clear()
         loop = self._loop
         if pending and loop is not None and not loop.is_closed():
             for q, snapshot in pending:
@@ -416,35 +494,34 @@ class JobRegistry:
         abandoned = False
         try:
             try:
-                with self._gpu_lock:
-                    # Stay in QUEUED while waiting for the GPU lock. Only flip
-                    # to PROBING once we actually own it, so a second
-                    # concurrent job honestly reports "Queued" instead of
-                    # falsely showing "Inspecting video" while really blocked.
-                    self._enter_phase(key, JobState.PROBING, progress=None)
-                    self.processor.run(
-                        url,
-                        model=model,
-                        keep_stems=keep_stems,
-                        hooks=RunHooks(
-                            on_probed=lambda info, plans, meta: self._on_probed(
-                                key, info, plans, meta
-                            ),
-                            on_progress=lambda meta, phase: self._on_separation_progress(
-                                key, meta, phase
-                            ),
-                            on_download_progress=lambda p: self._on_download_progress(
-                                key, p
-                            ),
-                            next_chunk_provider=self._make_chunk_provider(key),
-                            abort_check=lambda: self._raise_if_abandoned(
-                                key, SETTINGS.idle_timeout_seconds
-                            ),
-                            on_wait_for_download=lambda frac: self._on_wait_for_download(
-                                key, frac
-                            ),
+                # Probe/download/decode run concurrently across admitted jobs; the
+                # engine serializes only the GPU inference call (engine._infer_lock).
+                self._enter_phase(key, JobState.PROBING, progress=None)
+                self.processor.run(
+                    url,
+                    model=model,
+                    keep_stems=keep_stems,
+                    hooks=RunHooks(
+                        on_probed=lambda info, plans, meta: self._on_probed(
+                            key, info, plans, meta
                         ),
-                    )
+                        on_progress=lambda meta, phase: self._on_separation_progress(
+                            key, meta, phase
+                        ),
+                        on_download_progress=lambda p: self._on_download_progress(
+                            key, p
+                        ),
+                        next_chunk_provider=self._make_chunk_provider(
+                            key, my_thread
+                        ),
+                        abort_check=lambda: self._raise_if_abandoned(
+                            key, SETTINGS.idle_timeout_seconds, my_thread
+                        ),
+                        on_wait_for_download=lambda frac: self._on_wait_for_download(
+                            key, frac
+                        ),
+                    ),
+                )
                 meta = self.cache.load_meta(key)
                 chunks_ready = len(meta.chunks_ready) if meta else 0
                 ready_chunks = sorted(meta.chunks_ready) if meta else []
@@ -460,8 +537,7 @@ class JobRegistry:
                 log.info("Job %s ready", key)
             except WorkerAbandoned:
                 # Listed before the generic handler so an idle-abandon isn't
-                # mistaken for a failure. The GPU lock has already released via
-                # the with-block unwind; just flag it for finally to clean up.
+                # mistaken for a failure; just flag it for finally to clean up.
                 abandoned = True
                 # ``%gs`` renders 30.0 as "30s" (not "30.0s") so the value
                 # matches the grep documented in the verification steps.
@@ -472,40 +548,72 @@ class JobRegistry:
                 )
             except Exception as exc:
                 log.exception("Job %s failed", key)
-                self._enter_phase(
-                    key,
-                    JobState.ERROR,
-                    progress=1.0,
-                    error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}",
+                # The full traceback always goes to the server log (above). On a
+                # public deployment, surface only a generic message to the client
+                # so internal paths / stack frames don't leak (F20); keep the
+                # verbose detail in local/dev for fast debugging.
+                detail = (
+                    "processing failed"
+                    if SETTINGS.public
+                    else f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}"
                 )
+                self._enter_phase(key, JobState.ERROR, progress=1.0, error=detail)
         finally:
-            # The control + any orphaned priority hint are only meaningful
-            # while a worker is consuming chunks; drop them unconditionally.
             with self._lock:
-                self._controls.pop(key, None)
-                self._pending_priority.pop(key, None)
-                # Only retract the shared bookkeeping if we're still the
-                # registered worker for this key. If a submit() raced our
-                # unwind and installed a fresh worker, _threads[key] now points
-                # at that thread, not us — leave its _threads/_subscribers/
-                # _jobs entries alone. Dropping our own handle marks the job as
-                # having no live worker, which is what ``memory_gc`` keys off.
-                if self._threads.get(key) is my_thread:
-                    self._threads.pop(key, None)
-                    self._subscribers.pop(key, None)
-                    self._last_disconnect_at.pop(key, None)
-                    self._abandoning.discard(key)
-                    # The terminal _update(READY/ERROR) above already enqueued
-                    # its snapshot to every open stream, so dropping
-                    # _subscribers here loses nothing; each stream still drains
-                    # and closes itself. A stream that opens after this sees the
-                    # terminal state from disk and short-circuits.
-                    if abandoned and self._jobs.get(key) is my_status:
-                        # Drop the JobStatus so a later /process spawns a fresh
-                        # worker (resuming from disk-cached chunks) rather than
-                        # finding a stale entry. Completed/errored jobs are kept
-                        # for /status until memory_gc reclaims them.
-                        self._jobs.pop(key, None)
+                self._retire_worker(key, my_thread, my_status, abandoned)
+
+    def _retire_worker(
+        self,
+        key: str,
+        my_thread: threading.Thread,
+        my_status: Optional[JobStatus],
+        abandoned: bool,
+    ) -> None:
+        """Retract all shared bookkeeping for a finishing worker — but ONLY if we
+        still own ``_threads[key]``.
+
+        If a submit() raced our unwind and installed a fresh worker, ``_threads[key]``
+        now points at that thread and it owns the shared state (including its own
+        ``_controls`` entry, built in ``_on_probed``). Touching anything here would
+        corrupt that successor — in particular, popping ``_controls[key]`` would
+        strip the successor's live chunk control, so its provider returns ``None``,
+        the loop treats the queue as exhausted, and the job flips to READY with
+        chunks permanently missing. So ``_controls``/``_pending_priority`` are
+        retracted under the same ownership guard as everything else, not
+        unconditionally. Must be called holding ``self._lock``."""
+        # Always drop our own thread from the cache-clear abandon set: it's keyed
+        # by thread identity, so this is correct whether or not we still own the
+        # key slot (a superseded zombie returns below without it otherwise leaking
+        # its dead thread object here forever).
+        self._abandon_threads.discard(my_thread)
+        if self._threads.get(key) is not my_thread:
+            return
+        self._controls.pop(key, None)
+        self._pending_priority.pop(key, None)
+        self._threads.pop(key, None)
+        self._subscribers.pop(key, None)
+        self._last_disconnect_at.pop(key, None)
+        self._abandoning.discard(key)
+        # Release this worker's admission slot (F1) so the global + per-IP caps
+        # free up.
+        self._inflight.discard(key)
+        ip = self._ip_by_key.pop(key, None)
+        if ip is not None:
+            remaining = self._ip_counts.get(ip, 0) - 1
+            if remaining > 0:
+                self._ip_counts[ip] = remaining
+            else:
+                self._ip_counts.pop(ip, None)
+        # The terminal _update(READY/ERROR) above already enqueued its snapshot to
+        # every open stream, so dropping _subscribers here loses nothing; each
+        # stream still drains and closes itself. A stream that opens after this
+        # sees the terminal state from disk and short-circuits.
+        if abandoned and self._jobs.get(key) is my_status:
+            # Drop the JobStatus so a later /process spawns a fresh worker
+            # (resuming from disk-cached chunks) rather than finding a stale
+            # entry. Completed/errored jobs are kept for /status until memory_gc
+            # reclaims them.
+            self._jobs.pop(key, None)
 
     def _enter_phase(
         self,
@@ -542,14 +650,19 @@ class JobRegistry:
             chunks_ready=len(meta.chunks_ready),
             ready_chunks=sorted(meta.chunks_ready),
         )
-        # Now that we know total_chunks, build the per-job control. If a
-        # /prioritize call beat us here, apply the stashed hint now.
+        # Now that we know total_chunks, (re)build OUR per-job control from the
+        # on-disk truth. We always overwrite: a control already present at our
+        # probe time belongs to a superseded predecessor whose pending deque is
+        # missing the chunk it popped-but-never-finished, so adopting it would
+        # silently drop that chunk. Seeding fresh from meta.chunks_ready reincludes
+        # every not-yet-done chunk. _retire_worker only pops _controls[key] while
+        # our thread still owns _threads[key], so this object survives until we
+        # exit. If a /prioritize call beat us here, apply the stashed hint now.
         with self._lock:
-            if key not in self._controls:
-                self._controls[key] = _JobControl(
-                    total_chunks=meta.total_chunks,
-                    done=set(meta.chunks_ready),
-                )
+            self._controls[key] = _JobControl(
+                total_chunks=meta.total_chunks,
+                done=set(meta.chunks_ready),
+            )
             hint = self._pending_priority.pop(key, None)
         if hint is not None:
             self._controls[key].prioritize(hint)
@@ -614,19 +727,22 @@ class JobRegistry:
 
     # -- prioritization ------------------------------------------------------
 
-    def _make_chunk_provider(self, key: str) -> Callable[[], Optional[int]]:
+    def _make_chunk_provider(
+        self, key: str, my_thread: threading.Thread
+    ) -> Callable[[], Optional[int]]:
         """Build the callable that ``Processor.run`` calls between chunks.
 
         Returns the next chunk index, ``None`` when the queue is exhausted, or
         raises ``WorkerAbandoned`` when nobody has been streaming status for
         longer than ``idle_timeout_seconds``. The idle check runs here — at the
         chunk boundary — so abandoning costs at most one in-flight chunk and
-        unwinds cleanly out of the GPU lock.
-        """
+        unwinds cleanly between chunks. ``my_thread`` is the owning worker thread
+        (this callable runs on the decode pool thread, so it can't use
+        ``current_thread()``)."""
         idle_timeout = SETTINGS.idle_timeout_seconds
 
         def provider() -> Optional[int]:
-            self._raise_if_abandoned(key, idle_timeout)
+            self._raise_if_abandoned(key, idle_timeout, my_thread)
             with self._lock:
                 control = self._controls.get(key)
             if control is None:
@@ -635,15 +751,39 @@ class JobRegistry:
 
         return provider
 
-    def _raise_if_abandoned(self, key: str, idle_timeout: float) -> None:
+    def _raise_if_abandoned(
+        self, key: str, idle_timeout: float, my_thread: threading.Thread | None = None
+    ) -> None:
         """Raise ``WorkerAbandoned`` if the job has been flagged (idle decision
-        on a prior call, or a cache clear) or has now gone idle. The whole
-        check + flag-set happens under the lock so it can't interleave with a
-        submit() deciding whether to adopt the job. Shared by the chunk
-        provider and the progressive-download abort hook so a pause that lands
-        mid-download still releases the GPU promptly."""
+        on a prior call, or a cache clear), has blown its absolute deadline, or
+        has now gone idle. The whole check + flag-set happens under the lock so
+        it can't interleave with a submit() deciding whether to adopt the job.
+        Shared by the chunk provider and the progressive-download abort hook so a
+        pause (or a runaway job) that lands mid-download still unwinds promptly.
+
+        ``my_thread`` is the owning worker thread (captured in ``_run`` — NOT
+        ``current_thread()``, since this runs on the decode pool thread), checked
+        against the cache-clear abandon set."""
         with self._lock:
+            if my_thread is not None and my_thread in self._abandon_threads:
+                raise WorkerAbandoned
             if key in self._abandoning:
+                raise WorkerAbandoned
+            # Absolute deadline (F2): a wedged download/separation can't be kept
+            # alive indefinitely by an open /events stream, so this is checked
+            # BEFORE the subscriber early-return below.
+            status = self._jobs.get(key)
+            if (
+                status is not None
+                and SETTINGS.public
+                and SETTINGS.job_deadline_seconds > 0
+                and time.time() - status.created_at >= SETTINGS.job_deadline_seconds
+            ):
+                log.warning(
+                    "Job %s exceeded deadline (%gs); abandoning",
+                    key, SETTINGS.job_deadline_seconds,
+                )
+                self._abandoning.add(key)
                 raise WorkerAbandoned
             if idle_timeout <= 0:
                 return

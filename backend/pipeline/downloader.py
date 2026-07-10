@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from config import SETTINGS
+
 log = logging.getLogger(__name__)
 
 
@@ -67,6 +69,26 @@ _BYTES_PER_KB = 1024
 _BYTES_PER_MB = _BYTES_PER_KB * _BYTES_PER_KB
 
 
+def _enforce_downloaded_size(path: Path, cap_bytes: int, what: str) -> None:
+    """Delete and reject a downloaded file that exceeds ``cap_bytes`` (public mode).
+
+    yt-dlp's ``max_filesize`` only *pre-aborts* when the size is known up front,
+    which it isn't for fragmented DASH/HLS — exactly how YouTube and Facebook
+    serve video. So the declared size cap silently doesn't fire there. Checking
+    after the fact bounds on-disk size (and stops an over-cap file being served)
+    even when the pre-download cap was bypassed; bandwidth is still bounded by the
+    download deadline. No-op unless public / cap disabled."""
+    if not SETTINGS.public or cap_bytes <= 0:
+        return
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size > cap_bytes:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(f"{what} exceeds size cap ({size} > {cap_bytes} bytes)")
+
+
 def _emit_finished_progress(progress_hook: ProgressHook | None, size_bytes: int) -> None:
     """Synthesize a yt-dlp ``finished`` progress event for a cache hit, so a
     caller driving a UI bar jumps to 100% without special-casing the no-download
@@ -100,6 +122,12 @@ def _common_opts() -> dict[str, Any]:
         # YouTube's player JS. Hosted by the yt-dlp project.
         "remote_components": ["ejs:github"],
     }
+
+    # Public mode: pin yt-dlp to the curated extractors so ``generic`` (and the
+    # hundreds of other sites) are off — the box can't be used as an open
+    # download proxy for arbitrary URLs (F4/F6).
+    if SETTINGS.public and SETTINGS.allowed_extractors:
+        opts["allowed_extractors"] = list(SETTINGS.allowed_extractors)
 
     runtime_override = os.environ.get("NOMUSIC_JS_RUNTIME")
     if runtime_override:
@@ -145,6 +173,20 @@ class VideoMetadata:
     webpage_url: str
 
 
+def _enforce_duration_limit(duration: float) -> None:
+    """Reject over-long media in public mode (F4/F7), before any download — the
+    cheapest cut against a deliberately huge job. No-op in dev."""
+    if (
+        SETTINGS.public
+        and SETTINGS.max_duration_seconds > 0
+        and duration > SETTINGS.max_duration_seconds
+    ):
+        raise RuntimeError(
+            f"media too long ({duration:.0f}s > "
+            f"{SETTINGS.max_duration_seconds:.0f}s limit)"
+        )
+
+
 def probe(url: str) -> VideoMetadata:
     """Fetch metadata without downloading the media."""
     from yt_dlp import YoutubeDL  # imported lazily; yt-dlp is heavy
@@ -165,6 +207,7 @@ def probe(url: str) -> VideoMetadata:
             f"yt-dlp could not determine duration for {url}; "
             "live streams and unbounded media are not supported yet."
         )
+    _enforce_duration_limit(float(duration))
 
     return VideoMetadata(
         id=str(info.get("id", "unknown")),
@@ -227,6 +270,8 @@ def download_source(
             f"yt-dlp didn't produce a source file in {out_dir}; "
             "supported extensions: " + ", ".join(_SOURCE_EXTS)
         )
+    # Backstop the pre-download max_filesize (doesn't fire for fragmented DASH/HLS).
+    _enforce_downloaded_size(final, SETTINGS.max_source_filesize, "source audio")
     return final
 
 
@@ -299,6 +344,9 @@ def download_video(
         "fragment_retries": 3,
         "socket_timeout": 30,
     }
+    # Hard size cap (F4/F7/F8): /video can fetch multi-GB streams, so bound it.
+    if SETTINGS.public and SETTINGS.max_video_filesize > 0:
+        opts["max_filesize"] = SETTINGS.max_video_filesize
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
     ratelimit = _download_ratelimit()
@@ -314,6 +362,9 @@ def download_video(
             f"yt-dlp didn't produce a video file in {out_dir}; "
             "supported extensions: " + ", ".join(_VIDEO_EXTS)
         )
+    # Backstop the pre-download max_filesize, which doesn't fire for fragmented
+    # DASH/HLS (how YouTube/Facebook serve video).
+    _enforce_downloaded_size(final, SETTINGS.max_video_filesize, "video")
     return final
 
 
@@ -344,6 +395,9 @@ def _source_download_opts(out_dir: Path) -> dict[str, Any]:
         "fragment_retries": 3,
         "socket_timeout": 30,
     }
+    # Hard size cap (F4/F7) so a malicious/huge source can't fill the disk.
+    if SETTINGS.public and SETTINGS.max_source_filesize > 0:
+        opts["max_filesize"] = SETTINGS.max_source_filesize
     ratelimit = _download_ratelimit()
     if ratelimit:
         log.info("Throttling download to %.0f bytes/sec (test mode)", ratelimit)
@@ -395,6 +449,7 @@ class SourceFetcher:
                 f"yt-dlp could not determine duration for {self.url}; "
                 "live streams and unbounded media are not supported yet."
             )
+        _enforce_duration_limit(float(duration))
         self._info = info
         # If the source is already on disk, the download step short-circuits.
         self._cached = _find_source(self.out_dir)

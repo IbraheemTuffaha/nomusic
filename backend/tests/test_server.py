@@ -61,13 +61,23 @@ def test_capabilities_reports_stub_engine(client):
     assert body["defaults"]["chunk_seconds"] > 0
 
 
+# A well-formed-but-unknown job_id: 16 hex chars (the shape the routes enforce),
+# so these exercise the unknown-job path rather than the path-param 422.
+_UNKNOWN_JOB = "0123456789abcdef"
+
+
 def test_status_unknown_job_is_404(client):
-    assert client.get("/status/does-not-exist").status_code == 404
+    assert client.get(f"/status/{_UNKNOWN_JOB}").status_code == 404
+
+
+def test_status_malformed_job_id_is_422(client):
+    # Not 16 hex chars → rejected by the path-param pattern before any lookup.
+    assert client.get("/status/does-not-exist").status_code == 422
 
 
 def test_events_unknown_job_is_204(client):
     # 204 (not 404) so EventSource stops reconnecting per the SSE spec.
-    assert client.get("/events/does-not-exist").status_code == 204
+    assert client.get(f"/events/{_UNKNOWN_JOB}").status_code == 204
 
 
 def test_process_rejects_unknown_stem(client):
@@ -193,35 +203,37 @@ def test_raise_open_file_limit_is_best_effort(monkeypatch):
 
 
 def test_chunk_unknown_job_is_404(client):
-    assert client.get("/chunk/nope/0").status_code == 404
+    assert client.get(f"/chunk/{_UNKNOWN_JOB}/0").status_code == 404
 
 
 def test_audio_bad_format_is_400(client):
     # Format is validated before the job lookup, so a bad format wins over 404.
-    assert client.get("/audio/whatever?format=flac").status_code == 400
+    assert client.get(f"/audio/{_UNKNOWN_JOB}?format=flac").status_code == 400
 
 
 def test_audio_unknown_job_is_404(client):
-    assert client.get("/audio/whatever").status_code == 404
+    assert client.get(f"/audio/{_UNKNOWN_JOB}").status_code == 404
 
 
 def test_video_unknown_job_is_404(client):
-    assert client.get("/video/whatever").status_code == 404
+    assert client.get(f"/video/{_UNKNOWN_JOB}").status_code == 404
 
 
 def test_video_progress_defaults_to_idle(client):
-    resp = client.get("/video/whatever/progress")
+    resp = client.get(f"/video/{_UNKNOWN_JOB}/progress")
     assert resp.status_code == 200
     assert resp.json()["phase"] == "idle"
 
 
 def test_cache_stats_shape(client):
+    # Dev mode: /cache is open (admin gate is a no-op) and reports stats without
+    # leaking the on-disk root path.
     resp = client.get("/cache")
     assert resp.status_code == 200
     body = resp.json()
     assert "total_bytes" in body
     assert "job_count" in body
-    assert "root" in body
+    assert "root" not in body
 
 
 def test_cache_clear_returns_deleted_bytes(client):

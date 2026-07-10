@@ -143,6 +143,40 @@ test("_resumeProcessing keeps the same job_id when the url is unchanged", async 
   assert.equal(opened, 1); // reopened the (closed) stream
 });
 
+test("status stream reconnect backs off, respawns, then gives up", () => {
+  const s = makeSession();
+  let resumes = 0;
+  s._resumeProcessing = async () => {
+    resumes++;
+  };
+  const prevST = globalThis.setTimeout;
+  const pending = [];
+  globalThis.setTimeout = (fn) => {
+    pending.push(fn);
+    return pending.length;
+  };
+  try {
+    let guard = 0;
+    while (!s._streamEnded && guard++ < 50) {
+      s._scheduleStreamReconnect();
+      const fn = pending.shift();
+      if (fn) fn(); // fire the scheduled reconnect synchronously
+    }
+    assert.equal(s._streamEnded, true); // eventually gives up
+    assert.ok(resumes >= 1); // respawn attempted at least once
+  } finally {
+    globalThis.setTimeout = prevST;
+  }
+});
+
+test("_scheduleStreamReconnect no-ops once the stream has ended", () => {
+  const s = makeSession();
+  s._streamEnded = true;
+  s._scheduleStreamReconnect();
+  assert.equal(s._streamReconnectTimer, null);
+  assert.equal(s._streamReconnectAttempts, 0);
+});
+
 test("normalizeWatchUrl extracts a clean watch URL and strips extra params", () => {
   assert.equal(
     normalizeWatchUrl("https://www.youtube.com/watch?v=ABC123&t=42s&list=PLx"),
