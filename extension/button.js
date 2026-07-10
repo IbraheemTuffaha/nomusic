@@ -274,14 +274,15 @@ export class Button {
 
   // The download menu. MP3 (audio only) plus MP4 at a few resolution caps.
   // Resolution is a ceiling — the backend grabs the best stream up to it and
-  // falls back when a video doesn't offer that height.
+  // falls back when a video doesn't offer that height. The public backend caps
+  // exports at 1080p (config.allowed_video_heights), so we don't offer 1440p/4K:
+  // they would silently deliver 1080p. "Best available" yields whatever the
+  // backend allows (1080p on the hosted default, true-best on a self-host).
   static MENU_ITEMS = [
     { section: "Audio" },
     { label: "MP3 — audio only", format: "mp3", height: 0 },
     { section: "Video (MP4)" },
     { label: "Best available", format: "mp4", height: 0 },
-    { label: "2160p · 4K", format: "mp4", height: 2160 },
-    { label: "1440p", format: "mp4", height: 1440 },
     { label: "1080p", format: "mp4", height: 1080 },
     { label: "720p", format: "mp4", height: 720 },
     { label: "480p", format: "mp4", height: 480 },
