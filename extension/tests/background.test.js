@@ -53,6 +53,34 @@ test("onInstalled writes nothing when all defaults are present", async () => {
   assert.equal(getWritten(), null);
 });
 
+test("update migrates the old localhost default to the public backend", async () => {
+  const { captured, getWritten } = await loadBackground({
+    stored: {
+      backendUrl: "http://127.0.0.1:8723",
+      model: "m",
+      keepStems: ["vocals"],
+      autoStart: false,
+    },
+  });
+  await captured.onInstalled({ reason: "update" });
+  const written = getWritten();
+  assert.ok(written, "expected a migration write");
+  assert.equal(written.backendUrl, "https://nomusic.example.com");
+});
+
+test("update leaves a user's custom backend untouched", async () => {
+  const { captured, getWritten } = await loadBackground({
+    stored: {
+      backendUrl: "http://my-laptop.local:8723",
+      model: "m",
+      keepStems: ["vocals"],
+      autoStart: false,
+    },
+  });
+  await captured.onInstalled({ reason: "update" });
+  assert.equal(getWritten(), null); // nothing changed
+});
+
 test("ping-backend reports reachability from a capabilities fetch", async () => {
   const { captured } = await loadBackground({ stored: {} });
   globalThis.fetch = async () => ({ ok: true, status: 200 });
