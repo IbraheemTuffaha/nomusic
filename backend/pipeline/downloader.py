@@ -69,6 +69,26 @@ _BYTES_PER_KB = 1024
 _BYTES_PER_MB = _BYTES_PER_KB * _BYTES_PER_KB
 
 
+def _enforce_downloaded_size(path: Path, cap_bytes: int, what: str) -> None:
+    """Delete and reject a downloaded file that exceeds ``cap_bytes`` (public mode).
+
+    yt-dlp's ``max_filesize`` only *pre-aborts* when the size is known up front,
+    which it isn't for fragmented DASH/HLS — exactly how YouTube and Facebook
+    serve video. So the declared size cap silently doesn't fire there. Checking
+    after the fact bounds on-disk size (and stops an over-cap file being served)
+    even when the pre-download cap was bypassed; bandwidth is still bounded by the
+    download deadline. No-op unless public / cap disabled."""
+    if not SETTINGS.public or cap_bytes <= 0:
+        return
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size > cap_bytes:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(f"{what} exceeds size cap ({size} > {cap_bytes} bytes)")
+
+
 def _emit_finished_progress(progress_hook: ProgressHook | None, size_bytes: int) -> None:
     """Synthesize a yt-dlp ``finished`` progress event for a cache hit, so a
     caller driving a UI bar jumps to 100% without special-casing the no-download
@@ -250,6 +270,8 @@ def download_source(
             f"yt-dlp didn't produce a source file in {out_dir}; "
             "supported extensions: " + ", ".join(_SOURCE_EXTS)
         )
+    # Backstop the pre-download max_filesize (doesn't fire for fragmented DASH/HLS).
+    _enforce_downloaded_size(final, SETTINGS.max_source_filesize, "source audio")
     return final
 
 
@@ -340,6 +362,9 @@ def download_video(
             f"yt-dlp didn't produce a video file in {out_dir}; "
             "supported extensions: " + ", ".join(_VIDEO_EXTS)
         )
+    # Backstop the pre-download max_filesize, which doesn't fire for fragmented
+    # DASH/HLS (how YouTube/Facebook serve video).
+    _enforce_downloaded_size(final, SETTINGS.max_video_filesize, "video")
     return final
 
 
