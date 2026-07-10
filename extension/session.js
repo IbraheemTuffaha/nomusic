@@ -6,6 +6,15 @@ import { settings, dlog, SYNC_CHECK_MS } from "./settings.js";
 import { MuteController } from "./mute-controller.js";
 import { AudioScheduler } from "./audio-scheduler.js";
 
+// Status-stream reconnect backoff. EventSource treats an HTTP error (e.g. the
+// backend's SSE per-IP/global cap -> 429) as fatal and never retries, and a
+// stream with no subscriber lets the backend idle-abandon the worker — so on a
+// non-terminal close we re-establish the stream (respawning the worker) a few
+// times with growing delay, recovering once a slot frees / the blip passes.
+const STREAM_RECONNECT_BASE_MS = 3000;
+const STREAM_RECONNECT_MAX_MS = 15000;
+const STREAM_RECONNECT_MAX_ATTEMPTS = 5;
+
 /** Clean a raw URL down to https://www.youtube.com/watch?v=ID, or null if it
  *  isn't a watch URL — so the caller can fall back to the page URL. Stripping
  *  the time/playlist params keeps the same video to one backend cache key. */
@@ -91,6 +100,10 @@ export class Session {
     // Debounce timer for the /prioritize POST on seek so scrubbing a
     // timeline doesn't fire one request per intermediate frame.
     this._prioritizeTimer = null;
+    // Backoff state for reconnecting a status stream that closed before a
+    // terminal event (see STREAM_RECONNECT_* above). Reset on any received event.
+    this._streamReconnectTimer = null;
+    this._streamReconnectAttempts = 0;
     this._boundHandlers = {
       play: () => {
         this.scheduler?.reschedule();
@@ -237,10 +250,17 @@ export class Session {
    *  stops the reconnect loop. */
   _openEventStream() {
     if (this.disposed) return;
+    // Opening a fresh stream cancels any pending reconnect from a prior drop.
+    if (this._streamReconnectTimer) {
+      clearTimeout(this._streamReconnectTimer);
+      this._streamReconnectTimer = null;
+    }
     this.eventSource = new EventSource(
       `${settings.backendUrl}/events/${this.jobId}`,
     );
     this.eventSource.onmessage = (e) => {
+      // A delivered event means we're connected: reset the reconnect backoff.
+      this._streamReconnectAttempts = 0;
       let payload;
       try {
         payload = JSON.parse(e.data);
@@ -251,17 +271,50 @@ export class Session {
       this.handleStatus(payload);
     };
     this.eventSource.onerror = () => {
-      // A 204 (unknown job) or our own .close() on a terminal state puts
-      // readyState at CLOSED — there's no more stream to wait on. A
-      // transient drop instead sits in CONNECTING while EventSource retries,
-      // so we leave _streamEnded alone in that case.
+      // Only CLOSED is terminal for us; a transient drop sits in CONNECTING
+      // while EventSource retries on its own, so leave that alone.
       if (
-        this.eventSource &&
-        this.eventSource.readyState === EventSource.CLOSED
+        !this.eventSource ||
+        this.eventSource.readyState !== EventSource.CLOSED
       ) {
-        this._streamEnded = true;
+        return;
       }
+      this.eventSource = null;
+      // CLOSED can mean (a) handleStatus already closed us on a terminal state
+      // (_streamEnded set), (b) the user paused (we null the stream first), or
+      // (c) the stream closed before a terminal event — 204 unknown job, a
+      // transient drop, or a server rejection (SSE cap 429, which EventSource
+      // never retries). Only (c) needs recovery: reconnect with backoff so
+      // chunk fetching (driven by status.ready_chunks) doesn't stall.
+      if (this._streamEnded || this.disposed || this._streamPausedClosed) return;
+      this._scheduleStreamReconnect();
     };
+  }
+
+  /** Reconnect the status stream after a non-terminal close, with growing
+   *  backoff and a hard attempt cap. Respawns the worker via _resumeProcessing
+   *  (it may have idle-abandoned while we had no subscriber) and reopens the
+   *  stream; if the cap is hit we give up and mark the session ended so the UI
+   *  reverts and a fresh click starts over. */
+  _scheduleStreamReconnect() {
+    if (this.disposed || this._streamEnded || this._streamReconnectTimer) return;
+    this._streamReconnectAttempts += 1;
+    if (this._streamReconnectAttempts > STREAM_RECONNECT_MAX_ATTEMPTS) {
+      dlog("status stream gave up after reconnect attempts");
+      this._streamEnded = true;
+      return;
+    }
+    const delay = Math.min(
+      STREAM_RECONNECT_BASE_MS * this._streamReconnectAttempts,
+      STREAM_RECONNECT_MAX_MS,
+    );
+    this._streamReconnectTimer = setTimeout(() => {
+      this._streamReconnectTimer = null;
+      if (this.disposed || this._streamEnded || this._streamPausedClosed) return;
+      // _resumeProcessing re-/process's the job and reopens the stream; if that
+      // reopen fails again, onerror schedules the next (longer) attempt.
+      this._resumeProcessing();
+    }, delay);
   }
 
   /** User paused the video (not a buffer pause). Close the status stream so
@@ -278,6 +331,12 @@ export class Session {
     if (this.eventSource) {
       this.eventSource.close();
       this.eventSource = null;
+    }
+    // Cancel any pending stream reconnect: the user paused, so we WANT the
+    // backend to idle-abandon; a reconnect here would fight that.
+    if (this._streamReconnectTimer) {
+      clearTimeout(this._streamReconnectTimer);
+      this._streamReconnectTimer = null;
     }
     this._streamPausedClosed = true;
     // Replace the frozen live label (e.g. "Removing music 41%") with a
@@ -577,6 +636,7 @@ export class Session {
     }
     if (this.bufferTimer) clearTimeout(this.bufferTimer);
     if (this._prioritizeTimer) clearTimeout(this._prioritizeTimer);
+    if (this._streamReconnectTimer) clearTimeout(this._streamReconnectTimer);
     // If we paused for buffering, let the video resume now that we're
     // letting go of it — otherwise it would stay paused with no audio
     // override and the user would have to hit play themselves.
