@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="nomusic">
+  <title>nomusic</title>
+  <rect width="512" height="512" rx="115" fill="#101010"/>
+  <mask id="mark">
+    <g fill="#fff" transform="translate(256 250) scale(1.05) translate(-268 -249)">
+      <ellipse cx="224" cy="340" rx="58" ry="46" transform="rotate(-20 224 340)"/>
+      <rect x="246" y="120" width="34" height="222" rx="6"/>
+      <path d="M268 120 Q360 154 330 240 Q336 190 272 178 Z"/>
+    </g>
+    <!-- Gap first, then the bar inside it: on the transparent mark the gap has
+         to be a hole so the pill shows through, not a dark stroke. The slash
+         runs across the note's axis, so it cuts only the stem — head and flag
+         stay whole. -->
+    <line x1="120" y1="120" x2="392" y2="392" stroke="#000" stroke-width="54" stroke-linecap="round"/>
+    <line x1="120" y1="120" x2="392" y2="392" stroke="#fff" stroke-width="26" stroke-linecap="round"/>
+  </mask>
+  <rect width="512" height="512" fill="#C1EE07" mask="url(#mark)"/>
+</svg>
