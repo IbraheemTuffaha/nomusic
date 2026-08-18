@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="nomusic">
+  <title>nomusic</title>
+  <rect width="512" height="512" rx="115" fill="#101010"/>
+  <mask id="mark">
+    <path d="M140 95 L398 256 L140 417 Z" fill="#fff" stroke="#fff" stroke-width="48" stroke-linejoin="round"/>
+    <g fill="#000" transform="translate(200 256) scale(0.58) translate(-225 -243)">
+      <polygon points="176,132 340,100 340,146 176,178"/>
+      <rect x="176" y="132" width="30" height="212" rx="6"/>
+      <rect x="310" y="106" width="30" height="170" rx="6"/>
+      <ellipse cx="160" cy="346" rx="50" ry="40" transform="rotate(-20 160 346)"/>
+      <ellipse cx="294" cy="278" rx="50" ry="40" transform="rotate(-20 294 278)"/>
+    </g>
+  </mask>
+  <rect width="512" height="512" fill="#C1EE07" mask="url(#mark)"/>
+</svg>
