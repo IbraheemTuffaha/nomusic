@@ -8,6 +8,7 @@ server.py's branching lives.
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -39,8 +40,9 @@ class _CapsOnlyEngine(Engine):
 
 
 @pytest.fixture
-def client(monkeypatch):
+def client(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "get_engine", lambda name: _CapsOnlyEngine())
+    monkeypatch.setattr(server, "SETTINGS", replace(server.SETTINGS, cache_dir=tmp_path))
     app = server.create_app()
     with TestClient(app) as test_client:
         yield test_client
@@ -50,6 +52,13 @@ def test_healthz(client):
     resp = client.get("/healthz")
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
+
+
+def test_process_rejected_during_shutdown(client):
+    client.app.state.services.begin_shutdown()
+    response = client.post("/process", json={"url": "http://example.com/v"})
+    assert response.status_code == 503
+    assert response.json() == {"detail": "server shutting down"}
 
 
 def test_capabilities_reports_stub_engine(client):

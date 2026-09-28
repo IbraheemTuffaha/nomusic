@@ -105,6 +105,30 @@ compatibility launcher for the processing CLI. New code should import from
 the `nomusic` package. The installed `nomusic` command works from any working
 directory when invoked by its absolute path or through an activated environment.
 
+### Service lifecycle
+
+Each application lifespan creates its own engine, cache, job registry and
+background threads. Importing the server or constructing an app starts no
+model loading, downloads or maintenance work. Restarting creates fresh
+in-memory services and preserves the on-disk caches.
+
+Control+C or SIGTERM first stops new job admission and closes progress
+streams. The server then lets active HTTP requests, including exports,
+finish. Lifespan shutdown joins job workers, their download/decode/write
+work, model warmup and maintenance threads before releasing the services.
+Wait for **Service shutdown complete** before treating the backend as stopped.
+
+This is cooperative shutdown: an active native inference call or network
+operation can delay it. There is no hard deadline or supervised termination
+of a stuck model worker yet. Warmup failure still permits lazy retry on the
+first processing request; `/healthz` and `check-runtime` remain separate from
+model readiness.
+
+Use `nomusic serve`, `python -m nomusic serve`, or the compatibility launcher
+above. They use a small Uvicorn adapter to close progress streams before HTTP
+drain. A generic `uvicorn nomusic.server:app` command bypasses that step and
+can wait indefinitely for an open progress stream during shutdown.
+
 ### Device selection
 
 `NOMUSIC_DEVICE` accepts `auto` (the default), `cpu`, `mps`, or `cuda`.
@@ -238,7 +262,8 @@ npm --prefix extension test
 The backend suite contains isolated tests with stubbed acquisition/inference;
 it is not a substitute for real processing. Any GPU-specific skip must be
 reported as such. Extension Node tests do not replace loading the unpacked
-extension in Chrome.
+extension in Chrome. Lifecycle tests also start real server subprocesses to
+exercise SIGTERM, open progress streams, active HTTP request drain and reload.
 
 The standard installer uses a non-editable package. Re-run it after changing
 backend code, or use an editable development installation from the same lock
@@ -250,6 +275,16 @@ UV_PROJECT_ENVIRONMENT=backend/.venv uv sync --locked --extra cpu --python 3.12.
 
 Here and below, `uv` means an installed uv 0.12.19 executable; the bootstrap
 copy is `backend/.installer-venv/bin/uv` when the installer created one.
+
+For automatic restart after editing Python files in an editable installation:
+
+```sh
+NOMUSIC_RELOAD=1 backend/.venv/bin/nomusic serve
+```
+
+The reloader's parent process watches files without starting model warmup or
+maintenance. On a change, the serving child shuts down before its replacement
+starts fresh services. A slow graceful stop can therefore delay a reload.
 
 ### Run with fresh media and model caches
 
@@ -278,7 +313,9 @@ throughput or subjective listening benchmark.
 | Location | Responsibility |
 | --- | --- |
 | `backend/nomusic/__main__.py` | Installed command routing |
-| `backend/nomusic/server.py` and `routes/` | API construction and HTTP endpoints |
+| `backend/nomusic/server.py` and `routes/` | API construction, lifespan and HTTP endpoints |
+| `backend/nomusic/services.py` | One lifespan's engine, registry and background-thread ownership |
+| `backend/nomusic/serving.py` | Uvicorn launch/reload and shutdown announcement before HTTP drain |
 | `backend/nomusic/config.py` and `runtime.py` | Configuration and external-tool checks |
 | `backend/nomusic/jobs.py` | Current in-process job registry and worker ownership |
 | `backend/nomusic/engines/` | Engine contract, Demucs inference and pinned models |
@@ -287,8 +324,9 @@ throughput or subjective listening benchmark.
 | `extension/` | Browser UI, session networking and audio scheduling |
 
 Keep installation checks, model fetching and CLI help independent of server
-startup. Full lifecycle ownership and meaningful model readiness are follow-up
-work; packaging alone does not establish those guarantees.
+startup. Keep thread cleanup with the service or processor that creates the
+work. Model-readiness diagnostics and hard termination of stuck workers remain
+separate work from the normal lifecycle.
 
 ### Useful configuration
 

@@ -354,6 +354,8 @@ class SourceFetcher:
 
     ``download`` falls back to a clean :func:`download_source` if the same-
     session download raises, so the optimization can never fail a job outright.
+    If prepared work is abandoned before downloading, call ``close`` to release
+    the session. Extraction failures and all download exits close it themselves.
     """
 
     def __init__(self, url: str, out_dir: Path) -> None:
@@ -366,86 +368,97 @@ class SourceFetcher:
     def extract(self) -> VideoMetadata:
         from yt_dlp import YoutubeDL
 
+        # Reusing the fetcher starts a new session; do not lose ownership of a
+        # previous one or retain metadata from a failed extraction.
+        self.close()
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._ydl = YoutubeDL(_source_download_opts(self.out_dir))
-        t0 = time.monotonic()
-        info = self._ydl.extract_info(self.url, download=False)
-        log.info("SourceFetcher: metadata extracted in %.1fs", time.monotonic() - t0)
-        if info is None:
-            raise RuntimeError(f"yt-dlp returned no metadata for {self.url}")
-        if "entries" in info and info["entries"]:
-            info = info["entries"][0]
-        duration = info.get("duration")
-        if duration is None:
-            raise RuntimeError(
-                f"yt-dlp could not determine duration for {self.url}; "
-                "live streams and unbounded media are not supported yet."
+        try:
+            t0 = time.monotonic()
+            info = self._ydl.extract_info(self.url, download=False)
+            log.info("SourceFetcher: metadata extracted in %.1fs", time.monotonic() - t0)
+            if info is None:
+                raise RuntimeError(f"yt-dlp returned no metadata for {self.url}")
+            if "entries" in info and info["entries"]:
+                info = info["entries"][0]
+            duration = info.get("duration")
+            if duration is None:
+                raise RuntimeError(
+                    f"yt-dlp could not determine duration for {self.url}; "
+                    "live streams and unbounded media are not supported yet."
+                )
+            self._info = info
+            # If the source is already on disk, download short-circuits.
+            self._cached = _find_source(self.out_dir)
+            return VideoMetadata(
+                id=str(info.get("id", "unknown")),
+                title=str(info.get("title", "untitled")),
+                duration_seconds=float(duration),
+                extractor=str(info.get("extractor", "unknown")),
+                webpage_url=str(info.get("webpage_url", self.url)),
             )
-        self._info = info
-        # If the source is already on disk, the download step short-circuits.
-        self._cached = _find_source(self.out_dir)
-        return VideoMetadata(
-            id=str(info.get("id", "unknown")),
-            title=str(info.get("title", "untitled")),
-            duration_seconds=float(duration),
-            extractor=str(info.get("extractor", "unknown")),
-            webpage_url=str(info.get("webpage_url", self.url)),
-        )
+        except BaseException:
+            self.close()
+            raise
 
     def download(self, progress_hook: ProgressHook | None = None) -> Path:
-        if self._cached is not None:
-            log.info("Using cached source audio: %s", self._cached.name)
-            _emit_finished_progress(progress_hook, self._cached.stat().st_size)
-            self._close()
-            return self._cached
-
-        if self._ydl is None or self._info is None:
-            # extract() wasn't called (shouldn't happen) — just do a clean run.
-            return download_source(self.url, self.out_dir, progress_hook=progress_hook)
-
-        log.info("Downloading source audio for %s -> %s", self.url, self.out_dir)
-        t0 = time.monotonic()
         try:
-            if progress_hook:
-                self._ydl.add_progress_hook(progress_hook)
-            # Same-session download of the already-extracted result: this is
-            # exactly what extract_info(download=True) does internally, split
-            # in two — no second extraction, no cross-session 403.
-            self._ydl.process_ie_result(self._info, download=True)
-            log.info(
-                "SourceFetcher: same-session download OK (no re-extract), %.1fs",
-                time.monotonic() - t0,
-            )
-        except DownloadCancelled:
-            # An intentional abort (the progress hook raised), not a download
-            # failure — propagate it cleanly instead of logging a traceback and
-            # restarting the very download we're trying to stop.
-            self._close()
-            raise
-        except Exception:
-            log.warning(
-                "SourceFetcher: same-session download failed; retrying clean",
-                exc_info=True,
-            )
-            self._close()
-            return download_source(self.url, self.out_dir, progress_hook=progress_hook)
-        self._close()
+            if self._cached is not None:
+                log.info("Using cached source audio: %s", self._cached.name)
+                _emit_finished_progress(progress_hook, self._cached.stat().st_size)
+                return self._cached
 
-        final = _find_source(self.out_dir)
-        if final is None:
-            raise RuntimeError(
-                f"yt-dlp didn't produce a source file in {self.out_dir}; "
-                "supported extensions: " + ", ".join(_SOURCE_EXTS)
-            )
-        return final
+            if self._ydl is None or self._info is None:
+                # extract() wasn't called — just do a clean run.
+                return download_source(self.url, self.out_dir, progress_hook=progress_hook)
 
-    def _close(self) -> None:
-        if self._ydl is not None:
+            log.info("Downloading source audio for %s -> %s", self.url, self.out_dir)
+            t0 = time.monotonic()
             try:
-                self._ydl.close()
+                if progress_hook:
+                    self._ydl.add_progress_hook(progress_hook)
+                # Keep extraction and download in the same session to retain
+                # the credentials associated with the extracted media URLs.
+                self._ydl.process_ie_result(self._info, download=True)
+                log.info(
+                    "SourceFetcher: same-session download OK (no re-extract), %.1fs",
+                    time.monotonic() - t0,
+                )
+            except DownloadCancelled:
+                # Never restart a download the caller is deliberately stopping.
+                raise
+            except Exception:
+                log.warning(
+                    "SourceFetcher: same-session download failed; retrying clean",
+                    exc_info=True,
+                )
+                self.close()
+                return download_source(self.url, self.out_dir, progress_hook=progress_hook)
+
+            final = _find_source(self.out_dir)
+            if final is None:
+                raise RuntimeError(
+                    f"yt-dlp didn't produce a source file in {self.out_dir}; "
+                    "supported extensions: " + ", ".join(_SOURCE_EXTS)
+                )
+            return final
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Release the session after downloading or abandoning prepared work.
+
+        Idempotent. A later ``extract`` starts a fresh reusable session. The
+        caller must wait for any background download before calling this.
+        """
+        ydl, self._ydl = self._ydl, None
+        self._info = None
+        self._cached = None
+        if ydl is not None:
+            try:
+                ydl.close()
             except Exception:  # closing is best-effort; a failure here is benign
                 log.debug("SourceFetcher: ydl.close() raised", exc_info=True)
-            self._ydl = None
 
 
 def slice_source(

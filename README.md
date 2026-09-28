@@ -66,7 +66,10 @@ backend/.venv/bin/nomusic serve
 ```
 
 Keep this Terminal window open while using nomusic. Press **Control + C** to
-stop it. Next time, run the same command.
+stop it, and wait for shutdown to finish. It closes progress streams, lets
+active exports finish, and waits for processing and background work to stop.
+An active model operation or network request can delay shutdown. Next time,
+run the same command.
 
 The server listens at `http://127.0.0.1:8723`. A “Uvicorn running” message means
 the HTTP server is listening; the model can still be loading. The extension
@@ -140,6 +143,10 @@ The backend is Python/FastAPI with Demucs/PyTorch inference. The plain
 JavaScript Manifest V3 extension schedules processed audio against the video
 clock. Backend code lives in `backend/nomusic/`; `backend/server.py` remains a
 compatibility launcher.
+
+Application lifespan owns the engine, jobs and background work; importing the
+server does not start them. Use the documented launch commands so shutdown
+can close progress streams before draining HTTP requests.
 
 See [installation and development](docs/installation.md) for the dependency
 lock, commands, model provenance, test boundaries and upgrade workflow.

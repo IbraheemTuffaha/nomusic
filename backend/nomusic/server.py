@@ -2,10 +2,10 @@
 
 Run directly with ``python backend/server.py`` (no uvicorn CLI needed).
 
-``create_app`` is a thin assembler: it builds the app, wires the shared engine /
-cache / job registry onto ``app.state``, starts the background daemons (cache
-TTL sweep, memory GC, engine warmup), and includes the routers. The endpoints
-live in :mod:`routes` (system / jobs / media):
+``create_app`` only assembles routes and middleware. Its lifespan creates and
+owns the engine, cache, registry and background work, and joins normal work
+before releasing them on shutdown. Importing this module starts no services.
+The endpoints live in :mod:`nomusic.routes` (system / jobs / media):
 
   GET  /healthz
   GET  /capabilities
@@ -26,8 +26,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import threading
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -36,21 +34,16 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from nomusic.config import SETTINGS
 from nomusic.engines import get_engine
-from nomusic.jobs import JobRegistry
-from nomusic.pipeline.cache import JobCache
-from nomusic.pipeline.processor import Processor
 from nomusic.routes.jobs import router as jobs_router
-from nomusic.routes.media import router as media_router
+from nomusic.routes.media import _ExportProgress, router as media_router
 from nomusic.routes.system import router as system_router
+from nomusic.services import Services
 
 # Directory watched by the optional development reloader. All entry points use
 # the same package import so there is only one server module identity.
 _BACKEND_DIR = Path(__file__).resolve().parent
 
 log = logging.getLogger("nomusic.server")
-
-# Seconds in a day — the cache TTL is configured in days but compared in seconds.
-_SECONDS_PER_DAY = 86400.0
 
 
 def _raise_open_file_limit() -> None:
@@ -101,106 +94,34 @@ def _configure_logging() -> None:
     )
 
 
-def _start_cache_ttl_sweeper(cache: JobCache) -> None:
-    """Run an initial sweep, then schedule one every
-    ``cache_sweep_interval_seconds``. Skipped entirely when TTL is 0.
-
-    Lives in a daemon thread so it doesn't block server shutdown."""
-    if SETTINGS.cache_ttl_days <= 0 or SETTINGS.cache_sweep_interval_seconds <= 0:
-        log.info("Cache TTL sweep disabled (ttl_days=%s)", SETTINGS.cache_ttl_days)
-        return
-
-    ttl_seconds = SETTINGS.cache_ttl_days * _SECONDS_PER_DAY
-
-    def _loop() -> None:
-        while True:
-            try:
-                removed, freed = cache.sweep_older_than(ttl_seconds)
-                if removed:
-                    log.info(
-                        "TTL sweep: removed %d entries, freed %d bytes",
-                        removed,
-                        freed,
-                    )
-            except Exception:
-                # Daemon loop: one failed sweep must not kill the thread, or the
-                # cache would stop being reclaimed for the server's lifetime.
-                log.exception("TTL sweep failed")
-            time.sleep(SETTINGS.cache_sweep_interval_seconds)
-
-    t = threading.Thread(target=_loop, name="nomusic-cache-ttl", daemon=True)
-    t.start()
-
-
-def _start_memory_gc(registry: JobRegistry) -> None:
-    """Periodically reclaim in-memory job entries whose disk cache is gone.
-
-    Runs alongside the disk TTL sweeper on its own daemon thread, so the
-    in-memory JobStatus map can't grow without bound on a long-lived server.
-    Keyed to its own interval so a hosted deployment can GC aggressively
-    without touching the disk-sweep cadence. ``0`` disables it."""
-    interval = SETTINGS.memory_gc_interval_seconds
-    if interval <= 0:
-        log.info("Memory GC disabled (interval=%s)", interval)
-        return
-
-    def _loop() -> None:
-        while True:
-            time.sleep(interval)
-            try:
-                dropped = registry.memory_gc()
-                if dropped:
-                    log.info("Memory GC dropped %d stale in-memory job(s)", dropped)
-            except Exception:
-                # Daemon loop: swallow so a single failed pass doesn't stop all
-                # future GC and let the in-memory job map grow unbounded.
-                log.exception("Memory GC failed")
-
-    t = threading.Thread(target=_loop, name="nomusic-memory-gc", daemon=True)
-    t.start()
-
-
-def _start_engine_warmup(engine) -> None:
-    """Load the default model weights on a background thread at startup.
-
-    The first separation otherwise pays a one-off model-load cost (weights
-    fetch + MPS init, several seconds) on the user's first chunk. Warming up
-    in the background means that cost is usually already paid by the time the
-    first job reaches its separation phase, so first-chunk latency matches
-    steady state. Best-effort: a failure here just falls back to lazy loading.
-    """
-
-    def _loop() -> None:
-        try:
-            engine.warmup()
-            log.info("Engine warmup complete")
-        except Exception:
-            # Warmup is a latency optimization only; on failure the first real
-            # job loads the model lazily, so this must never be fatal.
-            log.exception("Engine warmup failed; will load lazily on first job")
-
-    t = threading.Thread(target=_loop, name="nomusic-engine-warmup", daemon=True)
-    t.start()
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Capture the running event loop once at startup. Worker threads use it
-    # (via call_soon_threadsafe) to push status snapshots onto SSE queues.
-    app.state.registry.attach_loop(asyncio.get_running_loop())
-    yield
+    _configure_logging()
+    _raise_open_file_limit()
+    services = Services(SETTINGS, engine_factory=get_engine)
+    app.state.services = services
+    try:
+        services.start(asyncio.get_running_loop())
+        app.state.engine = services.engine
+        app.state.cache = services.cache
+        app.state.registry = services.registry
+        app.state.export_progress = _ExportProgress()
+        yield
+    finally:
+        services.begin_shutdown()
+        # Joining synchronously here would block final worker-to-SSE callbacks.
+        await asyncio.to_thread(services.shutdown)
+        for name in ("engine", "cache", "registry", "export_progress", "services"):
+            if hasattr(app.state, name):
+                delattr(app.state, name)
 
 
 def create_app() -> FastAPI:
-    _configure_logging()
-    _raise_open_file_limit()
     app = FastAPI(title="nomusic", version="0.2.0", lifespan=lifespan)
 
-    # SECURITY INVARIANT: allow_origins='*' with no auth is only safe because
-    # the server binds to 127.0.0.1 (see SETTINGS.host / config.py) — it's
-    # reachable only from this machine, so any origin reaching it is already
-    # local. If you ever change the bind to a non-loopback address, you MUST add
-    # authentication and tighten allow_origins; the two settings are coupled.
+    # Preserve the existing local browser transport. Loopback and CORS do not
+    # authenticate callers; remote deployment requires separate authorization
+    # and origin restrictions.
     #
     # ``allow_private_network=True`` opts into Chrome's Private Network
     # Access flow: a fetch from a public origin (youtube.com) to a private
@@ -217,28 +138,6 @@ def create_app() -> FastAPI:
         allow_private_network=True,
     )
 
-    engine = get_engine(SETTINGS.engine_name)
-    cache = JobCache(SETTINGS.cache_dir)
-    processor = Processor(
-        engine=engine,
-        cache=cache,
-        chunk_seconds=SETTINGS.chunk_seconds,
-        chunk_overlap_seconds=SETTINGS.chunk_overlap_seconds,
-        keep_source_after_complete=SETTINGS.keep_source_after_complete,
-        progressive=SETTINGS.progressive_download,
-    )
-    registry = JobRegistry(processor=processor, cache=cache)
-
-    # Stash the shared services on app.state so the routers (and tests) reach
-    # them via request.app.state instead of closing over create_app locals.
-    app.state.engine = engine
-    app.state.cache = cache
-    app.state.registry = registry
-
-    _start_cache_ttl_sweeper(cache)
-    _start_memory_gc(registry)
-    _start_engine_warmup(engine)
-
     app.include_router(system_router)
     app.include_router(jobs_router)
     app.include_router(media_router)
@@ -251,7 +150,7 @@ app = create_app()
 def main() -> None:
     _configure_logging()
 
-    import uvicorn
+    from nomusic.serving import serve
 
     # Dev convenience: NOMUSIC_RELOAD=1 watches the imported package and restarts on
     # save, so you don't re-run the server by hand on every change. Off by
@@ -275,23 +174,13 @@ def main() -> None:
             "Auto-reload watches %s; use an editable install to watch checkout edits "
             "(see docs/installation.md)", _BACKEND_DIR,
         )
-        uvicorn.run(
-            "nomusic.server:app",
-            host=SETTINGS.host,
-            port=SETTINGS.port,
-            reload=True,
-            reload_dirs=[str(_BACKEND_DIR)],
-            log_level="info",
-            access_log=False,
-        )
-    else:
-        uvicorn.run(
-            app,
-            host=SETTINGS.host,
-            port=SETTINGS.port,
-            log_level="info",
-            access_log=False,
-        )
+    serve(
+        "nomusic.server:app",
+        host=SETTINGS.host,
+        port=SETTINGS.port,
+        reload=reload,
+        reload_dirs=[str(_BACKEND_DIR)] if reload else None,
+    )
 
 
 if __name__ == "__main__":
