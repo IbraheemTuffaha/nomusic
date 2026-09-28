@@ -1,18 +1,24 @@
-"""Uvicorn adapter that stops long-lived subscriptions before HTTP drain.
+"""Uvicorn adapter with quiet stream closure and a bounded process shutdown.
 
-Uvicorn drains requests before sending ASGI lifespan shutdown. A status stream
-can otherwise keep that drain open indefinitely, while the application waits
-for lifespan shutdown to stop its jobs. The adapter only announces shutdown
-early; lifespan remains responsible for joining application work. Ordinary
-requests, including synchronous exports, still get Uvicorn's normal drain.
+Uvicorn drains HTTP before ASGI lifespan shutdown. Stop admission and status
+streams first, then let active requests and cooperative jobs finish within one
+process-wide grace period. A first-start model preload alone is disposable.
+A watchdog and repeated interrupt exit the process if native work cannot stop;
+they do not pretend to cancel a running Python thread.
 
-``Server.shutdown`` and ``ChangeReload`` are the small integration surface with
-the pinned Uvicorn version. Real signal/reload tests cover that ordering. No
-application services are constructed in the reloader's parent process.
+The signal context covers asyncio executor teardown as well as HTTP/lifespan.
+The pinned Uvicorn integration is exercised by real signal and reload tests.
+No application services are constructed in the reloader's parent process.
 """
 
 from __future__ import annotations
 
+import contextlib
+import math
+import os
+import signal
+import threading
+import time
 from socket import socket
 from typing import Any
 
@@ -22,13 +28,129 @@ from uvicorn.supervisors import ChangeReload
 
 
 class LifecycleServer(uvicorn.Server):
+    """Graceful work drain with a process-level escape for stuck native calls.
+
+    Cancelling an asyncio task cannot stop its worker thread. The watchdog is
+    deliberately outside the event loop and exits the *process* on expiry.
+    No partial cleanup is attempted while a writer may still be using files.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        from nomusic.config import SETTINGS
+        self.grace_seconds = SETTINGS.shutdown_grace_seconds
+        if not math.isfinite(self.grace_seconds) or self.grace_seconds <= 0:
+            raise ValueError("NOMUSIC_SHUTDOWN_GRACE_SECONDS must be finite and positive")
+        self._watchdog: threading.Timer | None = None
+        self._shutdown_deadline: float | None = None
+        self._received_signal = False
+        self._running = False
+        self._application = None
+        self._shutdown_services = None
+
+    async def startup(self, sockets=None):
+        self._application = self.config.load_app()
+        await super().startup(sockets=sockets)
+
+    @staticmethod
+    def _announce(message):
+        # Diagnostics must not prevent interruption when stderr is closed or
+        # a logging pipe is full. Avoid Python logging locks in signal handlers.
+        try:
+            blocking = os.get_blocking(2)
+            os.set_blocking(2, False)
+        except OSError:
+            return
+        try:
+            os.write(2, message.encode())
+        except OSError:
+            pass
+        finally:
+            try:
+                os.set_blocking(2, blocking)
+            except OSError:
+                pass
+
+    def _force_exit(self, *, repeated=False):
+        reason = "second interrupt" if repeated else "shutdown grace period expired"
+        self._announce(f"Forced shutdown ({reason}); unfinished work was interrupted; restart and retry.\n")
+        os._exit(130 if repeated else 124)
+
+    def _start_watchdog(self, seconds=None):
+        if not self._running:
+            return
+        now = time.monotonic()
+        deadline = now + (self.grace_seconds if seconds is None else seconds)
+        if self._shutdown_deadline is not None and deadline >= self._shutdown_deadline:
+            return  # never extend the total deadline while moving between phases
+        self._shutdown_deadline = deadline
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+        self._watchdog = threading.Timer(max(0, deadline - now), self._force_exit)
+        self._watchdog.daemon = True
+        self._watchdog.start()
+
+    def handle_exit(self, sig, frame):
+        if self._received_signal and sig == signal.SIGINT:
+            self._force_exit(repeated=True)
+        self._received_signal = True
+        services = getattr(getattr(self._application, "state", None), "services", None)
+        if services is not None:
+            # A terminal signal can interrupt FFmpeg before Uvicorn reaches
+            # shutdown(). Silence streams immediately, without acquiring a lock
+            # that this signal might itself have interrupted on the main thread.
+            services.shutdown_requested = True
+        self._announce(
+            f"Stopping: finishing active processing/requests (up to {self.grace_seconds:g}s); "
+            "press Ctrl+C again to force quit. Model preload alone will not be awaited.\n"
+        )
+        self._start_watchdog()
+        self.should_exit = True
+
+    @contextlib.contextmanager
+    def capture_signals(self):
+        # Uvicorn normally restores handlers before asyncio.run drains executor
+        # threads. Keep ours active across that drain too (see run below).
+        yield
+
+    def run(self, sockets=None):
+        handlers = {}
+        if threading.current_thread() is threading.main_thread():
+            handlers = {sig: signal.signal(sig, self.handle_exit)
+                        for sig in (signal.SIGINT, signal.SIGTERM)}
+        self._running = True
+        try:
+            result = super().run(sockets=sockets)
+            preload = getattr(self._shutdown_services, "discarded_preload", None)
+            if preload is not None and preload.is_alive():
+                # Model download libraries can own ThreadPoolExecutors. Python
+                # joins even their daemon threads during interpreter teardown,
+                # after asyncio.run has returned. Application work is drained;
+                # dispose only this unfinished preload at the process boundary.
+                self._announce("Model preload interrupted; verified downloads can be reused on next start.\n")
+                os._exit(0)
+            return result
+        finally:
+            self._running = False
+            if self._watchdog is not None:
+                self._watchdog.cancel()
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
+
     async def shutdown(self, sockets: list[socket] | None = None) -> None:
-        # load_app returns the same imported app, before Uvicorn's middleware
-        # wrappers. Factory applications are deliberately not a launch mode.
+        self._start_watchdog()
         app = self.config.load_app()
         services = getattr(getattr(app, "state", None), "services", None)
         if services is not None:
+            self._shutdown_services = services
+            services.wait_for_warmup = False
             services.begin_shutdown()
+            registry = getattr(services, "registry", None)
+            if not (registry is not None and registry.has_active_workers) and not self.server_state.tasks:
+                # Nothing worth draining: do not spend a processing grace period
+                # on a model download or library-finalization thread. Normally
+                # the daemon preload lets the process exit much sooner than this.
+                self._start_watchdog(min(1.0, self.grace_seconds))
         await super().shutdown(sockets=sockets)
 
 
