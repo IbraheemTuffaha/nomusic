@@ -215,6 +215,8 @@ async def events(job_id: str, request: Request) -> Response:
         payload = json.dumps(initial.to_dict())
 
         async def one_shot():
+            if request.app.state.services.stopping:
+                return
             yield f"data: {payload}\n\n"
 
         return StreamingResponse(
@@ -232,10 +234,13 @@ async def events(job_id: str, request: Request) -> Response:
             # without waiting for the next change. Re-read after subscribe
             # to close the gap where the job finished mid-handshake.
             cur = registry.get(job_id)
-            if cur is None:
+            if cur is None or request.app.state.services.stopping:
                 return
-            yield f"data: {json.dumps(cur.to_dict())}\n\n"
-            if cur.state.value in ("ready", "error"):
+            snapshot = cur.to_dict()
+            if request.app.state.services.stopping:
+                return
+            yield f"data: {json.dumps(snapshot)}\n\n"
+            if snapshot["state"] in ("ready", "error"):
                 return
             # Poll for disconnect every _SSE_DISCONNECT_POLL_SECONDS but
             # only emit a keep-alive comment every sse_keepalive_seconds, so
@@ -253,10 +258,6 @@ async def events(job_id: str, request: Request) -> Response:
                 # Observe the lifecycle independently so it still closes on
                 # shutdown, even if no queue notification can reach it.
                 if request.app.state.services.stopping:
-                    terminal = {
-                        "job_id": job_id, "state": "error", "error": "server shutting down",
-                    }
-                    yield f"data: {json.dumps(terminal)}\n\n"
                     return
                 if await request.is_disconnected():
                     return
@@ -265,11 +266,17 @@ async def events(job_id: str, request: Request) -> Response:
                         queue.get(), timeout=_SSE_DISCONNECT_POLL_SECONDS
                     )
                 except asyncio.TimeoutError:
+                    if request.app.state.services.stopping:
+                        return
                     idle_polls += 1
                     if idle_polls >= polls_per_keepalive:
                         idle_polls = 0
                         yield ":\n\n"  # keep-alive comment; ignored by EventSource
                     continue
+                # Shutdown can begin while queue.get() is suspended, including
+                # after a terminal error/ready snapshot was already queued.
+                if request.app.state.services.stopping:
+                    return
                 idle_polls = 0
                 yield f"data: {json.dumps(update)}\n\n"
                 if update.get("state") in ("ready", "error"):

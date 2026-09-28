@@ -200,37 +200,13 @@ class JobRegistry:
         per-key abandon marks can be reset by a replacement submission; this
         registry-wide flag is permanent and is checked by every abort hook.
         """
-        pending: list[tuple[asyncio.Queue, dict]] = []
         with self._lock:
-            if self._closed:
-                return
             self._closed = True
-            for key, subscribers in self._subscribers.items():
-                status = self._jobs.get(key)
-                if status is None:
-                    # Partial disk caches can be subscribed to without an
-                    # in-memory execution. Cache clear can also remove a
-                    # status during the subscription handshake. Every live
-                    # queue still needs a terminal event before HTTP drain.
-                    status = JobStatus(job_id=key, state=JobState.ERROR)
-                snapshot = status.to_dict()
-                snapshot.update(
-                    state=JobState.ERROR.value,
-                    phase=JobState.ERROR.value,
-                    phase_label=_PHASE_LABELS[JobState.ERROR.value],
-                    error="server shutting down",
-                    updated_at=time.time(),
-                )
-                pending.extend((queue, snapshot) for queue in subscribers)
-            loop = self._loop
-        # Close active event streams before the HTTP server drains requests.
-        # Keep their queues and the loop attached until actual workers exit.
-        if loop is not None and not loop.is_closed():
-            for queue, snapshot in pending:
-                try:
-                    loop.call_soon_threadsafe(queue.put_nowait, snapshot)
-                except RuntimeError:
-                    break
+
+    @property
+    def has_active_workers(self) -> bool:
+        with self._lock:
+            return any(worker.is_alive() for worker in self._worker_threads)
 
     def shutdown(self) -> None:
         """Signal and join all ordinary work, then detach the event loop.
@@ -238,8 +214,8 @@ class JobRegistry:
         Call outside the event-loop thread so worker status callbacks can
         still run while the pipeline unwinds. This deliberately has no join
         timeout: a normal shutdown must not release resources while a worker
-        is still using them. Hard termination of stuck native work requires a
-        supervised process and is outside this in-process registry's contract.
+        is still using them. The CLI bounds the total drain at the process
+        boundary; this method never pretends a timed-out join stopped a worker.
         A closed registry cannot be restarted; create a new one per lifespan.
         """
         self.begin_shutdown()
@@ -566,7 +542,10 @@ class JobRegistry:
                     key,
                 )
             except Exception as exc:
-                log.exception("Job %s failed", key)
+                # A download/decoder may translate cancellation into an ordinary
+                # exception. _update makes shutdown and failure publication
+                # mutually exclusive under the registry lock.
+                log.exception("Job %s stopped with an exception", key)
                 self._enter_phase(
                     key,
                     JobState.ERROR,
@@ -792,6 +771,8 @@ class JobRegistry:
         snapshot: dict | None = None
         subs: list[asyncio.Queue] = []
         with self._lock:
+            if self._closed:
+                return
             status = self._jobs.get(key)
             if status is None:
                 return
