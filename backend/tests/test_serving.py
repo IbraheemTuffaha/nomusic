@@ -235,3 +235,220 @@ def test_failed_startup_exits_nonzero(tmp_path):
         assert proc.wait(timeout=10) == 3
         assert _events(tmp_path) == []
         assert _pid(base) is None
+
+
+# Real application lifespan/registry; only expensive model/network work is
+# replaced with file barriers so interrupt timing is deterministic offline.
+_WORK_APP = '''\
+import os
+import time
+from dataclasses import replace
+from pathlib import Path
+from nomusic import server
+
+ROOT = Path(__file__).parent
+MODE = os.environ.get("FIXTURE_WORK", "none")
+
+def record(event):
+    with (ROOT / "work-events").open("a") as out:
+        out.write(event + "\\n")
+
+def wait_for_release(name):
+    record(name + "-start")
+    while not (ROOT / ("release-" + name)).exists():
+        time.sleep(0.01)
+    record(name + "-end")
+
+class Engine:
+    def warmup(self):
+        if MODE == "warmup":
+            wait_for_release("warmup")
+        elif MODE == "warmup-executor":
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(1) as pool:
+                pool.submit(wait_for_release, "warmup").result()
+
+server.SETTINGS = replace(server.SETTINGS, cache_dir=ROOT / "cache",
+                          cache_ttl_days=0, memory_gc_interval_seconds=0)
+server.get_engine = lambda _: Engine()
+app = server.create_app()
+
+@app.get("/pid")
+def pid():
+    return {"pid": os.getpid()}
+
+@app.post("/job")
+def job():
+    registry = app.state.registry
+    def run(*args, hooks, **kwargs):
+        (app.state.cache.scratch.path / "chunk.part").write_bytes(b"unfinished")
+        wait_for_release("job")
+        hooks.abort_check()
+    registry.processor.run = run
+    registry.submit("https://example.test/interrupt", model="fixture", keep_stems=["vocals"])
+    return {"accepted": True}
+
+@app.get("/export")
+def export():
+    (app.state.cache.scratch.path / "export.part").write_bytes(b"unfinished")
+    wait_for_release("export")
+    return {"complete": True}
+'''
+
+
+@contextmanager
+def _work_server(root, *, mode="none", grace=30):
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sys.modules[__name__], "_APP", _WORK_APP)
+        patch.setenv("FIXTURE_WORK", mode)
+        patch.setenv("NOMUSIC_SHUTDOWN_GRACE_SECONDS", str(grace))
+        with _running_server(root) as running:
+            yield running
+
+
+def _work_started(root, kind):
+    path = root / "work-events"
+    return path.exists() and f"{kind}-start" in path.read_text()
+
+
+@pytest.mark.parametrize("mode", ["warmup", "warmup-executor"])
+def test_first_interrupt_does_not_wait_for_model_download(tmp_path, mode):
+    with _work_server(tmp_path, mode=mode) as (proc, base):
+        assert _wait_for(lambda: _pid(base)) == proc.pid
+        _wait_for(lambda: _work_started(tmp_path, "warmup"))
+        started = time.monotonic()
+        proc.send_signal(signal.SIGINT)
+        assert proc.wait(timeout=3) == 0
+        assert time.monotonic() - started < 2
+    text = (tmp_path / "server.log").read_text()
+    assert "Model preload alone will not be awaited" in text
+    assert "Service shutdown complete" in text
+    assert "Forced shutdown" not in text
+    assert "warmup-end" not in (tmp_path / "work-events").read_text()
+    # A subsequent first start is independent of the abandoned daemon preload.
+    with _work_server(tmp_path) as (proc, base):
+        assert _wait_for(lambda: _pid(base)) == proc.pid
+        proc.send_signal(signal.SIGINT)
+        assert proc.wait(timeout=3) == 0
+
+
+def test_first_interrupt_drains_active_chunk_before_clean_exit(tmp_path):
+    with _work_server(tmp_path, grace=3) as (proc, base):
+        assert _wait_for(lambda: _pid(base)) == proc.pid
+        assert httpx.post(f"{base}/job").status_code == 200
+        _wait_for(lambda: _work_started(tmp_path, "job"))
+        proc.send_signal(signal.SIGINT)
+        time.sleep(0.2)
+        assert proc.poll() is None
+        (tmp_path / "release-job").touch()
+        assert proc.wait(timeout=3) == 0
+    text = (tmp_path / "server.log").read_text()
+    assert "up to 3s" in text and "press Ctrl+C again" in text
+    assert "Service shutdown complete" in text and "Forced shutdown" not in text
+    assert "job-end" in (tmp_path / "work-events").read_text()
+
+
+@pytest.mark.parametrize("kind", ["job", "export"])
+@pytest.mark.parametrize("second_interrupt", [False, True])
+def test_stuck_work_has_total_deadline_and_immediate_second_interrupt(
+    tmp_path, kind, second_interrupt,
+):
+    from nomusic.pipeline.cache import JobCache
+    grace = 30 if second_interrupt else 0.5
+    completed = tmp_path / "cache" / "completed" / "chunk_000.opus"
+    completed.parent.mkdir(parents=True)
+    completed.write_bytes(b"already complete")
+    with _work_server(tmp_path, grace=grace) as (proc, base):
+        assert _wait_for(lambda: _pid(base)) == proc.pid
+        with ThreadPoolExecutor(1) as pool:
+            response = None
+            if kind == "job":
+                assert httpx.post(f"{base}/job").status_code == 200
+            else:
+                response = pool.submit(httpx.get, f"{base}/export", timeout=4)
+            _wait_for(lambda: _work_started(tmp_path, kind))
+            started = time.monotonic()
+            proc.send_signal(signal.SIGINT)
+            if second_interrupt:
+                time.sleep(0.1)
+                assert proc.poll() is None
+                started = time.monotonic()
+                proc.send_signal(signal.SIGINT)
+            assert proc.wait(timeout=3) == (130 if second_interrupt else 124)
+            elapsed = time.monotonic() - started
+            assert elapsed < 1 if second_interrupt else 0.45 <= elapsed < 2
+            if response is not None:
+                with pytest.raises(httpx.HTTPError):
+                    response.result(timeout=5)
+    text = (tmp_path / "server.log").read_text()
+    assert "Forced shutdown" in text
+    assert "Service shutdown complete" not in text
+    leftovers = list((tmp_path / "cache" / ".scratch").glob(f"*/{kind if kind == 'export' else 'chunk'}.part"))
+    assert len(leftovers) == 1
+    cache = JobCache(tmp_path / "cache")
+    try:
+        assert not leftovers[0].exists()
+        assert completed.read_bytes() == b"already complete"
+    finally:
+        cache.close()
+
+
+def test_first_signal_silences_streams_before_uvicorn_reaches_shutdown():
+    from nomusic.config import SETTINGS
+    from nomusic.services import Services
+    services = Services(SETTINGS, lambda _: None)
+    app = SimpleNamespace(state=SimpleNamespace(services=services))
+    server = LifecycleServer(uvicorn.Config(app))
+    server._application = app
+    assert not services.stopping
+    server.handle_exit(signal.SIGINT, None)
+    assert services.stopping
+    assert not services._stop.is_set()  # full, lock-taking shutdown has not run
+    assert server.should_exit
+
+
+def test_shortening_idle_drain_never_extends_original_deadline(monkeypatch):
+    import nomusic.serving as serving
+    now = [10.0]
+    timers = []
+    class Timer:
+        def __init__(self, seconds, callback):
+            self.seconds = seconds
+            self.cancelled = False
+            timers.append(self)
+        def start(self):
+            pass
+        def cancel(self):
+            self.cancelled = True
+    monkeypatch.setattr(serving.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(serving.threading, "Timer", Timer)
+    server = LifecycleServer(uvicorn.Config(object()))
+    server._running = True
+    server.grace_seconds = 0.5
+    server._start_watchdog()
+    now[0] = 10.2
+    server._start_watchdog(0.5)
+    assert server._shutdown_deadline == 10.5
+    assert len(timers) == 1 and not timers[0].cancelled
+    server._start_watchdog(0.1)
+    assert server._shutdown_deadline == pytest.approx(10.3)
+    assert len(timers) == 2 and timers[0].cancelled
+
+
+def test_closed_stderr_cannot_prevent_interrupt_or_forced_exit(monkeypatch):
+    import nomusic.serving as serving
+    def closed(*args):
+        raise BrokenPipeError("closed test pipe")
+    def exited(code):
+        raise SystemExit(code)
+    monkeypatch.setattr(serving.os, "write", closed)
+    monkeypatch.setattr(serving.os, "_exit", exited)
+    server = LifecycleServer(uvicorn.Config(object()))
+    server.handle_exit(signal.SIGINT, None)
+    assert server.should_exit
+    with pytest.raises(SystemExit) as second:
+        server.handle_exit(signal.SIGINT, None)
+    assert second.value.code == 130
+    with pytest.raises(SystemExit) as deadline:
+        server._force_exit()
+    assert deadline.value.code == 124

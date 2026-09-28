@@ -1,9 +1,9 @@
 """One lifespan's services and background work.
 
-Construction is inert. Startup owns every thread it creates; shutdown first
-signals cooperative work, then joins it before releasing services. Native
-inference and downloads can delay a graceful stop; this is not hard worker
-termination or a service-readiness check.
+Construction is inert. Shutdown signals cooperative work and joins it before
+releasing services. The CLI may discard daemon model preload at process exit;
+its adapter bounds the total drain and provides an emergency process exit.
+Embedded lifespans still own all their threads through normal cleanup.
 """
 
 from __future__ import annotations
@@ -30,7 +30,12 @@ class Services:
         self.cache: JobCache | None = None
         self.registry: JobRegistry | None = None
         self._stop = threading.Event()
+        self.shutdown_requested = False
         self._threads: list[threading.Thread] = []
+        # The CLI owns process termination, so a daemon model preload need not
+        # delay an otherwise drained server. Embedded lifespans still join it.
+        self.wait_for_warmup = True
+        self.discarded_preload: threading.Thread | None = None
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """Called once inside lifespan, with shutdown guaranteed even on failure."""
@@ -94,11 +99,11 @@ class Services:
             log.info("Memory GC dropped %d stale in-memory job(s)", dropped)
 
     def _warmup(self) -> None:
-        if self._stop.is_set():
+        engine = self.engine
+        if self._stop.is_set() or engine is None:
             return
-        assert self.engine is not None
         try:
-            self.engine.warmup()
+            engine.warmup()
             log.info("Engine warmup complete")
         except Exception:
             # Preserve lazy retry on first processing request. Readiness and
@@ -107,10 +112,11 @@ class Services:
 
     @property
     def stopping(self) -> bool:
-        return self._stop.is_set()
+        return self.shutdown_requested or self._stop.is_set()
 
     def begin_shutdown(self) -> None:
         """Stop admission/maintenance and close status streams before HTTP drain."""
+        self.shutdown_requested = True
         self._stop.set()
         if self.registry is not None:
             self.registry.begin_shutdown()
@@ -121,6 +127,10 @@ class Services:
         if self.registry is not None:
             self.registry.shutdown()
         for thread in self._threads:
+            if thread.name == "nomusic-engine-warmup" and not self.wait_for_warmup:
+                if thread.is_alive():
+                    self.discarded_preload = thread
+                continue
             thread.join()
         self._threads.clear()
         if self.cache is not None:
