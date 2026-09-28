@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nomusic"
+version = "0.2.0"
+description = "Local source separation backend for the nomusic browser extension"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.141.1",
+  "uvicorn[standard]==0.54.0",
+  "pydantic==2.13.5",
+  # allow_private_network requires Starlette >=0.51.0.
+  "starlette==1.7.0",
+  "yt-dlp[default]==2026.8.19",
+  "yt-dlp-ejs==0.8.0",
+  "soundfile==0.14.0",
+  "numpy==2.2.6",
+  "torch==2.14.0",
+  # Demucs 4.1 inference no longer needs torchaudio or training dependencies.
+  "demucs==4.1.0",
+  "huggingface-hub==2.0.0",
+  "safetensors==0.8.0",
+  "PyYAML==6.0.3",
+]
+
+[project.scripts]
+nomusic = "nomusic.__main__:main"
+nomusic-process = "nomusic.cli:main"
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "httpx==0.28.1"]
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+include = ["nomusic*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+
+[tool.uv]
+required-version = ">=0.12.19"
+environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+required-environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

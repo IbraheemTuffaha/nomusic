@@ -32,8 +32,8 @@ from typing import Any, Callable, Optional
 import numpy as np
 import soundfile as sf
 
-from config import SETTINGS
-from engines.base import Engine
+from nomusic.config import SETTINGS
+from nomusic.engines.base import Engine
 
 from .cache import CacheMeta, JobCache
 from .downloader import (

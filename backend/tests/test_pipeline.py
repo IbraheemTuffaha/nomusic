@@ -17,14 +17,14 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from engines.base import Engine, EngineCapabilities, SeparationResult
-from pipeline.cache import JobCache
-from pipeline.export import (
+from nomusic.engines.base import Engine, EngineCapabilities, SeparationResult
+from nomusic.pipeline.cache import JobCache
+from nomusic.pipeline.export import (
     mp3_transcode_cmd,
     mux_video_cmd,
     snapshot_chunk_files,
 )
-from pipeline.processor import Processor, RunHooks, plan_chunks
+from nomusic.pipeline.processor import Processor, RunHooks, plan_chunks
 
 
 def test_plan_chunks_covers_full_duration():
@@ -163,7 +163,7 @@ def _fake_fetcher_class(source_tone: Path, duration: float = 10.0):
     """A stand-in for downloader.SourceFetcher: extract() returns fixed
     metadata; download() drops the pre-written tone into out_dir. Patch it onto
     ``processor.SourceFetcher`` to exercise the first-run path without yt-dlp."""
-    from pipeline.downloader import VideoMetadata
+    from nomusic.pipeline.downloader import VideoMetadata
 
     class _FakeFetcher:
         def __init__(self, url, out_dir):
@@ -196,7 +196,7 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     source = tmp_path / "source.wav"
     _write_tone(source, seconds=10.0)
 
-    from pipeline import processor as proc
+    from nomusic.pipeline import processor as proc
 
     def fake_slice_source(src, out_path, *, start, end):
         audio, sr = sf.read(str(src), always_2d=True, dtype="float32")
@@ -246,7 +246,7 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     # accumulates offset and audio falls out of sync with the video.
     # Opus encoding may add a few extra samples of priming at the boundary;
     # tolerance is loose enough to absorb that without hiding real drift.
-    from pipeline.processor import plan_chunks
+    from nomusic.pipeline.processor import plan_chunks
 
     plans = plan_chunks(
         duration=meta.duration_seconds,
@@ -275,7 +275,7 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     # [1, gpu_batch] — a regression that passed the whole queue in one call, or
     # broke the per-call list, would land outside that bound. The batch count
     # must also account for every chunk exactly once.
-    from config import SETTINGS
+    from nomusic.config import SETTINGS
 
     cap = max(1, SETTINGS.gpu_batch)
     assert engine.batch_sizes, "infer_batch was never called"
@@ -295,7 +295,7 @@ def test_processor_progressive_produces_correct_chunks(tmp_path, monkeypatch):
     source = tmp_path / "source.wav"
     _write_tone(source, seconds=10.0)
 
-    from pipeline import processor as proc
+    from nomusic.pipeline import processor as proc
 
     def fake_slice_source(src, out_path, *, start, end):
         audio, sr = sf.read(str(src), always_2d=True, dtype="float32")
@@ -329,7 +329,7 @@ def test_progressive_source_cancel_unblocks_source_for(tmp_path):
     # An abort must release a source_for() that's blocked waiting for bytes, so
     # an abandoned/failed run doesn't keep the GPU lock until the download lands
     # (and the orphaned yt-dlp keeps going). cancel() makes the wait raise.
-    from pipeline.processor import (
+    from nomusic.pipeline.processor import (
         ChunkPlan,
         _DownloadCancelled,
         _ProgressiveSource,
@@ -352,8 +352,8 @@ def test_source_fetcher_download_propagates_cancel_without_retry(tmp_path, monke
     # retry-clean handler and start a fresh download of the very thing we're
     # cancelling (which is what produced the stray re-download + traceback on a
     # page-close mid-download).
-    from pipeline import downloader
-    from pipeline.downloader import DownloadCancelled, SourceFetcher
+    from nomusic.pipeline import downloader
+    from nomusic.pipeline.downloader import DownloadCancelled, SourceFetcher
 
     class _FakeYDL:
         def add_progress_hook(self, hook):
@@ -384,8 +384,8 @@ def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
     # A prior run already probed this job and processed some chunks; a resume
     # (after idle-abandon or a page refresh) must NOT pay the yt-dlp probe
     # again, and must preserve the already-completed chunks.
-    from pipeline import processor as proc
-    from pipeline.cache import CacheMeta
+    from nomusic.pipeline import processor as proc
+    from nomusic.pipeline.cache import CacheMeta
 
     class _BoomFetcher:
         def __init__(self, *a, **k):
@@ -471,7 +471,7 @@ def _ffprobe_duration(path: Path) -> float:
 
 
 def test_video_format_honours_height_cap():
-    from pipeline.downloader import _video_format
+    from nomusic.pipeline.downloader import _video_format
 
     capped = _video_format(720)
     assert capped == "bestvideo[height<=720]/bestvideo/best"
@@ -663,7 +663,7 @@ def test_mux_video_reencodes_vp9_to_h264(tmp_path):
 def test_abandon_all_signals_workers_and_clears_state():
     # /cache/clear must tell live workers to stop (so they unwind cleanly
     # instead of writing into deleted dirs) and wipe the in-memory maps.
-    from jobs import JobRegistry, JobState, JobStatus
+    from nomusic.jobs import JobRegistry, JobState, JobStatus
 
     registry = JobRegistry(processor=None, cache=None)
     registry._jobs["k1"] = JobStatus(job_id="k1", state=JobState.PROCESSING)
@@ -684,7 +684,7 @@ def test_abandon_all_pushes_terminal_event_to_open_streams():
     # client's EventSource closes instead of hanging on keep-alives forever.
     import asyncio
 
-    from jobs import JobRegistry, JobState, JobStatus
+    from nomusic.jobs import JobRegistry, JobState, JobStatus
 
     registry = JobRegistry(processor=None, cache=None)
     loop = asyncio.new_event_loop()
@@ -717,7 +717,7 @@ def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):
     # The C7 race: a /process landing during a job's abandon-unwind must NOT
     # hand back the dying job (which would leave it stuck with no worker); it
     # must spawn a fresh worker instead.
-    from jobs import JobRegistry, JobState, JobStatus
+    from nomusic.jobs import JobRegistry, JobState, JobStatus
 
     class _StubCache:
         def key(self, *a, **k):
@@ -759,7 +759,7 @@ def test_infer_batch_matches_single_mlx(tmp_path):
     if not (torch.backends.mps.is_available() or torch.cuda.is_available()):
         pytest.skip("no GPU (MPS/CUDA) available")
 
-    from engines.mlx_engine import MLXEngine
+    from nomusic.engines.mlx_engine import MLXEngine
 
     def _tone(name: str, freq: float, seconds: float) -> Path:
         t = np.arange(int(seconds * 44100)) / 44100
@@ -826,14 +826,14 @@ _MODERN_ARCHS = ["sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"]
 
 
 def test_cuda_usable_rejects_too_old_gpu():
-    from engines.mlx_engine import _cuda_is_usable
+    from nomusic.engines.mlx_engine import _cuda_is_usable
 
     # GTX 1050 Ti is sm_61; the modern wheel ships nothing it can run.
     assert _cuda_is_usable(_fake_torch((6, 1), _MODERN_ARCHS)) is False
 
 
 def test_cuda_usable_accepts_exact_and_minor_compatible():
-    from engines.mlx_engine import _cuda_is_usable
+    from nomusic.engines.mlx_engine import _cuda_is_usable
 
     # Exact real-arch match (RTX 2080, sm_75).
     assert _cuda_is_usable(_fake_torch((7, 5), _MODERN_ARCHS)) is True
@@ -844,7 +844,7 @@ def test_cuda_usable_accepts_exact_and_minor_compatible():
 
 
 def test_cuda_usable_accepts_forward_ptx_jit():
-    from engines.mlx_engine import _cuda_is_usable
+    from nomusic.engines.mlx_engine import _cuda_is_usable
 
     # A PTX (compute_) arch JIT-compiles forward to any newer device.
     assert _cuda_is_usable(_fake_torch((9, 0), ["compute_80"])) is True
@@ -853,7 +853,7 @@ def test_cuda_usable_accepts_forward_ptx_jit():
 
 
 def test_cuda_usable_handles_arch_specific_suffixes():
-    from engines.mlx_engine import _cuda_is_usable
+    from nomusic.engines.mlx_engine import _cuda_is_usable
 
     # CUDA 12.x/13.x wheels emit suffixed entries (sm_90a, sm_120a, compute_90a).
     # These must not be silently dropped, or a usable Hopper/Blackwell GPU gets
@@ -864,7 +864,7 @@ def test_cuda_usable_handles_arch_specific_suffixes():
 
 
 def test_cuda_usable_defaults_true_when_undetectable():
-    from engines.mlx_engine import _cuda_is_usable
+    from nomusic.engines.mlx_engine import _cuda_is_usable
     from types import SimpleNamespace
 
     def _boom():

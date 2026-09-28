@@ -22,9 +22,9 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Callable, Optional
 
-from config import SETTINGS
-from pipeline.cache import CacheMeta, JobCache
-from pipeline.processor import Processor, RunHooks
+from nomusic.config import SETTINGS
+from nomusic.pipeline.cache import CacheMeta, JobCache
+from nomusic.pipeline.processor import Processor, RunHooks
 
 log = logging.getLogger(__name__)
 

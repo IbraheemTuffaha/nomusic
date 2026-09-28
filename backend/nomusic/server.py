@@ -34,20 +34,17 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import SETTINGS
-from engines import get_engine
-from jobs import JobRegistry
-from pipeline.cache import JobCache
-from pipeline.processor import Processor
-from routes.jobs import router as jobs_router
-from routes.media import router as media_router
-from routes.system import router as system_router
+from nomusic.config import SETTINGS
+from nomusic.engines import get_engine
+from nomusic.jobs import JobRegistry
+from nomusic.pipeline.cache import JobCache
+from nomusic.pipeline.processor import Processor
+from nomusic.routes.jobs import router as jobs_router
+from nomusic.routes.media import router as media_router
+from nomusic.routes.system import router as system_router
 
-# Directory holding the flat backend modules; needed by the uvicorn reloader
-# (see main()), which re-imports "server" in a watcher subprocess and so needs
-# the dir on PYTHONPATH. Running ``python backend/server.py`` puts this dir on
-# sys.path automatically (Python prepends the executed script's directory), so
-# the sibling ``from config import …`` imports above resolve.
+# Directory watched by the optional development reloader. All entry points use
+# the same package import so there is only one server module identity.
 _BACKEND_DIR = Path(__file__).resolve().parent
 
 log = logging.getLogger("nomusic.server")
@@ -274,15 +271,8 @@ def main() -> None:
         " · auto-reload" if reload else "",
     )
     if reload:
-        # uvicorn's reloader needs an import string (not the app object) so its
-        # watcher subprocess can re-import on change. Put the backend dir on
-        # PYTHONPATH so that subprocess resolves "server" no matter which cwd
-        # the script was launched from (the README runs it from the repo root).
-        os.environ["PYTHONPATH"] = (
-            str(_BACKEND_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
-        )
         uvicorn.run(
-            "server:app",
+            "nomusic.server:app",
             host=SETTINGS.host,
             port=SETTINGS.port,
             reload=True,

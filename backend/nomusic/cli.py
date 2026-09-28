@@ -1,8 +1,7 @@
 """Command-line driver for local testing.
 
-Run from the ``backend/`` directory so the flat sibling modules import — ``-m``
-puts the current directory on sys.path:
-    .venv/bin/python -m tools.cli <url> [--model M] [--stems vocals,other]
+Run from any directory after installation:
+    nomusic process <url> [--model M] [--stems vocals,other]
 
 Runs the full pipeline (download -> separate -> chunk -> cache) without touching
 the HTTP server. Useful for benchmarking and debugging.
@@ -14,10 +13,10 @@ import argparse
 import logging
 import time
 
-from config import SETTINGS
-from engines import get_engine
-from pipeline.cache import JobCache
-from pipeline.processor import Processor, RunHooks
+from nomusic.config import SETTINGS
+from nomusic.engines import get_engine
+from nomusic.pipeline.cache import JobCache
+from nomusic.pipeline.processor import Processor, RunHooks
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,8 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     logging.basicConfig(
         level=logging.INFO,

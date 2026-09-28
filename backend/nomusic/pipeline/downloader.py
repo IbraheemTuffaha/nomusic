@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+from nomusic.runtime import javascript_runtime
 
 log = logging.getLogger(__name__)
 
@@ -85,33 +86,18 @@ def _emit_finished_progress(progress_hook: ProgressHook | None, size_bytes: int)
 def _common_opts() -> dict[str, Any]:
     """Options shared by ``probe`` and the source/video download helpers.
 
-    YouTube requires a JavaScript runtime + EJS challenge solver scripts for
-    most videos (without them, extraction fails with the misleading "This
-    video is not available" error). We auto-detect ``node`` / ``deno`` / ``bun``
-    and pin to the first one found; ``NOMUSIC_JS_RUNTIME=/path/to/bin``
-    overrides. If nothing is available we still try the request — many
-    short-form videos work without it.
+    Use the packaged EJS challenge solver with a supported Node/Deno runtime.
+    No solver code is downloaded from a moving remote release at job time.
     """
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        # Pull the EJS challenge-solver scripts that yt-dlp uses to defeat
-        # YouTube's player JS. Hosted by the yt-dlp project.
-        "remote_components": ["ejs:github"],
+        "remote_components": [],
     }
 
-    runtime_override = os.environ.get("NOMUSIC_JS_RUNTIME")
-    if runtime_override:
-        name = Path(runtime_override).name
-        opts["js_runtimes"] = {name: {"path": runtime_override}}
-        return opts
-
-    for name in ("deno", "node", "bun"):
-        path = shutil.which(name)
-        if path:
-            opts["js_runtimes"] = {name: {"path": path}}
-            break
+    runtime = javascript_runtime()
+    opts["js_runtimes"] = {runtime.name: {"path": runtime.path}}
     return opts
 
 
