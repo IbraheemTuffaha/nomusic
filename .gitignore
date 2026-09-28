@@ -19,6 +19,7 @@ dist/
 .ruff_cache/
 
 # Local-only state
+/mds/
 .cache/
 .desloppify/
 scorecard.png
@@ -42,5 +43,6 @@ vendor/
 .claude/
 
 # Extension build artifacts
+node_modules/
 extension/dist/
 extension/*.zip

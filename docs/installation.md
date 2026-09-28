@@ -301,6 +301,10 @@ an installation with only legacy model files needs the safetensors download.
 
 ## Developer workflow and validation
 
+The [verification guide](verification.md) provides one repeatable command for
+the suites and controlled real extension/CPU playback/export check, including
+browser setup, offline model use, local evidence and manual acceptance.
+
 Install development dependencies:
 
 ```sh
