@@ -297,3 +297,107 @@ def test_processor_closes_prepared_session_on_setup_failure(tmp_path, monkeypatc
                       hooks=hooks)
     assert sessions[0].closed == 1
     assert sessions[0].downloaded == []
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_shutdown_discards_prefetched_batches_but_drains_active_batch(
+    tmp_path, monkeypatch, batch_size,
+):
+    """Provider cancellation alone is stale once decode has prefetched a batch."""
+    import asyncio
+    from dataclasses import replace
+    import numpy as np
+
+    from nomusic.engines.base import SeparationResult
+    from nomusic.jobs import JobRegistry
+    from nomusic.routes.jobs import events
+
+    entered, release = threading.Event(), threading.Event()
+    decoded = set()
+    decoded_changed = threading.Condition()
+    inferred = []
+    url = "https://example.test/prefetched-shutdown"
+    cache = JobCache(tmp_path / "cache")
+
+    class Fetcher:
+        def __init__(self, url, out_dir):
+            self.url = url
+        def extract(self):
+            return VideoMetadata("fixture", "Fixture", 60, "fixture", self.url)
+        def download(self, **kwargs):
+            return tmp_path / "source.wav"
+        def close(self):
+            pass
+
+    def decode(source, key, plan, **kwargs):
+        with decoded_changed:
+            decoded.add(plan.index)
+            decoded_changed.notify_all()
+        return proc._ChunkWork(plan, plan.index, 0, 0)
+
+    def infer_batch(prepared):
+        inferred.append(list(prepared))
+        entered.set()
+        assert release.wait(5), "test did not release active inference"
+        return [SeparationResult(
+            stems={"vocals": np.full((441_000, 2), 0.1, dtype=np.float32)},
+            sample_rate=44100, duration_seconds=10,
+        ) for _ in prepared]
+
+    monkeypatch.setattr(proc, "SETTINGS", replace(proc.SETTINGS, gpu_batch=batch_size))
+    monkeypatch.setattr(proc, "SourceFetcher", Fetcher)
+    processor = proc.Processor(
+        engine=SimpleNamespace(infer_batch=infer_batch), cache=cache,
+        chunk_seconds=10, chunk_overlap_seconds=0.5, progressive=False,
+    )
+    monkeypatch.setattr(processor, "_decode_chunk", decode)
+    registry = JobRegistry(processor, cache)
+    services = SimpleNamespace(stopping=False)
+
+    async def is_disconnected():
+        return False
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(registry=registry, services=services)),
+        is_disconnected=is_disconnected,
+    )
+
+    def full_prefetch_ready():
+        with decoded_changed:
+            return decoded_changed.wait_for(
+                lambda: max(inferred[0]) + batch_size in decoded, timeout=5,
+            )
+
+    async def scenario():
+        registry.attach_loop(asyncio.get_running_loop())
+        status = registry.submit(url, model="fixture", keep_stems=["vocals"])
+        assert await asyncio.to_thread(entered.wait, 5)
+        # Make the race deterministic: a complete later batch is already decoded
+        # before cancellation. Rechecking the chunk provider cannot protect it.
+        assert await asyncio.to_thread(full_prefetch_ready)
+        response = await events(status.job_id, request)
+        stream = response.body_iterator
+        assert '"state": "processing"' in await anext(stream)
+        services.stopping = True
+        registry.begin_shutdown()
+        release.set()
+        workers = tuple(registry._worker_threads)
+        await asyncio.gather(*(asyncio.to_thread(t.join, 5) for t in workers))
+        assert all(not t.is_alive() for t in workers)
+        assert len(inferred) == 1  # no native inference for the prefetched batch
+        meta = cache.load_meta(status.job_id)
+        assert meta.chunks_ready == inferred[0]
+        assert not meta.complete
+        for index in inferred[0]:
+            # Real mix/FFmpeg/write drained the active batch atomically.
+            assert cache.chunk_path(status.job_id, index).stat().st_size > 0
+        assert list(cache.scratch.path.iterdir()) == [cache.scratch.path / "lease"]
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        await asyncio.to_thread(registry.shutdown)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        registry.shutdown()
+        cache.close()

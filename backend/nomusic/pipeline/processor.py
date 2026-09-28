@@ -637,6 +637,9 @@ class Processor:
                         dl.available_seconds(),
                         info.duration_seconds,
                     )
+                # Source acquisition may have waited past a stop request.
+                if abort_check:
+                    abort_check()
                 return self._decode_chunk(source_path, key, plan, model=model, dl=dl)
 
         # Batch up to BATCH chunks per GPU call: a single chunk leaves the GPU
@@ -692,6 +695,11 @@ class Processor:
                     m = self.cache.load_meta(key)
                     if m:
                         on_progress(m, "separating")
+                # Prefetched inputs may have passed the provider's abort check
+                # before shutdown began. Recheck at the inference boundary so
+                # draining the current batch never starts another native call.
+                if abort_check:
+                    abort_check()
                 ti = time.perf_counter()
                 results = self.engine.infer_batch([w.prepared for w in batch_works])
                 dt = time.perf_counter() - ti
