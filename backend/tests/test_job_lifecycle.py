@@ -114,9 +114,8 @@ def test_shutdown_keeps_loop_attached_through_worker_callbacks():
             assert await asyncio.to_thread(processor.unwinding.wait, 5)
             stopping = asyncio.create_task(asyncio.to_thread(registry.shutdown))
             try:
-                terminal = await asyncio.wait_for(queue.get(), timeout=5)
-                assert terminal["state"] == "error"
-                assert terminal["error"] == "server shutting down"
+                await asyncio.sleep(0)
+                assert queue.empty()  # planned shutdown sends no fabricated failure
                 assert not stopping.done()
                 assert registry._loop is loop
                 # A final pipeline callback can still safely schedule onto
@@ -124,8 +123,8 @@ def test_shutdown_keeps_loop_attached_through_worker_callbacks():
                 await asyncio.to_thread(
                     registry._update, status.job_id, title="cleanup callback"
                 )
-                final_callback = await asyncio.wait_for(queue.get(), timeout=5)
-                assert final_callback["title"] == "cleanup callback"
+                await asyncio.sleep(0)
+                assert queue.empty()  # late callbacks cannot publish after stop
                 with pytest.raises(RegistryClosed):
                     registry.subscribe(status.job_id)
             finally:
@@ -176,10 +175,7 @@ def test_shutdown_closes_subscriptions_without_an_in_memory_job():
         registry.begin_shutdown()
         registry.begin_shutdown()  # terminal notification stays idempotent
         try:
-            terminal = await asyncio.wait_for(queue.get(), timeout=5)
-            assert terminal["job_id"] == "partial-disk-cache"
-            assert terminal["state"] == "error"
-            assert terminal["error"] == "server shutting down"
+            await asyncio.sleep(0)
             assert queue.empty()
         finally:
             await asyncio.to_thread(registry.shutdown)

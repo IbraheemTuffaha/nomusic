@@ -193,8 +193,7 @@ def test_orphaned_status_stream_observes_service_shutdown(monkeypatch, settings)
             # queue, but shutdown can no longer notify it through the mapping.
             registry._subscribers.clear()
             app.state.services.begin_shutdown()
-            assert "server shutting down" in await asyncio.wait_for(anext(stream), 2)
             with pytest.raises(StopAsyncIteration):
-                await anext(stream)
+                await asyncio.wait_for(anext(stream), 2)
 
     asyncio.run(scenario())
