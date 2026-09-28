@@ -362,7 +362,14 @@ try {
   await isolated("__nomusicSmoke.restore()");
   note("toggle-off-restores-source-and-closes-audio");
   assert.ok(report.network.some((item) => item.path.startsWith("/chunk/") && item.status === 200));
-  assert.deepEqual(report.network.filter((item) => item.status >= 400 || item.failed), [], "Backend browser requests succeed");
+  const eventPath = `/events/${job.job_id}`;
+  assert.ok(report.network.some((item) => item.path === eventPath && item.status === 200), "Real progress stream opened");
+  // EventSource.close() on ready/pause/disposal can appear as ERR_ABORTED.
+  // The stream opened successfully and this job already reached ready above.
+  // Keep HTTP errors and failures of every other request fatal.
+  const expectedStreamClose = (item) => item.path === eventPath
+    && item.failed?.errorText === "net::ERR_ABORTED";
+  assert.deepEqual(report.network.filter((item) => item.status >= 400 || (item.failed && !expectedStreamClose(item))), [], "Backend browser requests succeed");
   assert.deepEqual(report.pageErrors, [], "No fixture or extension page errors");
   assert.equal(timedOut, false);
   report.passed = true;
