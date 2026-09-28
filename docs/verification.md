@@ -136,13 +136,11 @@ diagnosable; the OS is not a frozen, bit-for-bit build environment. Mac CPU CI
 cannot establish MPS acceleration, a native Chrome session, or installer behavior
 on a user's existing machine. Those remain hardware acceptance checks.
 
-For a PR changing code or a user flow, automated green checks are followed by
-a fresh agent-led manual application session before opening the draft:
-inspect settings and readiness, start processing, observe playback and seeks,
-use the affected controls, and inspect exports and shutdown. Keep output
-muted when testing on a shared or forwarded environment. Record the exact
-candidate revision, actions, evidence and limitations locally. A scripted
-scenario alone does not satisfy this manual gate.
+For changes affecting playback or operation, also check the actual application:
+settings and readiness, fresh processing, pause/seeks, exports and shutdown
+during active work. Record the revision and any limitations. Keep output muted
+on shared or forwarded machines; measure or listen separately when assessing
+separation quality. See the [local-use guide](local-workflow.md).
 
 Live YouTube acquisition and playback remain a separate acceptance check.
 When upstream verification or throttling blocks it, record the blocker and

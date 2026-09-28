@@ -1,110 +1,80 @@
-# First local run
+# Local use and troubleshooting
 
-This checklist uses Chrome and the helper on the same machine, with the
-default `htdemucs` model and vocals stem. Choose a short, public YouTube video
-with a fixed duration. Private, restricted and live videos are outside this
-initial scope. Processing may be slower than playback on a CPU.
+First install and load the extension using the [README](../README.md).
+This guide assumes Chrome and the helper share a machine, using
+`http://127.0.0.1:8723`. Start with a public YouTube video with a fixed duration;
+private, restricted and live videos are outside the initial supported scope.
 
-Keep the default loopback address. This version has no user authentication;
-internet sharing is outside this workflow. See the
-[installation guide](installation.md) for supported platforms and prerequisites.
+## Check readiness
 
-## 1. Install and check the helper
-
-From the project folder, with any existing helper stopped:
-
-```sh
-./install.sh
-backend/.venv/bin/nomusic doctor
-```
-
-Installation fetches the pinned dependencies and default model. Doctor should
-finish successfully, including its short inference check. It uses generated
-audio and cached weights; it does not contact YouTube or play sound. If a
-check fails, follow its remedy before continuing.
-
-## 2. Start and check readiness
-
-In the same Terminal window:
-
-```sh
-backend/.venv/bin/nomusic serve
-```
-
-Leave it running. In a second Terminal window:
+Start `backend/.venv/bin/nomusic serve` in the project folder. In another terminal:
 
 ```sh
 curl --include http://127.0.0.1:8723/readyz
 ```
 
-Expect HTTP **200** and `"state":"ready"`. HTTP **503** with `starting` or
-`warming` means startup is still in progress; wait and check again. If the
-state is `failed`, inspect the helper's log, stop it, fix the reported cause
-and restart. A “Uvicorn running” message alone does not mean the model is ready.
+HTTP **200** with `"state":"ready"` means startup checks and default-model loading
+passed. HTTP **503** with `starting` or `warming` means wait and retry. A `failed`
+state needs its logged cause fixed and the helper restarted. Readiness does not
+check YouTube availability or perform inference on each request. The extension's
+**backend up** label confirms reachability only.
 
-## 3. Connect the extension
+## Playback and settings
 
-1. Open `chrome://extensions`, enable **Developer mode**, and **Load unpacked**
-   from the project's `extension` folder. If already installed, reload the
-   extension after updating its files, then reload the video page.
-2. Open nomusic from Chrome's toolbar. Check the backend URL is
-   `http://127.0.0.1:8723`, the model is **htdemucs**, and only **vocals** is
-   selected. Settings save automatically. The **backend up** label confirms
-   reachability, not model readiness or access to YouTube.
-3. Open the chosen video. Allow the site's **Local network access** permission
-   when Chrome asks. If previously denied, allow it in the site's settings
-   beside the address bar and reload. This is separate from the extension's
-   permissions.
+Click nomusic on the video and wait for processed playback. Try pause/resume and
+a backward/forward seek, allowing processing to catch up. CPU processing may be
+slower than playback. The toolbar popup saves settings automatically:
 
-## 4. Play and save
+| Setting | Default | Effect |
+| --- | --- | --- |
+| Backend URL | `http://127.0.0.1:8723` | Helper used by the extension |
+| Model | `htdemucs` | `htdemucs_ft` uses four fine-tuned models and needs more processing |
+| Keep stems | `vocals` | Retains speech and singing; `other` adds ambience/effects and potentially music; `drums`/`bass` retain those components |
 
-For this check, turn off YouTube autoplay so a short clip stays on the chosen
-page. Click the **nomusic** button on the video and wait for processed playback.
-The player may pause while waiting for a chunk. Try pause/resume, a backward
-seek and a forward seek, allowing processing to catch up each time.
+Toggle nomusic off and on after changing model or stems. A successful process
+does not guarantee perfect music removal; compare speech clarity and residual
+music on your own recordings.
 
-Use the button's download chevron to select **MP3 — audio only**, then try
-**480p** under **Video (MP4)**. Leave the tab open until each download finishes.
-An export requested before processing finishes waits for the rest of the
-track; you can pause playback while it prepares. MP4 preparation may need a
-separate source download. Check that both files finish downloading and have
-the expected duration; actual video resolution depends on the source.
+**Processing failures can restore original audio and resume playback.** Mute
+the site or browser before retrying if avoiding that audio is essential.
 
-Click nomusic again to return to original audio. After changing model or stem
-settings, toggle it off and on to start a new session. Vocals include speech
-and singing; a working pipeline does not guarantee perfect music removal.
+## Exports and cache
 
-**Current failure behavior:** a processing error can restore original audio
-and resume the player. Mute the site or browser before retrying if avoiding
-that audio is essential. Keep browser output muted when testing through a
-shared or forwarded environment; observing audio activity is not a listening
-test.
+The download chevron beside nomusic offers **MP3 — audio only** and **Video
+(MP4)** at several resolutions. You can request either before processing
+finishes; keep the tab open until the download completes. Pausing playback
+does not cancel export preparation. MP4 may require another source download.
+Check saved files have their full expected duration; resolution depends on
+the source and current downloader fallbacks.
 
-## 5. Stop and restart
+Completed work is cached for reuse, with seven-day default retention. Finish
+playback and exports before clearing it: open the popup, click **Clear**, then
+**Confirm**. Model weights and files already saved to Downloads are preserved.
 
-Finish exports, pause the video, and press **Control+C** in the helper's
-Terminal. Wait for **Service shutdown complete**. An active model operation
-or network request can delay shutdown.
+## Stop and restart
 
-Run `backend/.venv/bin/nomusic serve` again, check readiness, and toggle nomusic
-on for the same video. Reopen the popup or reload the page if it still shows
-the helper as offline. Completed work may be reused from disk. Media and model
-caches survive an ordinary restart.
+Pause playback and finish exports, then press **Control+C** in the helper's
+terminal. If work is active, it reports a shutdown wait of up to 60 seconds.
+A second **Control+C** forces immediate exit. Startup model loading by itself
+does not cause a long wait. Completed media/model caches survive shutdown;
+unfinished exports may need to be requested again after a forced exit.
 
-To clear processed media, finish playback and exports, then click **Clear**
-and **Confirm** in the popup. Model weights are kept separately.
+Start the helper again, check readiness, and toggle nomusic off/on for the
+video. Reopen the popup or reload the page if needed. Completed audio can be
+reused; interrupted jobs do not yet have reliable automatic reconnect/recovery.
 
 ## When a check fails
 
 | Observation | Next step |
 | --- | --- |
-| Doctor fails | Follow its runtime, model or storage remedy; repeat doctor before starting the helper. |
-| Readiness stays failed | Check the helper's log, stop it, fix the cause and restart. |
-| Popup works but the video says “backend unreachable” | Check the site's local-network permission and reload the page. |
-| YouTube reports HTTP 429 or human verification | Source acquisition is blocked independently of local readiness. The browser page may still play. Retry later or test the same installation on a network where acquisition is available; record the blocked run as incomplete. |
-| Playback stalls or loses sync | Mute the site or browser, toggle nomusic off/on, and retry. Recovery and long-session reliability still need further work. |
+| Installation or doctor fails | Follow the displayed remedy; see [installation](installation.md). |
+| Readiness remains failed | Inspect the helper log, fix the cause and restart. |
+| Popup works but video says “backend unreachable” | Allow the site's **Local network access** permission in Chrome site settings, then reload. |
+| YouTube returns HTTP 429 or human verification | Acquisition is blocked independently of local readiness, even if browser playback works. Retry later or on a network where downloads are available. |
+| Music remains or effects disappear | Adjust retained stems; results depend on the recording. |
+| Playback stalls or drifts | Mute the site/browser, toggle nomusic off/on, and retry; long-session recovery still has limitations. |
 
-The [verification runner](verification.md) checks the local pipeline with
-generated media when a source website is unavailable. Its success does not
-complete a live YouTube check. Keep local diagnostics and browser profiles
-private; share only reviewed error details when reporting a problem.
+The [verification runner](verification.md) tests generated media independently
+of YouTube. When reporting a problem, include versions, the video URL and reviewed
+error details. Keep raw logs and browser profiles local unless checked for
+private paths, credentials or personal information.
