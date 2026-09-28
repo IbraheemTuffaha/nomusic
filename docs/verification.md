@@ -16,7 +16,7 @@ and `libvpx-vp9` (the last is used by an existing export regression).
 From the repository root:
 
 ```sh
-./install.sh --dev --skip-system-packages
+./install.sh --profile cpu --dev --skip-system-packages
 npm ci --prefix tests/e2e
 tests/e2e/node_modules/.bin/playwright install --with-deps chromium
 backend/.venv/bin/python scripts/verify.py
@@ -37,8 +37,13 @@ settings before retrying.
 
 The check requires a non-editable installation whose Python source matches
 the checkout. Re-run the installer after backend edits; a stale installation
-fails early instead of testing older code. Tests, browser helpers and the
-extension are read directly from the checkout.
+fails early instead of testing older code. Pytest runs with `--import-mode=importlib`
+and checks loaded `nomusic` modules inside the test process against that installed
+directory, including modules imported during test execution. A checkout that
+shadows the installation fails verification. The installed path is recorded in
+`summary.json`; tests, browser helpers and the extension come from the checkout.
+Ordinary pytest runs outside this verification command may use an editable
+development installation.
 
 ## Commands and evidence
 
@@ -102,22 +107,30 @@ world. It preserves the existing audio connections and scheduling methods.
 This measures signal before Chromium's output mute; it is **not listening
 validation**. Generated media cannot establish speech intelligibility,
 separation quality, sustained performance, long-session memory behavior,
-upstream YouTube acquisition, or Mac/GPU compatibility.
+upstream YouTube acquisition, or Mac/GPU compatibility. The test page is served
+from loopback; it does not exercise a public website requesting Chrome local-network
+permission. Permission denial and recovery remain separate browser acceptance
+work, planned with playback recovery.
 
 ## CI and manual acceptance
 
 CI runs on ordinary pull requests (including stacked PR targets), pushes to
 `main`, and manual dispatch. Actions use commit pins and read-only repository
-permissions. Dependencies install from the committed Python and npm locks;
-model fetching is a separate explicit step. No account cookies, credentials
-or live-source requests are required. CI does not upload browser profiles,
+permissions. Both jobs exercise `install.sh --profile cpu` with the committed
+Python lock, fetch the pinned model explicitly, and run the real
+`nomusic doctor --json` CPU inference check. Linux installs the locked npm browser dependencies
+and runs the complete baseline. The `macos-15` Apple Silicon job runs the backend
+and extension unit suites, without a browser or MPS inference. No account cookies,
+credentials or live-source requests are required. CI does not upload browser profiles,
 traces, logs or generated media as artifacts.
 On failure, it prints bounded tails of the disposable CI step logs so the
 failed check remains diagnosable. Local runs keep their raw logs local.
 
-The Ubuntu runner image and apt FFmpeg packages receive updates. Recorded
-versions plus codec checks make failures diagnosable; the OS is not a frozen,
-bit-for-bit build environment. The baseline validates Linux CPU only.
+The Ubuntu/macOS runner images and apt/Homebrew FFmpeg packages receive updates.
+Recorded versions, architecture assertions and codec checks make failures
+diagnosable; the OS is not a frozen, bit-for-bit build environment. Mac CPU CI
+cannot establish MPS acceleration, a native Chrome session, or installer behavior
+on a user's existing machine. Those remain hardware acceptance checks.
 
 For a PR changing code or a user flow, automated green checks are followed by
 a fresh agent-led manual application session before opening the draft:

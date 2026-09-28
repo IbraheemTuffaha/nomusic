@@ -15,13 +15,28 @@ concurrency:
 
 jobs:
   verify:
-    runs-on: ubuntu-24.04
+    name: CPU (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            architecture: x86_64
+            suite: all
+          - os: macos-15
+            architecture: arm64
+            suite: unit
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
       UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/backend/.venv
       HF_HOME: ${{ github.workspace }}/mds/ci-models
       HF_HUB_CACHE: ${{ github.workspace }}/mds/ci-models/hub
       HF_HUB_DISABLE_TELEMETRY: '1'
+      NOMUSIC_DEVICE: cpu
+      NOMUSIC_CACHE_DIR: ${{ github.workspace }}/mds/ci-media
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -34,17 +49,31 @@ jobs:
         with:
           version: '0.12.19'
           enable-cache: false
-      - name: Install FFmpeg
+      - name: Check runner architecture
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: test "$(uname -m)" = "$EXPECTED_ARCHITECTURE"
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y ffmpeg
-      - name: Install locked application and test dependencies
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install locked CPU application through the user installer
+        run: NOMUSIC_UV="$(command -v uv)" ./install.sh --profile cpu --dev --skip-system-packages --skip-model-download
+      - name: Install browser test dependencies
+        if: matrix.suite == 'all'
         run: |
-          uv sync --locked --no-editable --reinstall-package nomusic --python 3.12.14 --group dev
           npm ci --prefix tests/e2e
           tests/e2e/node_modules/.bin/playwright install --with-deps chromium
       - name: Fetch and verify pinned public model
         run: backend/.venv/bin/nomusic models fetch
-      - name: Verify suites and real extension with CPU inference
-        run: backend/.venv/bin/python scripts/verify.py
+      - name: Check installed diagnostics and real CPU inference
+        env:
+          HF_HUB_OFFLINE: '1'
+        run: backend/.venv/bin/nomusic doctor --json
+      - name: Verify installed suites (and real extension on Linux)
+        run: backend/.venv/bin/python scripts/verify.py --suite ${{ matrix.suite }}
       # Evidence remains local: do not upload profiles, traces, caches or media.
