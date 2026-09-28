@@ -74,7 +74,9 @@ should record their GPU coverage separately.
 Tests use fresh media caches and browser profiles, CPU inference with two
 model threads, bounded waits, and test-owned subprocess groups. Existing
 `NOMUSIC_*` tuning is cleared so it cannot select a private cache or change
-the chunk profile. Port conflicts fail without touching the other process.
+the chunk profile. `PYTEST_*` overrides are also cleared so local test filters
+or plugins cannot silently alter the baseline. Port conflicts fail without
+touching the other process.
 On success, failure or interruption, the runner stops its children. Normal
 backend shutdown must confirm that owned threads drained. A hung process
 can be killed by the harness; that cleanup does not count as a successful
