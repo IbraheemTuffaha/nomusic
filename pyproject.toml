@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools==84.0.0"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build==0.12.19"]
+build-backend = "uv_build"
 
 [project]
 name = "nomusic"
@@ -26,23 +26,28 @@ dependencies = [
   "PyYAML==6.0.3",
 ]
 
+[project.optional-dependencies]
+cpu = ["torch==2.14.0"]
+cu126 = ["torch==2.14.0"]
+
 [project.scripts]
 nomusic = "nomusic.__main__:main"
 nomusic-process = "nomusic.cli:main"
 
 [dependency-groups]
-dev = ["pytest==9.1.1", "httpx==0.28.1"]
+dev = ["pytest==9.1.1", "httpx==0.28.1", "uv_build==0.12.19"]
 
-[tool.setuptools.packages.find]
-where = ["backend"]
-include = ["nomusic*"]
-namespaces = false
+[tool.uv.build-backend]
+module-root = "backend"
+module-name = "nomusic"
 
 [tool.pytest.ini_options]
 testpaths = ["backend/tests"]
+addopts = ["--import-mode=importlib"]
 
 [tool.uv]
 required-version = ">=0.12.19"
+conflicts = [[{ extra = "cpu" }, { extra = "cu126" }]]
 environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
   "sys_platform == 'darwin' and platform_machine == 'arm64'",
@@ -53,9 +58,17 @@ required-environments = [
 ]
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux'" },
+  { index = "pytorch-cu126", extra = "cu126", marker = "sys_platform == 'linux'" },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
