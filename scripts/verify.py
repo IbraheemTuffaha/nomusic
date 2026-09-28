@@ -100,14 +100,14 @@ def preflight() -> dict:
     source = REPO / "backend/nomusic"
     if installed == source or installed != distribution_root:
         raise RuntimeError("Verification requires a non-editable installation. "
-                           "Re-run ./install.sh --dev --skip-system-packages.")
+                           "Re-run ./install.sh --profile cpu --dev --skip-system-packages.")
     source_files = {p.relative_to(source) for p in source.rglob("*.py")}
     installed_files = {p.relative_to(installed) for p in installed.rglob("*.py")}
     if source_files != installed_files or any(
         (source / p).read_bytes() != (installed / p).read_bytes() for p in source_files
     ):
         raise RuntimeError("Installed nomusic differs from this checkout. "
-                           "Re-run ./install.sh --dev --skip-system-packages.")
+                           "Re-run ./install.sh --profile cpu --dev --skip-system-packages.")
     encoders = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"],
                                       text=True, stderr=subprocess.STDOUT, timeout=10)
     available = {fields[1] for line in encoders.splitlines()
@@ -217,6 +217,20 @@ def smoke(run: Path, env: dict[str, str], port: int, timeout: float) -> dict:
             "browser_report": "browser/report.json"}
 
 
+def verification_env(run: Path, scratch: Path) -> dict[str, str]:
+    """Use the reference settings, independent of local pytest selection/plugins."""
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(("NOMUSIC_", "PYTEST_"))
+           and key not in ("PYTHONPATH", "PYTHONHOME")}
+    env.update({"NOMUSIC_DEVICE": "cpu", "NOMUSIC_CACHE_DIR": str(run / "unit-media"),
+                "NOMUSIC_CACHE_TTL_DAYS": "0", "NOMUSIC_CACHE_SWEEP_INTERVAL_SECONDS": "0",
+                "NOMUSIC_MEMORY_GC_INTERVAL_SECONDS": "0", "NOMUSIC_IDLE_TIMEOUT_SECONDS": "0",
+                "HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1",
+                "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "TMPDIR": str(scratch),
+                "PYTHONDONTWRITEBYTECODE": "1"})
+    return env
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=("all", "unit", "smoke"), default="all")
@@ -233,14 +247,7 @@ def main() -> int:
     # Chromium's Unix socket paths have a small length limit. This short,
     # test-owned directory stays within ignored local state and is removed.
     scratch = Path(tempfile.mkdtemp(prefix="v-", dir=REPO / "mds"))
-    env = {key: value for key, value in os.environ.items()
-           if not key.startswith("NOMUSIC_") and key not in ("PYTHONPATH", "PYTHONHOME")}
-    env.update({"NOMUSIC_DEVICE": "cpu", "NOMUSIC_CACHE_DIR": str(run / "unit-media"),
-                "NOMUSIC_CACHE_TTL_DAYS": "0", "NOMUSIC_CACHE_SWEEP_INTERVAL_SECONDS": "0",
-                "NOMUSIC_MEMORY_GC_INTERVAL_SECONDS": "0", "NOMUSIC_IDLE_TIMEOUT_SECONDS": "0",
-                "HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1",
-                "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "TMPDIR": str(scratch),
-                "PYTHONDONTWRITEBYTECODE": "1"})
+    env = verification_env(run, scratch)
     # Preflight uses the same isolated settings as subprocesses.
     os.environ.clear()
     os.environ.update(env)
