@@ -96,8 +96,9 @@ def preflight() -> dict:
     from nomusic.runtime import check_runtime
 
     installed = Path(nomusic.__file__).resolve().parent
+    distribution_root = Path(importlib.metadata.distribution("nomusic").locate_file("nomusic")).resolve()
     source = REPO / "backend/nomusic"
-    if installed == source:
+    if installed == source or installed != distribution_root:
         raise RuntimeError("Verification requires a non-editable installation. "
                            "Re-run ./install.sh --dev --skip-system-packages.")
     source_files = {p.relative_to(source) for p in source.rglob("*.py")}
@@ -116,6 +117,7 @@ def preflight() -> dict:
         raise RuntimeError(f"FFmpeg lacks required test encoders: {', '.join(sorted(missing))}")
     return {
         "python": platform.python_version(), "platform": platform.platform(),
+        "installed_package": str(installed),
         "packages": {name: importlib.metadata.version(name) for name in
                      ("nomusic", "pytest", "torch", "demucs", "numpy", "soundfile")},
         "node": subprocess.check_output(["node", "--version"], text=True, timeout=10).strip(),
@@ -127,6 +129,7 @@ def preflight() -> dict:
 def unit_suites(run: Path, env: dict[str, str], timeout: float) -> dict:
     xml = run / "pytest.xml"
     run_step("backend-tests", [sys.executable, "-m", "pytest", "backend/tests", "-q", "-rs",
+                              "--import-mode=importlib",
                               f"--junitxml={xml}"], run, env, timeout)
     cases = ET.parse(xml).findall(".//testcase")
     skips = []
@@ -249,6 +252,8 @@ def main() -> int:
     announce(f"Local evidence: {run}")
     try:
         report["environment"] = preflight()
+        # Enforce this again inside pytest, whose collection can modify sys.path.
+        env["NOMUSIC_TEST_INSTALLED_ROOT"] = report["environment"]["installed_package"]
         if args.suite in ("all", "unit"):
             report["unit"] = unit_suites(run, env, args.timeout_seconds)
         if args.suite in ("all", "smoke"):
