@@ -24,9 +24,12 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+
+from nomusic.pipeline.scratch import ScratchWorkspace
 
 log = logging.getLogger(__name__)
 
@@ -38,9 +41,9 @@ SCHEMA_VERSION = 3
 CHUNK_EXT = ".opus"
 CHUNK_MEDIA_TYPE = "audio/ogg"
 
-# Top-level dirs under the cache root that hold url-keyed caches, not jobs.
-# The job-dir scans (stats, TTL sweep) skip these and handle them separately.
-_RESERVED_DIRS = frozenset({"sources", "videos"})
+# Top-level directories that are not completed job entries. Source/video caches
+# have separate accounting; private staging is reclaimed only via its leases.
+_RESERVED_DIRS = frozenset({"sources", "videos", ".scratch"})
 
 
 @dataclass
@@ -62,6 +65,10 @@ class JobCache:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
+        self.scratch = ScratchWorkspace(self.root)
+
+    def close(self) -> None:
+        self.scratch.close()
 
     # -- key helpers ---------------------------------------------------------
 
@@ -170,11 +177,12 @@ class JobCache:
         # Atomic write: a crash (or a concurrent reader) must never observe a
         # half-written meta.json — load_meta would treat the truncated file as a
         # cache miss and re-process the whole video. Write to a temp file in the
-        # same dir, then rename (atomic on the same filesystem).
+        # private staging tree, then rename (atomic on the same filesystem).
         meta_path = self.dir_for(key) / "meta.json"
-        tmp_path = meta_path.with_suffix(".json.part")
-        tmp_path.write_text(json.dumps(asdict(meta), indent=2, sort_keys=True))
-        os.replace(tmp_path, meta_path)
+        with tempfile.TemporaryDirectory(dir=self.scratch.path, prefix="meta-") as work:
+            tmp_path = Path(work) / "meta.json.part"
+            tmp_path.write_text(json.dumps(asdict(meta), indent=2, sort_keys=True))
+            os.replace(tmp_path, meta_path)
 
     # -- chunks --------------------------------------------------------------
 
@@ -271,8 +279,11 @@ class JobCache:
         directory itself is preserved so subsequent writes don't need to
         recreate it.
         """
+        self.scratch.reap()
         freed = 0
         for child in list(self.root.iterdir()):
+            if child.name == ".scratch":
+                continue  # active staging is lease-owned, not completed cache
             try:
                 freed += _dir_bytes(child) if child.is_dir() else child.stat().st_size
             except OSError as err:

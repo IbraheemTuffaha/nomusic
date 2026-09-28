@@ -48,7 +48,7 @@ _STREAM_BLOCK_BYTES = 65536
 _FFMPEG_TIMEOUT_SECONDS = 3600.0
 
 
-def _run_ffmpeg(cmd: list[str]) -> None:
+def _run_ffmpeg(cmd: list[str], *, pass_fds: tuple[int, ...] = ()) -> None:
     """Run an ffmpeg command, surfacing its stderr as a 500 on failure.
 
     Mirrors slice_source's error handling: capture stderr so a failure carries
@@ -56,7 +56,7 @@ def _run_ffmpeg(cmd: list[str]) -> None:
     """
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECONDS
+            cmd, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECONDS, pass_fds=pass_fds
         )
     except subprocess.TimeoutExpired as exc:
         log.error("ffmpeg timed out after %.0fs", _FFMPEG_TIMEOUT_SECONDS)
@@ -70,7 +70,9 @@ def _run_ffmpeg(cmd: list[str]) -> None:
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {detail}")
 
 
-def _run_ffmpeg_progress(cmd: list[str], total_seconds: float, on_pct) -> None:
+def _run_ffmpeg_progress(
+    cmd: list[str], total_seconds: float, on_pct, *, pass_fds: tuple[int, ...] = (),
+) -> None:
     """Run ffmpeg, streaming completion fraction to ``on_pct`` as it encodes.
 
     ``cmd`` must start with ``ffmpeg``; we inject ``-progress pipe:1`` so ffmpeg
@@ -85,7 +87,7 @@ def _run_ffmpeg_progress(cmd: list[str], total_seconds: float, on_pct) -> None:
     # reading stdout — a classic pipe deadlock. A file never blocks the writer.
     with tempfile.TemporaryFile() as errf:
         proc = subprocess.Popen(
-            full, stdout=subprocess.PIPE, stderr=errf, text=True
+            full, stdout=subprocess.PIPE, stderr=errf, text=True, pass_fds=pass_fds
         )
         assert proc.stdout is not None
         # Bound the whole run with a watchdog: the stdout loop below blocks until
@@ -234,10 +236,10 @@ def audio(job_id: str, request: Request, format: str = "opus") -> Response:
         # FileResponse and delete the dir once the response is sent. A
         # single up-front transcode (rather than a streaming pipe) keeps
         # this simple and is fine for a local single-user backend.
-        tmp_dir = Path(tempfile.mkdtemp(prefix="nomusic-mp3-"))
+        tmp_dir = Path(tempfile.mkdtemp(prefix="mp3-", dir=cache.scratch.path))
         try:
             out = tmp_dir / "full.mp3"
-            _run_ffmpeg(mp3_transcode_cmd(chunk_files, out))
+            _run_ffmpeg(mp3_transcode_cmd(chunk_files, out), pass_fds=(cache.scratch.fd,))
         except BaseException:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
@@ -333,7 +335,7 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
 
         # --- Phase 2: mux the stripped audio over the video ---
         progress.set(progress_key, "encoding", 0.0)
-        tmp_dir = Path(tempfile.mkdtemp(prefix="nomusic-mp4-"))
+        tmp_dir = Path(tempfile.mkdtemp(prefix="mp4-", dir=cache.scratch.path))
         out = tmp_dir / "full.mp4"
         total_seconds = video_duration(video_path)
 
@@ -346,7 +348,7 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
         try:
             _run_ffmpeg_progress(
                 mux_video_cmd(video_path, chunk_files, out, reencode_video=reencode),
-                total_seconds, _enc_pct,
+                total_seconds, _enc_pct, pass_fds=(cache.scratch.fd,),
             )
         except HTTPException:
             if reencode:
@@ -361,7 +363,7 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
             progress.set(progress_key, "encoding", 0.0)
             _run_ffmpeg_progress(
                 mux_video_cmd(video_path, chunk_files, out, reencode_video=True),
-                total_seconds, _enc_pct,
+                total_seconds, _enc_pct, pass_fds=(cache.scratch.fd,),
             )
     except BaseException:
         progress.clear(progress_key)

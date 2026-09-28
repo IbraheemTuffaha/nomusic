@@ -783,10 +783,11 @@ class Processor:
             # ffmpeg's open.
             if dl is not None and not src.exists():
                 src = dl.wait_complete()
-            with tempfile.TemporaryDirectory(prefix="nomusic-") as tmp_str:
+            with tempfile.TemporaryDirectory(prefix="decode-", dir=self.cache.scratch.path) as tmp_str:
                 raw = Path(tmp_str) / f"raw_{plan.index:03d}.wav"
                 t0 = time.perf_counter()
-                slice_source(src, raw, start=plan.start, end=plan.end)
+                slice_source(src, raw, start=plan.start, end=plan.end,
+                             pass_fds=(self.cache.scratch.fd,))
                 t_slice = time.perf_counter() - t0
                 t1 = time.perf_counter()
                 prepared = self.engine.prepare(raw, model=model)
@@ -952,13 +953,16 @@ class Processor:
             trimmed[-click_fade:] *= tail_ramp
 
         out = self.cache.chunk_path(key, plan.index)
-        tmp_path = out.with_suffix(".part")
-        _encode_opus(trimmed, sample_rate, tmp_path)
-        tmp_path.replace(out)
+        with tempfile.TemporaryDirectory(prefix="chunk-", dir=self.cache.scratch.path) as work:
+            tmp_path = Path(work) / "chunk.part"
+            _encode_opus(trimmed, sample_rate, tmp_path, pass_fds=(self.cache.scratch.fd,))
+            tmp_path.replace(out)
 
 
 
-def _encode_opus(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
+def _encode_opus(
+    audio: np.ndarray, sample_rate: int, out_path: Path, *, pass_fds: tuple[int, ...] = (),
+) -> None:
     """Encode ``audio`` (samples, channels) to OGG/Opus at ``out_path``.
 
     Pipes a WAV through ffmpeg's stdin and writes the resulting OGG/Opus
@@ -998,6 +1002,7 @@ def _encode_opus(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
             input=wav_buf.getvalue(),
             capture_output=True,
             timeout=_OPUS_ENCODE_TIMEOUT_SECONDS,
+            pass_fds=pass_fds,
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
