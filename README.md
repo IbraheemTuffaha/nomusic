@@ -20,7 +20,7 @@ version does not provide user authentication.
 ## What you need
 
 - **Apple Silicon Mac with macOS 14 or newer**, or **Linux x86_64 with glibc
-  2.28 or newer**. Linux uses CPU processing in the standard installation.
+  2.28 or newer**. Linux automatically selects the locked CPU or NVIDIA CUDA profile.
 - **Google Chrome** for the extension. Other Chromium browsers may work but
   need separate testing.
 - An internet connection for installation, model downloads and source videos.
@@ -29,7 +29,7 @@ version does not provide user authentication.
 
 Processing speed depends on the machine and video. CPU processing may be
 slower than playback. See the [installation guide](docs/installation.md) for
-platform details, developer setup and an experimental NVIDIA path.
+platform details, developer setup and explicit CPU/NVIDIA profile selection.
 
 ## Install
 
@@ -143,3 +143,7 @@ compatibility launcher.
 
 See [installation and development](docs/installation.md) for the dependency
 lock, commands, model provenance, test boundaries and upgrade workflow.
+
+## License
+
+MIT

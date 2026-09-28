@@ -10,23 +10,14 @@ outside this installation profile.
 
 | Platform | Installation | Processing device | Validation status |
 | --- | --- | --- | --- |
-| Linux x86_64, glibc 2.28+ | Locked CPU PyTorch wheels; Debian/Ubuntu system-package helper | CPU | Fresh installation, real CPU processing, actual extension playback and MP3/MP4 exports passed |
+| Linux x86_64, glibc 2.28+ | Locked CPU profile; Debian/Ubuntu system-package helper | CPU | Fresh installation, real CPU processing, actual extension playback and MP3/MP4 exports passed |
 | Apple Silicon, macOS 14+ | Same lock, native macOS PyTorch wheel; Homebrew prerequisites | MPS when available, otherwise CPU | Wheels checked and installation path retained; no Mac or GPU execution in the Linux validation environment |
-| Linux NVIDIA | Separate experimental environment described below | CUDA if its wheel and driver support the GPU | Not part of the locked or tested reference profile |
+| Linux NVIDIA | Locked `cu126` profile, selected automatically for a usable NVIDIA driver | CUDA if its wheel and driver support the GPU | Build installation checked separately; actual GPU inference still needs hardware acceptance |
 
 Intel Macs, Linux ARM, Alpine/musl and native Windows are not covered by this
 lock. A wheel being available is not a claim about inference performance.
 CPU throughput, GPU throughput, browser compatibility and audible separation
 quality need their own measurements.
-
-The 2026-09-28 Linux checks used Python 3.12.14, FFmpeg 9.0.1 and Node
-24.19.0. They included an empty dependency cache, a fresh interpreter download,
-an empty model cache, installed-package imports outside the checkout, and
-controlled-media plus live YouTube browser runs. The controlled case replaces
-only source acquisition with a fixture; the live case uses real acquisition.
-The backend suite passed 99 tests with one GPU-only skip, and the extension
-Node suite passed 38 tests. Long-session behavior, subjective listening
-quality, Mac execution and GPU inference are separate checks.
 
 ## Standard installation
 
@@ -51,7 +42,8 @@ The installer:
    isolated bootstrap in `backend/.installer-venv`. It does not upgrade the
    user's global Python packages.
 3. Obtains Python **3.12.14** and installs `uv.lock` into `backend/.venv`
-   using `uv sync --locked --no-editable --reinstall-package nomusic`. It
+   using `uv sync --locked --no-editable --reinstall-package nomusic` with
+   the selected `cpu` or `cu126` extra. It
    rebuilds the application from the current checkout on each run.
    Development dependencies are omitted by default.
 4. Runs `nomusic check-runtime` to verify FFmpeg, ffprobe and the JavaScript
@@ -66,6 +58,7 @@ Successful processing is a separate check.
 
 | Option | Purpose |
 | --- | --- |
+| `--profile auto\|cpu\|cu126` | Choose the locked PyTorch profile; default `auto` probes NVIDIA driver/device information on Linux |
 | `--dev` | Include the locked development dependency group |
 | `--skip-system-packages` | Use prerequisites already installed; do not call apt or Homebrew |
 | `--skip-model-download` | Defer model download; a later fetch or first inference still needs the weights |
@@ -83,9 +76,9 @@ For example, with FFmpeg and a supported JS runtime already available:
 `backend/.venv` in the remaining commands with that path.
 
 The installer accepts `NOMUSIC_PYTHON` only when it equals the exact pinned
-version in `.python-version`. The former `NOMUSIC_TORCH` and `NOMUSIC_CUDA`
-installer overrides are rejected: changing those values would no longer
-install the recorded lock. Use a separate experimental profile when needed.
+version in `.python-version`. The former `NOMUSIC_TORCH` override is rejected because the lock pins torch.
+`NOMUSIC_CUDA=cu126` remains an alias for the locked CUDA profile; other CUDA
+versions are rejected with instructions to select a supported profile.
 
 ## Start, inspect and stop
 
@@ -123,10 +116,13 @@ changing devices.
 NOMUSIC_DEVICE=cpu backend/.venv/bin/nomusic serve
 ```
 
-The Linux reference installation contains a CPU PyTorch build, even on a
-machine with an NVIDIA GPU. Setting `NOMUSIC_DEVICE=cuda` cannot add CUDA
-support to that build. On Apple Silicon the native PyTorch wheel provides the
-MPS path, subject to the host's support.
+On Linux, `--profile auto` selects CUDA 12.6 when NVIDIA device/driver queries
+succeed and the reported CUDA support is at least 12.6, otherwise CPU. An
+installed CUDA build does not guarantee GPU architecture compatibility; the
+installer reports the build and selected device. Use `--profile cpu` to force
+CPU packages. On Apple Silicon the `cpu` extra installs the native PyTorch
+wheel, which also provides MPS. `NOMUSIC_DEVICE` chooses the runtime device;
+it cannot add CUDA support to CPU packages.
 
 ## Browser setup
 
@@ -160,7 +156,7 @@ pins the interpreter used by installation.
 | --- | --- |
 | Python | 3.12.14; package accepts the 3.12 series |
 | uv installer | 0.12.19 |
-| PyTorch | 2.14.0; official `+cpu` wheel on Linux, native PyPI wheel on macOS |
+| PyTorch | 2.14.0; locked `+cpu` or `+cu126` wheels on Linux, native PyPI wheel on macOS |
 | Demucs | 4.1.0 |
 | NumPy / soundfile | 2.2.6 / 0.14.0 |
 | FastAPI / Starlette | 0.141.1 / 1.7.0 |
@@ -245,7 +241,7 @@ backend code, or use an editable development installation from the same lock
 with uv 0.12.19:
 
 ```sh
-UV_PROJECT_ENVIRONMENT=backend/.venv uv sync --locked --python 3.12.14
+UV_PROJECT_ENVIRONMENT=backend/.venv uv sync --locked --extra cpu --python 3.12.14
 ```
 
 Here and below, `uv` means an installed uv 0.12.19 executable; the bootstrap
@@ -317,12 +313,15 @@ Stop the helper before replacing its environment. Retain the previous
 checkout or downloaded project folder until the replacement has passed the
 same local playback/export checks.
 
-If the old `backend/.venv` uses a different Python version, is incomplete, or
-is not a virtual environment, the installer stops without deleting it.
-Install to a new absolute path using `NOMUSIC_VENV`, or rename the old
-environment yourself after stopping its processes. Python environments are
-not generally relocatable; a renamed backup should be restored to its
-original path before reuse.
+If the default `backend/.venv` uses a different Python version, the installer
+moves it to `backend/.venv.bak` after checking prerequisites, then creates the
+pinned environment. It never overwrites an existing backup. If installation
+fails, it preserves the backup and prints the exact restore command.
+
+Incomplete directories, symlinks and incompatible explicitly selected custom
+environments are refused without deletion. Python environments are not
+generally relocatable; restore a backup to its original path before reuse.
+After accepting the upgrade, remove the backup when no longer needed.
 
 For ordinary upgrades, obtain the new checkout and run `./install.sh` there.
 The installer keeps Python packages in sync with the committed lock and
@@ -341,7 +340,7 @@ Edit direct pins in `pyproject.toml`, then regenerate and review the lock:
 ```sh
 uv lock
 uv lock --check
-UV_PROJECT_ENVIRONMENT=backend/.venv uv sync --locked --python 3.12.14
+UV_PROJECT_ENVIRONMENT=backend/.venv uv sync --locked --extra cpu --python 3.12.14
 backend/.venv/bin/python -m pytest backend/tests -v
 npm --prefix extension test
 ```
@@ -356,27 +355,25 @@ when changing the reference Python version. Keep the installer uv pin and docume
 consistent. Model changes require reviewed repository revisions and file hashes
 in `model_store.py`; a Python lock update alone cannot pin remote model data.
 
-## Experimental NVIDIA installation
+## NVIDIA installation
 
-Use a separate environment for GPU evaluation. This path deliberately does
-not use the CPU reference lock and has not been validated here. It needs
-compatible NVIDIA hardware and drivers, and it can fail if the pinned torch
-version does not publish a wheel usable by that driver or GPU.
-
-From the repository root, with uv 0.12.19 and external prerequisites present:
+CPU and CUDA 12.6 packages are separate, mutually exclusive extras in the same
+lock. Choose a profile explicitly to install without relying on auto-detection:
 
 ```sh
-uv venv --python 3.12.14 backend/.venv-cuda
-uv pip install --python backend/.venv-cuda/bin/python . --torch-backend=auto
-backend/.venv-cuda/bin/nomusic check-runtime
-backend/.venv-cuda/bin/nomusic models fetch
-NOMUSIC_DEVICE=cuda backend/.venv-cuda/bin/nomusic serve
+./install.sh --profile cu126 --skip-system-packages
+NOMUSIC_DEVICE=cuda backend/.venv/bin/nomusic serve
 ```
 
-uv chooses a PyTorch index based on detected hardware and driver support;
-the explicit `cuda` device request then prevents an unnoticed CPU fallback.
-The package's direct pins still apply, but transitive dependencies in this
-experimental environment are resolved separately from `uv.lock`. Record the
-resulting environment and real inference measurements before proposing a
-supported CUDA profile. Older GPUs may require a separately maintained
-dependency profile. [uv's PyTorch installation documentation](https://docs.astral.sh/uv/guides/integration/pytorch/#automatic-backend-selection).
+An explicit CUDA request fails if the installed build, GPU architecture or
+NVIDIA driver cannot run it. Installing the CUDA wheels on a CPU-only machine
+can verify dependency resolution and build identity, but cannot test inference.
+The native Mac profile does not use a Linux CUDA package index.
+
+To switch back, stop the helper and run `./install.sh --profile cpu`.
+For editable CUDA development use `uv sync --locked --extra cu126` with the
+same `UV_PROJECT_ENVIRONMENT` and Python pin as above. Always select one extra
+when running uv directly; unqualified `uv sync` resolves the default upstream
+PyTorch build instead of choosing a nomusic accelerator profile.
+
+See [uv's optional accelerator profiles](https://docs.astral.sh/uv/guides/integration/pytorch/#configuring-accelerators-with-optional-dependencies).

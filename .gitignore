@@ -11,6 +11,7 @@ env/
 ENV/
 *.egg-info/
 backend/.installer-venv/
+backend/.venv.bak/
 build/
 dist/
 .pytest_cache/

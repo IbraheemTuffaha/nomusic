@@ -253,7 +253,7 @@ def main() -> None:
 
     import uvicorn
 
-    # Dev convenience: NOMUSIC_RELOAD=1 watches backend/*.py and restarts on
+    # Dev convenience: NOMUSIC_RELOAD=1 watches the imported package and restarts on
     # save, so you don't re-run the server by hand on every change. Off by
     # default (the reloader spawns a watcher subprocess + re-imports the app,
     # which reloads the model — fine for dev, wasteful for normal use).
@@ -271,6 +271,10 @@ def main() -> None:
         " · auto-reload" if reload else "",
     )
     if reload:
+        log.warning(
+            "Auto-reload watches %s; use an editable install to watch checkout edits "
+            "(see docs/installation.md)", _BACKEND_DIR,
+        )
         uvicorn.run(
             "nomusic.server:app",
             host=SETTINGS.host,
