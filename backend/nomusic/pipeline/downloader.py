@@ -467,6 +467,7 @@ def slice_source(
     *,
     start: float,
     end: float,
+    pass_fds: tuple[int, ...] = (),
 ) -> Path:
     """Cut ``[start, end)`` seconds of ``source`` into a 44.1 kHz stereo WAV.
 
@@ -518,7 +519,7 @@ def slice_source(
     # stops a wedged ffmpeg (corrupt container) from hanging the worker forever.
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, timeout=_FFMPEG_SLICE_TIMEOUT_SECONDS
+            cmd, capture_output=True, timeout=_FFMPEG_SLICE_TIMEOUT_SECONDS, pass_fds=pass_fds
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(

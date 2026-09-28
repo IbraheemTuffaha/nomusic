@@ -123,6 +123,8 @@ class Services:
         for thread in self._threads:
             thread.join()
         self._threads.clear()
+        if self.cache is not None:
+            self.cache.close()
         self.registry = None
         self.cache = None
         self.engine = None
