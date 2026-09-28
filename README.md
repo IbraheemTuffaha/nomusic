@@ -4,168 +4,126 @@
   <img src="assets/logo.png" alt="nomusic" width="180" />
 </p>
 
-Watch videos with less background music. nomusic adds a button to your browser
-and processes the audio on your own computer, using a local source-separation
-model. It is made for people who want to avoid music for religious or personal
-reasons.
+Watch videos with less background music. nomusic adds a button to videos in
+Chrome and separates their audio on your own computer. It is made for people
+who want to avoid music for religious or personal reasons.
 
-The default keeps the **vocals** stem: speech and singing. Separation can leave
-some music or remove wanted sounds; it does not perfectly distinguish every
-kind of music from every other sound.
+The default keeps **vocals**, including speech and singing. Some music may
+remain, and some wanted sounds may be removed. Start with a **public YouTube
+video with a fixed duration**; other sites are experimental.
 
-The current setup is for **local use with public, finite YouTube videos**.
-Other sites are experimental. Authenticated internet sharing is planned; this
-version does not provide user authentication.
+This version is for local use and has no user authentication. Keep the backend
+on its default loopback address; authenticated internet sharing is not ready.
 
 ## What you need
 
-- **Apple Silicon Mac with macOS 14 or newer**, or **Linux x86_64 with glibc
-  2.28 or newer**. Linux automatically selects the locked CPU or NVIDIA CUDA profile.
-- **Google Chrome** for the extension. Other Chromium browsers may work but
-  need separate testing.
-- An internet connection for installation, model downloads and source videos.
-- On Mac, [Homebrew](https://brew.sh/). On Linux, **Node.js 22+ or Deno 2.3+**
-  installed before running the installer.
+- **Apple Silicon Mac, macOS 14+**, or **Linux x86_64, glibc 2.28+**.
+  On Mac, choose **Apple menu → About This Mac** to check the chip and OS.
+- **Google Chrome**. Other Chromium browsers need separate testing.
+- Internet access for installation, model downloads and source videos.
+- On Mac, [Homebrew](https://brew.sh/); on Linux, **Node.js 22+ or Deno 2.3+**.
 
-Processing speed depends on the machine and video. CPU processing may be
-slower than playback. See the [installation guide](docs/installation.md) for
-platform details, developer setup and explicit CPU/NVIDIA profile selection.
+Linux installation selects CPU or NVIDIA CUDA automatically. Native Mac
+installation provides MPS acceleration when available. CPU processing can be
+slower than playback. See [platforms and profiles](docs/installation.md#platforms-and-profiles)
+for requirements and hardware-testing limits.
 
-## Install
+## 1. Get the files and open Terminal
 
-Download and unzip this repository using GitHub's **Code → Download ZIP**, or
-clone it:
+1. On this repository's GitHub page, click **Code → Download ZIP**.
+2. Unzip it and move the project folder somewhere you will keep it, such as
+   Documents. The extension will continue to use files from this folder.
+3. On Mac, press **Command + Space**, type **Terminal**, and press Return.
+4. Type `cd `, including the trailing space, drag the project folder from
+   Finder into Terminal, and press Return. Linux users can open a terminal
+   in the project folder.
+
+If you use Git, these commands replace the download/unzip steps:
 
 ```sh
 git clone https://github.com/IbraheemTuffaha/nomusic.git
 cd nomusic
 ```
 
-Open Terminal in the downloaded project folder. On Mac, you can type `cd `,
-drag the folder into Terminal, and press Return. Then run:
+## 2. Install and check
+
+On Mac, install Homebrew first by following the command and **Next steps** at
+[brew.sh](https://brew.sh/). If it asks for your login password, Terminal hides
+characters while you type. On Linux, install a supported Node.js or Deno
+runtime before continuing.
+
+From the project folder, with any existing nomusic helper stopped:
 
 ```sh
 ./install.sh
+backend/.venv/bin/nomusic doctor
 ```
 
-The installer sets up the pinned Python environment, checks FFmpeg and the
-JavaScript runtime, and downloads and verifies the default model (about
-84 MB). It may ask for permission to install missing system packages. Keep the
-project folder after installation.
+Installation creates the pinned Python environment, checks prerequisites and
+downloads the default model, about 84 MB. It can request permission to install
+missing system packages. Doctor runs a short, silent inference check and should
+finish with **Local checks passed.** Follow any reported remedy before continuing.
 
-If the installer reports an existing environment with the wrong Python
-version, follow the [migration instructions](docs/installation.md#upgrading-and-rollback).
-It preserves that environment rather than deleting it.
+An older default Python environment is preserved as `backend/.venv.bak` during
+migration. See [upgrading and rollback](docs/installation.md#upgrading-and-rollback)
+if you already have a backup or use a custom environment.
 
-For your first run, follow the [local workflow checklist](docs/local-workflow.md)
-to check the installation, play and export a short video, and restart the helper.
-
-## Start and stop
-
-From the project folder:
+## 3. Start the helper
 
 ```sh
 backend/.venv/bin/nomusic serve
 ```
 
-Keep this Terminal window open while using nomusic. Press **Control + C** to
-stop it. Progress streams close quietly while active processing and requests
-drain for up to 60 seconds. Press **Control + C** again to force quit sooner.
-A model preload alone is not awaited. A forced exit interrupts unfinished
-work; restart and retry it. The next start removes abandoned nomusic scratch
-files while retaining complete cached media and resumable model downloads.
-Run the same command next time.
+Keep this Terminal window open. The helper listens at `http://127.0.0.1:8723`;
+its model may still be loading after the listening message appears. The
+[local-use guide](docs/local-workflow.md) explains checking readiness.
 
-The server listens at `http://127.0.0.1:8723`. A “Uvicorn running” message means
-the HTTP server is listening; the model can still be loading. The extension
-shows progress when you start processing a video.
+To stop, press **Control + C**. Active processing or requests get up to
+60 seconds to finish stopping; a second **Control + C** forces exit immediately.
+Stopping while only the startup model load is running exits promptly.
+Next time, open Terminal in the project folder and run the same serve command.
 
-## Add the extension
+## 4. Add the extension
 
-1. Open `chrome://extensions` in Chrome.
-2. Enable **Developer mode**.
-3. Click **Load unpacked** and select the project's `extension` folder.
-4. Open a public YouTube video with a fixed duration.
-5. When Chrome asks whether the site may access devices on your local network,
-   **allow it for that site**. This lets the video page reach the local helper.
+1. Open `chrome://extensions` in Chrome and turn on **Developer mode**.
+2. Click **Load unpacked** and select the project's `extension` folder.
+3. Open nomusic from the toolbar, possibly under the puzzle-piece icon.
+   Keep the backend URL `http://127.0.0.1:8723`, model **htdemucs** and
+   **vocals** selected. Settings save automatically.
+4. Open a public YouTube video. If Chrome requests **Local network access**,
+   allow it for the video site so the page can reach the helper.
 
-If that permission was denied, open the site's settings using the control
-beside the address bar, allow **Local network access**, and reload the page.
-Extension host permissions and this browser permission are separate.
+If permission was denied, open the site's settings beside the address bar,
+allow **Local network access**, and reload. After updating extension files,
+reload the extension on `chrome://extensions`, then reload your video tabs.
 
-## Watch and save
+## 5. Watch and save
 
-1. Start the helper and open a supported video.
-2. Click the **nomusic** button on the video.
-3. Wait while it fetches and processes the audio. Playback starts when the
-   first processed chunk is available and may pause while waiting for more.
-4. Click the button again to return to the original audio.
+Click **nomusic** on the video. Playback starts when processed audio becomes
+available and can pause while more is prepared. Click again to return to the
+original audio. For a short first test, turn YouTube autoplay off.
 
-Use the download chevron on the button to save **MP3 audio** or an **MP4 video**
-with processed audio. Video export can require a separate video download and
-additional processing. Leave the tab open while it prepares. Resolution
-choices depend on what the source provides.
+Use the download chevron beside the button for **MP3 audio** or **MP4 video**.
+You can request an export before processing finishes; leave the tab open until
+the file downloads. MP4 preparation may download the video separately.
 
-To change which sounds are kept, open nomusic from Chrome's toolbar, possibly
-under the puzzle-piece menu:
+**A processing error can restore original audio and resume the player.** Mute
+the site or browser before retrying if avoiding that audio is essential.
 
-- **Vocals only** is the default and retains speech and singing.
-- **Vocals + other** may retain more effects and ambience, but also more music.
-- **Drums** and **bass** retain those musical components.
+See [local use and troubleshooting](docs/local-workflow.md) for stem settings,
+exports, cache clearing and recovery after a restart.
 
-Settings save automatically. Toggle nomusic off and on after changing the
-model or stems to start a new playback session with those settings.
+## Privacy and development
 
-The settings panel also shows the processed-media cache and provides a clear
-button. Cached work can speed up later visits; the default retention is seven
-days. Finish playback and exports before clearing; click **Clear**, then
-**Confirm**. Downloaded model weights use a separate cache and are kept.
+Separation runs on the configured backend, your own computer by default.
+The backend downloads media from the source site and stores processed audio
+and metadata locally. Installation also contacts package and model hosts.
 
-## Troubleshooting
-
-**“Backend unreachable.”** Start the helper, check the backend URL in the
-extension settings, and check the site's local-network permission. A denied
-permission can look like an offline backend.
-
-**Processing fails.** Check the helper's Terminal output. Private, restricted
-and live videos are outside the initial supported scope. Run
-`backend/.venv/bin/nomusic doctor` with the helper stopped to check the local
-installation and a short inference. YouTube can separately reject downloads
-with HTTP 429 or a human-verification message, even when the page plays and
-local checks pass. See [source-access troubleshooting](docs/local-workflow.md#when-a-check-fails).
-
-A processing failure can restore the original audio and resume the player.
-Mute the site or browser before retrying if you need to avoid that audio.
-
-**Music remains or wanted sounds disappear.** Try the stem settings above.
-Model quality varies with the recording.
-
-**Playback stalls or loses sync.** Toggle nomusic off and on to start a new
-playback session. Long sessions and recovery after interruptions still need
-further reliability work.
-
-## Privacy
-
-Audio separation runs on the configured backend. With the default setup,
-that is your own computer. The backend contacts the source video service to
-download media; installation and model setup also contact package and model
-hosts. Processed audio and metadata are stored in the local cache.
-
-## Development
-
-The backend is Python/FastAPI with Demucs/PyTorch inference. The plain
-JavaScript Manifest V3 extension schedules processed audio against the video
-clock. Backend code lives in `backend/nomusic/`; `backend/server.py` remains a
-compatibility launcher.
-
-Application lifespan owns the engine, jobs and background work; importing the
-server does not start them. Use the documented launch commands so shutdown
-can close progress streams before draining HTTP requests.
-
-See [installation and development](docs/installation.md) for the dependency
-lock, commands, model provenance, test boundaries and upgrade workflow.
-The [verification guide](docs/verification.md) covers the shared local/CI test
-command, actual extension and CPU smoke, and separate manual/live-source checks.
+- [Installation and development](docs/installation.md): profiles, upgrades,
+  model storage and editable development.
+- [Reference](docs/reference.md): architecture, all backend settings and API.
+- [Verification](docs/verification.md): installed-package tests, CPU/extension
+  smoke and their limits.
 
 ## License
 
