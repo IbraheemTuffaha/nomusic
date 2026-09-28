@@ -29,6 +29,7 @@ class WarmupEngine:
 
 @pytest.fixture
 def settings(monkeypatch, tmp_path):
+    monkeypatch.setattr("nomusic.services.check_runtime", lambda: {})
     configured = replace(
         server.SETTINGS, cache_dir=tmp_path / "cache",
         cache_ttl_days=1, cache_sweep_interval_seconds=3600,
@@ -161,6 +162,12 @@ def test_failed_warmup_is_joined_and_retains_lazy_retry(monkeypatch, settings, c
     with TestClient(app) as client:
         threads = list(app.state.services._threads)
         assert client.get("/healthz").status_code == 200
+        # Initialization now checks runtime/storage before model loading. Wait
+        # for its outcome instead of racing shutdown against the warmup call.
+        for thread in threads:
+            if thread.name == "nomusic-engine-warmup":
+                thread.join(timeout=3)
+                assert not thread.is_alive()
     assert all(not t.is_alive() for t in threads)
     assert "will load lazily on first job" in caplog.text
 

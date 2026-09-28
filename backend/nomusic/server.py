@@ -8,6 +8,7 @@ before releasing them on shutdown. Importing this module starts no services.
 The endpoints live in :mod:`nomusic.routes` (system / jobs / media):
 
   GET  /healthz
+  GET  /readyz
   GET  /capabilities
   POST /process              {url, model?, keep_stems?} -> {job_id, ...}
   POST /process/{job_id}/prioritize {from_chunk} -> {applied}
