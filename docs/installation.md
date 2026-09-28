@@ -6,6 +6,8 @@ vocals stem. Other extractors remain experimental. The backend binds to
 loopback by default and does not yet authenticate users; remote deployment is
 outside this installation profile.
 
+For the complete first-run sequence, use the [local workflow checklist](local-workflow.md).
+
 ## Platform profile
 
 | Platform | Installation | Processing device | Validation status |
@@ -30,6 +32,7 @@ runtime version.
 
 ```sh
 ./install.sh
+backend/.venv/bin/nomusic doctor
 backend/.venv/bin/nomusic serve
 ```
 
@@ -222,6 +225,12 @@ extension, acquisition, inference, chunk serving, Web Audio and existing
 export flow. Keep the tab open while preparing an export. A short successful
 example does not establish long-session reliability or support for every
 source video.
+
+The popup's **backend up** label means the API is reachable; it does not check
+model readiness or YouTube access. Settings save automatically. After changing
+the model or stems, toggle nomusic off and on to start a new session. See the
+[local workflow checklist](local-workflow.md) for readiness, restart and
+source-access troubleshooting.
 
 ## Dependencies and external tools
 
@@ -426,6 +435,12 @@ For ordinary upgrades, obtain the new checkout and run `./install.sh` there.
 The installer keeps Python packages in sync with the committed lock and
 verifies the pinned weights. Media and model caches are preserved. The old
 launch wrappers remain, but `nomusic serve` is the canonical command.
+
+After extension files change, open `chrome://extensions`, reload nomusic,
+and reload your video page. If the new checkout is in a different folder,
+remove the old unpacked extension and load the new `extension` folder; check
+its backend URL, model and stems again. Repeat the
+[local workflow checklist](local-workflow.md) before retiring the old setup.
 
 To roll back, stop the new helper and return to the previous checkout and
 environment at their original paths, or reinstall that checkout's own

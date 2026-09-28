@@ -57,6 +57,9 @@ If the installer reports an existing environment with the wrong Python
 version, follow the [migration instructions](docs/installation.md#upgrading-and-rollback).
 It preserves that environment rather than deleting it.
 
+For your first run, follow the [local workflow checklist](docs/local-workflow.md)
+to check the installation, play and export a short video, and restart the helper.
+
 ## Start and stop
 
 From the project folder:
@@ -110,9 +113,13 @@ under the puzzle-piece menu:
 - **Vocals + other** may retain more effects and ambience, but also more music.
 - **Drums** and **bass** retain those musical components.
 
+Settings save automatically. Toggle nomusic off and on after changing the
+model or stems to start a new playback session with those settings.
+
 The settings panel also shows the processed-media cache and provides a clear
 button. Cached work can speed up later visits; the default retention is seven
-days. Downloaded model weights use a separate cache.
+days. Finish playback and exports before clearing; click **Clear**, then
+**Confirm**. Downloaded model weights use a separate cache and are kept.
 
 ## Troubleshooting
 
@@ -121,9 +128,14 @@ extension settings, and check the site's local-network permission. A denied
 permission can look like an offline backend.
 
 **Processing fails.** Check the helper's Terminal output. Private, restricted
-and live videos are outside the initial supported scope. Try another public
-finite video, then run `backend/.venv/bin/nomusic check-runtime` to check
-FFmpeg and the YouTube JavaScript runtime.
+and live videos are outside the initial supported scope. Run
+`backend/.venv/bin/nomusic doctor` with the helper stopped to check the local
+installation and a short inference. YouTube can separately reject downloads
+with HTTP 429 or a human-verification message, even when the page plays and
+local checks pass. See [source-access troubleshooting](docs/local-workflow.md#when-a-check-fails).
+
+A processing failure can restore the original audio and resume the player.
+Mute the site or browser before retrying if you need to avoid that audio.
 
 **Music remains or wanted sounds disappear.** Try the stem settings above.
 Model quality varies with the recording.
