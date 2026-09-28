@@ -185,6 +185,9 @@ def _fake_fetcher_class(source_tone: Path, duration: float = 10.0):
                 progress_hook({"status": "finished", "downloaded_bytes": 1, "total_bytes": 1})
             return dst
 
+        def close(self):
+            pass
+
     return _FakeFetcher
 
 

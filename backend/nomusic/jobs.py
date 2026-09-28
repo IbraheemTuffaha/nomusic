@@ -30,11 +30,15 @@ log = logging.getLogger(__name__)
 
 
 class WorkerAbandoned(Exception):
-    """Raised from the chunk provider when a job has had no SSE subscriber for
-    longer than ``idle_timeout_seconds``. It propagates up through
+    """Raised when a job goes idle, its cache is cleared, or shutdown starts.
+    It propagates up through
     ``Processor.run`` and out of ``with self._gpu_lock:``, so the GPU lock is
     released naturally on the way out and the worker thread exits. The client
     re-spawns the job from disk-cached progress on its next click."""
+
+
+class RegistryClosed(RuntimeError):
+    """The service is stopping and cannot accept new work."""
 
 
 class JobState(str, Enum):
@@ -147,6 +151,12 @@ class JobRegistry:
         self.cache = cache
         self._jobs: dict[str, JobStatus] = {}
         self._threads: dict[str, threading.Thread] = {}
+        # A key may be replaced before its old worker finishes unwinding.
+        # Retain physical thread handles independently so shutdown joins both
+        # generations. Finished handles are pruned when admitting another job;
+        # workers cannot remove themselves before they have actually exited.
+        self._worker_threads: set[threading.Thread] = set()
+        self._closed = False
         # Per-job control for chunk ordering. Built lazily inside
         # ``_on_probed`` (once we know total_chunks) and discarded when the
         # worker finishes.
@@ -178,7 +188,75 @@ class JobRegistry:
     def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Capture the server's event loop so worker threads can schedule
         queue writes onto it. Called once from the FastAPI lifespan startup."""
-        self._loop = loop
+        with self._lock:
+            if self._closed:
+                raise RegistryClosed("job registry is shutting down")
+            self._loop = loop
+
+    def begin_shutdown(self) -> None:
+        """Stop admissions and signal every execution, including old workers.
+
+        This phase does not wait and is safe on the event loop. Cache-clear's
+        per-key abandon marks can be reset by a replacement submission; this
+        registry-wide flag is permanent and is checked by every abort hook.
+        """
+        pending: list[tuple[asyncio.Queue, dict]] = []
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for key, subscribers in self._subscribers.items():
+                status = self._jobs.get(key)
+                if status is None:
+                    # Partial disk caches can be subscribed to without an
+                    # in-memory execution. Cache clear can also remove a
+                    # status during the subscription handshake. Every live
+                    # queue still needs a terminal event before HTTP drain.
+                    status = JobStatus(job_id=key, state=JobState.ERROR)
+                snapshot = status.to_dict()
+                snapshot.update(
+                    state=JobState.ERROR.value,
+                    phase=JobState.ERROR.value,
+                    phase_label=_PHASE_LABELS[JobState.ERROR.value],
+                    error="server shutting down",
+                    updated_at=time.time(),
+                )
+                pending.extend((queue, snapshot) for queue in subscribers)
+            loop = self._loop
+        # Close active event streams before the HTTP server drains requests.
+        # Keep their queues and the loop attached until actual workers exit.
+        if loop is not None and not loop.is_closed():
+            for queue, snapshot in pending:
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, snapshot)
+                except RuntimeError:
+                    break
+
+    def shutdown(self) -> None:
+        """Signal and join all ordinary work, then detach the event loop.
+
+        Call outside the event-loop thread so worker status callbacks can
+        still run while the pipeline unwinds. This deliberately has no join
+        timeout: a normal shutdown must not release resources while a worker
+        is still using them. Hard termination of stuck native work requires a
+        supervised process and is outside this in-process registry's contract.
+        A closed registry cannot be restarted; create a new one per lifespan.
+        """
+        self.begin_shutdown()
+        with self._lock:
+            workers = tuple(self._worker_threads)
+        for worker in workers:
+            worker.join()
+        with self._lock:
+            self._worker_threads.clear()
+            self._threads.clear()
+            self._jobs.clear()
+            self._controls.clear()
+            self._pending_priority.clear()
+            self._subscribers.clear()
+            self._last_disconnect_at.clear()
+            self._abandoning.clear()
+            self._loop = None
 
     def subscribe(self, key: str) -> asyncio.Queue:
         """Register an /events stream for ``key`` and return its queue.
@@ -187,6 +265,8 @@ class JobRegistry:
         the idle clock the instant their stream opens."""
         q: asyncio.Queue = asyncio.Queue()
         with self._lock:
+            if self._closed:
+                raise RegistryClosed("job registry is shutting down")
             self._subscribers.setdefault(key, []).append(q)
             self._last_disconnect_at.pop(key, None)
         return q
@@ -214,6 +294,9 @@ class JobRegistry:
         model: str,
         keep_stems: list[str],
     ) -> JobStatus:
+        with self._lock:
+            if self._closed:
+                raise RegistryClosed("job registry is shutting down")
         # No probe here: the yt-dlp metadata call takes 3-6s on YouTube
         # because of the JS challenge, and blocking /process on it made the
         # button look stuck on "Starting". The cache key only needs (url,
@@ -229,6 +312,8 @@ class JobRegistry:
         existing_meta = self.cache.load_meta(key)
 
         with self._lock:
+            if self._closed:
+                raise RegistryClosed("job registry is shutting down")
             existing = self._jobs.get(key)
             if self._is_live_duplicate(existing, key):
                 # A returning/duplicate client. Restart the idle clock so the
@@ -257,7 +342,17 @@ class JobRegistry:
                 daemon=True,
             )
             self._threads[key] = t
-            t.start()
+            self._worker_threads = {
+                worker for worker in self._worker_threads if worker.is_alive()
+            }
+            self._worker_threads.add(t)
+            try:
+                t.start()
+            except BaseException:
+                self._worker_threads.remove(t)
+                self._threads.pop(key, None)
+                self._jobs.pop(key, None)
+                raise
             return status
 
     def _is_live_duplicate(self, existing: Optional[JobStatus], key: str) -> bool:
@@ -417,6 +512,9 @@ class JobRegistry:
         try:
             try:
                 with self._gpu_lock:
+                    # Queued work must not begin probing/downloading after a
+                    # shutdown signal received while it waited for the lock.
+                    self._raise_if_abandoned(key, SETTINGS.idle_timeout_seconds)
                     # Stay in QUEUED while waiting for the GPU lock. Only flip
                     # to PROBING once we actually own it, so a second
                     # concurrent job honestly reports "Queued" instead of
@@ -463,12 +561,9 @@ class JobRegistry:
                 # mistaken for a failure. The GPU lock has already released via
                 # the with-block unwind; just flag it for finally to clean up.
                 abandoned = True
-                # ``%gs`` renders 30.0 as "30s" (not "30.0s") so the value
-                # matches the grep documented in the verification steps.
                 log.info(
-                    "Job %s abandoned: idle > %gs",
+                    "Job %s abandoned (idle, cache clear, or service shutdown)",
                     key,
-                    SETTINGS.idle_timeout_seconds,
                 )
             except Exception as exc:
                 log.exception("Job %s failed", key)
@@ -643,7 +738,7 @@ class JobRegistry:
         provider and the progressive-download abort hook so a pause that lands
         mid-download still releases the GPU promptly."""
         with self._lock:
-            if key in self._abandoning:
+            if self._closed or key in self._abandoning:
                 raise WorkerAbandoned
             if idle_timeout <= 0:
                 return
