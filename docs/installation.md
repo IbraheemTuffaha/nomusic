@@ -85,14 +85,60 @@ versions are rejected with instructions to select a supported profile.
 ```sh
 backend/.venv/bin/nomusic --help
 backend/.venv/bin/nomusic check-runtime
+backend/.venv/bin/nomusic doctor
 backend/.venv/bin/nomusic serve
 ```
 
 The listener defaults to `127.0.0.1:8723`. Keep the process running and stop it
 with Control+C. `/healthz` answers whether the API responds, and
-`/capabilities` reports the engine and configuration. They do not currently
-prove model readiness or successful inference. The “Uvicorn running” log line
-also means only that the HTTP server is listening.
+`/capabilities` reports the engine and configuration. `/readyz` returns HTTP
+503 during initialization or after a startup check fails, and HTTP 200 only
+after runtime, writable storage and default-model loading checks pass. The
+“Uvicorn running” log line means only that the HTTP server is listening.
+
+### Local diagnostics and readiness
+
+`nomusic doctor` works without a running API or an accessible source website.
+It reports runtime/package versions, checks cache and temporary storage with
+real write/read/rename/delete operations, identifies the selected device/model,
+verifies the pinned cached model files, and separates two seconds of generated
+audio. It validates duration, all stem lengths, finite samples and at least one
+non-silent stem. This is an execution check, not a music-removal quality or
+sustained performance benchmark.
+
+```sh
+backend/.venv/bin/nomusic doctor --json
+backend/.venv/bin/nomusic doctor --skip-inference
+NOMUSIC_DEVICE=cpu backend/.venv/bin/nomusic doctor
+backend/.venv/bin/nomusic doctor --model htdemucs_ft
+curl --fail http://127.0.0.1:8723/readyz
+```
+
+Doctor uses local model files only and never downloads weights. If the model
+is missing, follow its `nomusic models fetch --model MODEL` instruction, then
+run doctor again. It may create the configured cache directory but preserves
+existing data and removes its temporary probes. Run it as the same OS user,
+with the same environment as the service. Normal doctor runs load a model and
+consume inference memory; avoid running them alongside a busy service on a
+memory-constrained machine. `--skip-inference` checks prerequisites only and
+explicitly reports that inference was not verified. Both modes exit nonzero
+when a check fails. JSON reports include `ok`, `inference_verified` and named
+checks with errors/remedies; file paths and runtime details are local diagnostics.
+
+Readiness is a cheap snapshot of **startup** checks; it performs no I/O or
+inference per request. States are `not_started`, `starting`, `warming` (with a
+check name), `failed` (with a check name), `ready`, and `stopping`. Readiness
+responses cannot be cached and omit raw errors and private paths. Full failure
+details stay in server logs and doctor. A startup failure remains unready until
+the cause is fixed and the service is restarted, even if a later job happens
+to load the model successfully. Shutdown immediately withdraws readiness.
+
+Readiness verifies the default model can load; doctor separately proves a tiny
+inference. Neither proves remote-source access, optional-model readiness,
+available queue capacity, long-session reliability or safe public deployment.
+The existing extension uses liveness/capabilities and does not wait for readyz;
+early jobs can still wait for lazy model loading. An unavailable YouTube source
+can therefore fail even when doctor and readiness succeed.
 
 The old launch forms remain available for existing workflows:
 
@@ -124,8 +170,8 @@ the process exits with a **Forced shutdown** message and code 124; a second
 interrupt exits with code 130. Restart and retry unfinished work. On startup,
 cleanup removes abandoned nomusic scratch files whose leases are no longer
 held, while retaining complete cached media and shared model-download
-partials. Warmup failure still permits lazy retry on the first processing
-request; `/healthz` and `check-runtime` remain separate from model readiness.
+partials. `/readyz` keeps a startup failure visible until restart, while
+`/healthz` continues to report liveness.
 
 Use `nomusic serve`, `python -m nomusic serve`, or the compatibility launcher
 above. They use a small Uvicorn adapter for quiet progress-stream closure and
@@ -321,6 +367,7 @@ throughput or subjective listening benchmark.
 | `backend/nomusic/services.py` | One lifespan's engine, registry and background-thread ownership |
 | `backend/nomusic/serving.py` | Uvicorn launch/reload and shutdown announcement before HTTP drain |
 | `backend/nomusic/config.py` and `runtime.py` | Configuration and external-tool checks |
+| `backend/nomusic/diagnostics.py` | Offline doctor, storage checks and real inference smoke |
 | `backend/nomusic/jobs.py` | Current in-process job registry and worker ownership |
 | `backend/nomusic/engines/` | Engine contract, Demucs inference and pinned models |
 | `backend/nomusic/pipeline/` | Source download, chunk processing, cache and exports |
@@ -329,8 +376,9 @@ throughput or subjective listening benchmark.
 
 Keep installation checks, model fetching and CLI help independent of server
 startup. Keep thread cleanup with the service or processor that creates the
-work. Model-readiness diagnostics and supervision of separate model worker
-processes remain separate work from this bounded server lifecycle.
+work. Readiness belongs to the lifespan's service owner; supervision of
+separate model worker processes remains future work beyond this bounded
+server lifecycle.
 
 ### Useful configuration
 

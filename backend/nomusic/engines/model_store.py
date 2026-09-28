@@ -52,13 +52,16 @@ MODEL_RELEASES = MappingProxyType({
 })
 
 
-def _download_verified(release: ModelRelease, filename: str, sha256: str) -> Path:
+def _download_verified(
+    release: ModelRelease, filename: str, sha256: str, *, local_files_only: bool = False,
+) -> Path:
     from huggingface_hub import hf_hub_download
 
     path = Path(hf_hub_download(
         repo_id=release.repo_id,
         filename=filename,
         revision=release.revision,
+        local_files_only=local_files_only,
     ))
     with path.open("rb") as source:
         actual = hashlib.file_digest(source, "sha256").hexdigest()
@@ -90,31 +93,32 @@ def _read_bag(name: str, config: Path, release: ModelRelease) -> dict[str, Any]:
     return bag
 
 
-def fetch_model_files(name: str = "htdemucs") -> dict[str, Path]:
+def fetch_model_files(name: str = "htdemucs", *, local_files_only: bool = False) -> dict[str, Path]:
     """Download and verify a model without importing torch or selecting a GPU.
 
     Returns filenames mapped to their paths in the standard Hub cache (honoring
     HF_HOME/HF_HUB_CACHE). Both fetching and loading reject unknown model names.
+    With local_files_only=True, missing files fail without a network request.
     """
     release = _release(name)
     filename = f"{name}.yaml"
-    config = _download_verified(release, filename, release.config_sha256)
+    config = _download_verified(release, filename, release.config_sha256, local_files_only=local_files_only)
     _read_bag(name, config, release)
     paths = {filename: config}
     for signature, digest in release.members:
         filename = f"{signature}.safetensors"
-        paths[filename] = _download_verified(release, filename, digest)
+        paths[filename] = _download_verified(release, filename, digest, local_files_only=local_files_only)
     return paths
 
 
-def load_model(name: str) -> Any:
+def load_model(name: str, *, local_files_only: bool = False) -> Any:
     """Load one supported bag using verified safetensors and pinned metadata.
 
     Hub/network/cache failures propagate to the caller. In particular, a failed
     download must never silently select different weights or a pickle loader.
     """
     release = _release(name)
-    paths = fetch_model_files(name)
+    paths = fetch_model_files(name, local_files_only=local_files_only)
     bag = _read_bag(name, paths[f"{name}.yaml"], release)
 
     from demucs.apply import BagOfModels

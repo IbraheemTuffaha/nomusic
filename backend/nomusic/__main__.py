@@ -22,6 +22,10 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("serve", help="Start the local API")
     commands.add_parser("process", help="Process a source URL without the API")
     commands.add_parser("check-runtime", help="Check FFmpeg and the YouTube JavaScript runtime")
+    doctor_parser = commands.add_parser("doctor", help="Check the local installation and run offline test inference")
+    doctor_parser.add_argument("--model", choices=("htdemucs", "htdemucs_ft"))
+    doctor_parser.add_argument("--json", action="store_true", help="Print a structured report")
+    doctor_parser.add_argument("--skip-inference", action="store_true", help="Check prerequisites only; does not verify processing")
     models = commands.add_parser("models", help="Manage pinned model artifacts")
     model_commands = models.add_subparsers(dest="model_command", required=True)
     fetch = model_commands.add_parser("fetch", help="Download and verify the model files")
@@ -34,6 +38,12 @@ def main(argv: list[str] | None = None) -> int:
         elif options.command == "check-runtime":
             from .runtime import check_runtime
             print(json.dumps(check_runtime(), indent=2))
+        elif options.command == "doctor":
+            from .config import SETTINGS
+            from .diagnostics import doctor, format_report
+            report = doctor(SETTINGS, model=options.model, skip_inference=options.skip_inference)
+            print(json.dumps(report, indent=2) if options.json else format_report(report))
+            return 0 if report["ok"] else 1
         elif options.command == "models":
             from .engines.model_store import MODEL_RELEASES, fetch_model_files
             files = fetch_model_files(options.model)
