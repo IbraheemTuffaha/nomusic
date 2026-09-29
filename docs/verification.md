@@ -44,6 +44,8 @@ shadows the installation fails verification. The installed path is recorded in
 `summary.json`; tests, browser helpers and the extension come from the checkout.
 Ordinary pytest runs outside this verification command may use an editable
 development installation.
+With the default non-editable installation, plain `pytest` tests the installed
+copy, not subsequent source edits; reinstall or use an editable development setup.
 
 ## Commands and evidence
 
