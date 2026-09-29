@@ -83,9 +83,10 @@ The local API has no user authentication. Interactive schemas are available at
 | POST | `/cache/clear` | Remove processed media → `{deleted_bytes}` |
 
 `JobStatus` includes `job_id`, `state`, `phase`, `phase_progress` (0–1 or null),
-`phase_label`, `chunks_ready`, `total_chunks`, `duration_seconds`, `title` and
-an error when relevant. States are `queued`, `probing`, `downloading`,
-`processing`, `ready` and `error`.
+`phase_label`, `chunks_ready`, `ready_chunks`, `total_chunks`, `duration_seconds`,
+`title` and an error when relevant. `chunks_ready` is the count; `ready_chunks`
+is the sorted list of completed chunk indices, which may be noncontiguous after
+a seek. States are `queued`, `probing`, `downloading`, `processing`, `ready` and `error`.
 
 Readiness describes startup runtime/storage/default-model checks; doctor adds
 a tiny real inference. Neither establishes source availability or ongoing
