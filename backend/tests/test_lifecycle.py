@@ -152,7 +152,7 @@ def test_partial_startup_failure_joins_already_started_work(monkeypatch, setting
     assert not hasattr(app.state, "services")
 
 
-def test_failed_warmup_is_joined_and_retains_lazy_retry(monkeypatch, settings, caplog):
+def test_failed_warmup_is_joined_and_reports_restart_remedy(monkeypatch, settings, caplog):
     class FailedEngine:
         def warmup(self):
             raise ValueError("test model load failure")
@@ -169,7 +169,7 @@ def test_failed_warmup_is_joined_and_retains_lazy_retry(monkeypatch, settings, c
                 thread.join(timeout=3)
                 assert not thread.is_alive()
     assert all(not t.is_alive() for t in threads)
-    assert "will load lazily on first job" in caplog.text
+    assert "Startup model check failed; fix the cause and restart" in caplog.text
 
 
 def test_engine_initialization_failure_cleans_app_state(monkeypatch, settings):

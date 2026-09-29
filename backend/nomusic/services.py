@@ -127,7 +127,7 @@ class Services:
                 # Details stay in local logs/doctor, never in an HTTP probe.
                 # Preserve lazy model retry, but startup readiness is sticky
                 # after failure: fix the cause and restart to rerun all checks.
-                log.exception("Startup %s check failed; will load lazily on first job", name)
+                log.exception("Startup %s check failed; fix the cause and restart (see nomusic doctor)", name)
                 self._set_readiness({
                     "ok": False, "state": "failed", "check": name,
                     "message": "Run nomusic doctor and inspect server logs; fix the cause and restart.",
