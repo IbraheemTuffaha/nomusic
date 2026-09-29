@@ -47,7 +47,7 @@ not resource or authorization guarantees for a public service.
 | `NOMUSIC_KEEP_SOURCE_AFTER_COMPLETE` | `false` | Keep downloaded source audio for later variants, using more disk |
 | `NOMUSIC_CHUNK_SECONDS` | `10` | Processing chunk duration |
 | `NOMUSIC_CHUNK_OVERLAP_SECONDS` | `0.5` | Separator context overlap |
-| `NOMUSIC_GPU_BATCH` | `2` | Maximum chunks per inference batch; `1` disables batching |
+| `NOMUSIC_GPU_BATCH` | `2` | Maximum chunks per inference batch; retry with `1` after a GPU out-of-memory error |
 | `NOMUSIC_IDLE_TIMEOUT_SECONDS` | `10` | Abandon work after the last status subscriber leaves; `0` disables |
 | `NOMUSIC_SSE_KEEPALIVE_SECONDS` | `15` | Interval between SSE keep-alive comments |
 | `NOMUSIC_MEMORY_GC_INTERVAL_SECONDS` | `3600` | Reclaim in-memory entries whose disk cache disappeared; `0` disables |

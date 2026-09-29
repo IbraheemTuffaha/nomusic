@@ -28,6 +28,15 @@ You can choose explicitly:
 ./install.sh --profile cu126
 ```
 
+For an older compatible NVIDIA driver that reports CUDA below 12.6, use
+`--profile cu126` explicitly instead of auto-selection. This selects the wheel;
+it does not bypass driver requirements. [CUDA 12.x minor-version compatibility
+starts at Linux driver 525.60.13](https://docs.nvidia.com/cuda/archive/12.6.0/cuda-toolkit-release-notes/index.html),
+with [feature/PTX limitations](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html),
+so verify real inference with an explicit CUDA device before relying on it.
+For Pascal GPUs such as the GTX 1050 Ti, [R580 is the last supporting driver
+series](https://forums.developer.nvidia.com/t/unix-graphics-feature-deprecation-schedule/60588).
+
 CPU and CUDA are mutually exclusive extras in the same lock. The CUDA option
 is Linux-only. On Mac the `cpu` extra selects the native wheel, which also
 supports MPS. Package selection and runtime device selection are separate:
@@ -43,11 +52,27 @@ device fails visibly. To switch Linux packages, stop the helper and rerun
 the installer with the desired profile. A CPU wheel cannot enable CUDA merely
 by setting `NOMUSIC_DEVICE`.
 
+To require NVIDIA execution for both diagnostics and the server:
+
+```sh
+export NOMUSIC_DEVICE=cuda
+backend/.venv/bin/nomusic doctor
+backend/.venv/bin/nomusic serve
+```
+
+Both commands fail visibly if CUDA is unavailable or unsupported instead of
+falling back to CPU. If processing runs out of GPU memory, stop the helper and
+retry with `NOMUSIC_GPU_BATCH=1`; this reduces the inference batch from two
+chunks to one. Use the same device setting for the retry.
+
 ## Prerequisites and installer options
 
 On Mac, install [Homebrew](https://brew.sh/). On Linux, provide
 [Node.js 22+](https://nodejs.org/en/download) or
 [Deno 2.3+](https://docs.deno.com/runtime/getting_started/installation/).
+Install a supported runtime before running the installer: do not assume
+Ubuntu's apt `nodejs` is new enough. For example, [Ubuntu 24.04 ships Node
+18.x](https://packages.ubuntu.com/noble/nodejs), below the required version.
 The current runtime check requires one for all source downloads; Bun is not
 accepted. macOS installation supplies Deno when a supported runtime is missing.
 
