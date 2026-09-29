@@ -106,6 +106,12 @@ case "$OS/$ARCH" in
           && [[ "$NVIDIA_STATUS" =~ CUDA[[:space:]]+Version:[[:space:]]+([0-9]+)\.([0-9]+) ]] \
           && [[ "${BASH_REMATCH[1]}" -gt 12 || ( "${BASH_REMATCH[1]}" -eq 12 && "${BASH_REMATCH[2]}" -ge 6 ) ]]; then
           EXTRA="cu126"
+          # RTX 50-series and RTX PRO Blackwell need newer wheels. Keep the
+          # GeForce qualifier: older Quadro/RTX 5000 cards are not Blackwell.
+          if [[ "$GPU_NAMES" =~ GeForce[[:space:]]+RTX[[:space:]]+50[0-9][0-9]|Blackwell ]]; then
+            EXTRA="cpu"
+            printf 'Detected a Blackwell GPU unsupported by the locked CUDA 12.6 build; selecting CPU.\n' >&2
+          fi
         else
           printf 'NVIDIA CUDA detection did not find a usable device/driver advertising CUDA 12.6+; selecting CPU. Use --profile cu126 to install that build explicitly.\n' >&2
         fi

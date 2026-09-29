@@ -12,7 +12,7 @@ outside this installation profile.
 | --- | --- | --- | --- |
 | Linux x86_64, glibc 2.28+ | Locked CPU profile; Debian/Ubuntu system-package helper | CPU | Fresh installation, real CPU processing, actual extension playback and MP3/MP4 exports passed |
 | Apple Silicon, macOS 14+ | Same lock, native macOS PyTorch wheel; Homebrew prerequisites | MPS when available, otherwise CPU | Wheels checked and installation path retained; no Mac or GPU execution in the Linux validation environment |
-| Linux NVIDIA | Locked `cu126` profile, selected automatically for a usable NVIDIA driver | CUDA if its wheel and driver support the GPU | Build installation checked separately; actual GPU inference still needs hardware acceptance |
+| Linux NVIDIA | Locked `cu126` profile, selected automatically for a compatible device/driver | CUDA if its wheel and driver support the GPU | Build installation checked separately; actual GPU inference still needs hardware acceptance |
 
 Intel Macs, Linux ARM, Alpine/musl and native Windows are not covered by this
 lock. A wheel being available is not a claim about inference performance.
@@ -117,7 +117,11 @@ NOMUSIC_DEVICE=cpu backend/.venv/bin/nomusic serve
 ```
 
 On Linux, `--profile auto` selects CUDA 12.6 when NVIDIA device/driver queries
-succeed and the reported CUDA support is at least 12.6, otherwise CPU. An
+succeed and the reported CUDA support is at least 12.6, otherwise CPU. GeForce
+RTX 50-series and devices named Blackwell select CPU, including mixed-device
+systems: the locked CUDA 12.6 build does not support them. Blackwell GPU
+acceleration needs a newer wheel ([PyTorch guidance](https://pytorch.org/blog/pytorch-2-12-release-blog/#deprecation-of-the-cuda-128-wheel)),
+which is not currently a locked installer profile. An
 installed CUDA build does not guarantee GPU architecture compatibility; the
 installer reports the build and selected device. Use `--profile cpu` to force
 CPU packages. On Apple Silicon the `cpu` extra installs the native PyTorch

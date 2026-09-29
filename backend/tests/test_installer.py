@@ -268,6 +268,43 @@ def test_unusable_nvidia_detection_falls_back_to_cpu(installer, options):
     assert "selecting CPU" in result.stderr
 
 
+@pytest.mark.parametrize("names", [
+    "NVIDIA GeForce RTX 5090",
+    "NVIDIA GeForce RTX 5070 Ti",
+    "NVIDIA GeForce RTX 5050 Laptop GPU",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "NVIDIA RTX PRO 5000 Blackwell",
+    "NVIDIA GeForce RTX 4090\nNVIDIA GeForce RTX 5090",
+])
+def test_automatic_profile_skips_cuda_for_blackwell_models(installer, names):
+    installer.nvidia(names=names, cuda="13.0")
+    result = installer.run()
+    assert result.returncode == 0, result.stderr
+    assert selected_profile(installer) == "cpu"
+    assert "Blackwell" in result.stderr and "selecting CPU" in result.stderr
+    assert "Installed PyTorch 2.14.0+cpu; CUDA build: none" in result.stdout
+
+
+@pytest.mark.parametrize("names", [
+    "NVIDIA GeForce RTX 4090",
+    "Quadro RTX 5000",
+    "NVIDIA RTX 5000 Ada Generation",
+])
+def test_automatic_cuda_keeps_supported_rtx_models(installer, names):
+    installer.nvidia(names=names, cuda="13.0")
+    result = installer.run(TEST_DEVICE="cuda")
+    assert result.returncode == 0, result.stderr
+    assert selected_profile(installer) == "cu126"
+
+
+def test_explicit_cuda_profile_bypasses_blackwell_auto_fallback(installer):
+    installer.nvidia(names="NVIDIA GeForce RTX 5090", cuda="13.0")
+    result = installer.run("--profile=cu126")
+    assert result.returncode == 0, result.stderr
+    assert selected_profile(installer) == "cu126"
+    assert "falls back to CPU" in result.stderr
+
+
 def test_explicit_cpu_overrides_gpu_detection(installer):
     installer.nvidia()
     result = installer.run("--profile", "cpu")
