@@ -1,0 +1,14 @@
+{
+  "name": "nomusic-browser-smoke",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "smoke": "node browser.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

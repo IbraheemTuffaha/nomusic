@@ -1,0 +1,400 @@
+// Controlled integration smoke: the unpacked extension, real CPU backend and
+// FFmpeg are exercised together. Only source acquisition uses a local fixture.
+// Chromium's default --mute-audio remains enabled; no sound is sent to speakers.
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createReadStream } from "node:fs";
+import { mkdir, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { chromium } from "playwright";
+
+const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const sourceUrl = "https://www.youtube.com/watch?v=nomusic_e2e_fixture";
+const usage = "node tests/e2e/browser.mjs --backend http://127.0.0.1:PORT --fixture FIXTURE_DIR --output NEW_DIR [--timeout-seconds 300] [--extension DIR]";
+
+function argumentsFrom(argv) {
+  const allowed = new Set(["backend", "fixture", "output", "timeout-seconds", "extension"]);
+  const args = {};
+  for (let index = 0; index < argv.length; index += 2) {
+    const name = argv[index].replace(/^--/, "");
+    assert.ok(argv[index].startsWith("--") && allowed.has(name), usage);
+    assert.ok(argv[index + 1] && !argv[index + 1].startsWith("--"), usage);
+    assert.ok(!(name in args), `Duplicate argument: ${name}`);
+    args[name] = argv[index + 1];
+  }
+  for (const name of ["backend", "fixture", "output"]) assert.ok(args[name], usage);
+  const base = new URL(args.backend);
+  assert.ok(base.protocol === "http:" && base.hostname === "127.0.0.1", "Use a loopback HTTP test backend");
+  assert.ok(base.pathname === "/" && !base.search && !base.hash && !base.username && !base.password, usage);
+  const timeoutSeconds = Number(args["timeout-seconds"] || 300);
+  assert.ok(Number.isFinite(timeoutSeconds) && timeoutSeconds >= 30 && timeoutSeconds <= 1800, "Timeout must be 30–1800 seconds");
+  return {
+    backend: base.origin,
+    fixture: path.resolve(args.fixture, "clip.mp4"),
+    output: path.resolve(args.output),
+    extension: path.resolve(args.extension || path.join(repo, "extension")),
+    timeoutSeconds,
+  };
+}
+
+const options = argumentsFrom(process.argv.slice(2));
+assert.ok((await stat(options.fixture)).isFile(), "Fixture must be a media file");
+await mkdir(path.dirname(options.output), { recursive: true });
+await mkdir(options.output); // Refuse to reuse a browser profile or old evidence.
+
+const report = {
+  startedAt: new Date().toISOString(),
+  mode: "controlled-fixture",
+  sourceUrl,
+  boundaries: {
+    actualUnmodifiedExtension: true,
+    actualCPUModel: true,
+    actualFFmpeg: true,
+    fixtureAcquisition: true,
+    liveYouTube: false,
+    browserAudioOutputMuted: true,
+    subjectiveListening: false,
+  },
+  steps: [],
+  network: [],
+  pageErrors: [],
+};
+const started = performance.now();
+let context, page, server;
+let timedOut = false;
+const watchdog = setTimeout(() => {
+  timedOut = true;
+  console.error(`Browser smoke exceeded ${options.timeoutSeconds} seconds`);
+  void context?.close().catch(() => {});
+}, options.timeoutSeconds * 1000);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function note(name, data = {}) {
+  const item = { name, elapsedSeconds: +((performance.now() - started) / 1000).toFixed(3), ...data };
+  report.steps.push(item);
+  console.log(JSON.stringify(item));
+}
+
+async function until(description, fn, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!timedOut && Date.now() < deadline) {
+    const value = await fn();
+    if (value) return value;
+    await sleep(100);
+  }
+  throw new Error(`Timed out: ${description}`);
+}
+
+async function backendJson(route) {
+  const response = await fetch(`${options.backend}${route}`, { signal: AbortSignal.timeout(10000) });
+  assert.equal(response.status, 200, `${route}: ${await response.clone().text()}`);
+  return response.json();
+}
+
+function fixturePage(boundary) {
+  return `<!doctype html><html lang="en"><meta charset="utf-8">
+    <title>nomusic controlled fixture</title>
+    <style>body{margin:32px;font:18px sans-serif;background:#18202c;color:white}#movie_player{position:relative;width:640px;height:360px}button{margin:10px;padding:10px}</style>
+    <h1>Controlled extension smoke</h1><p>Generated media; real CPU processing. Browser output is muted.</p>
+    <div id="movie_player"><video controls preload="auto" width="640" height="360" src="/clip.mp4"></video></div>
+    <button id="play">Play</button><button id="pause">Pause</button>
+    <button id="seek-start">Seek to one second</button><button id="seek-boundary">Seek before chunk boundary</button>
+    <script>
+      const video = document.querySelector('video');
+      document.querySelector('#movie_player').getVideoData = () => ({video_id: 'nomusic_e2e_fixture'});
+      document.querySelector('#play').onclick = () => video.play();
+      document.querySelector('#pause').onclick = () => video.pause();
+      document.querySelector('#seek-start').onclick = () => { video.currentTime = 1; };
+      document.querySelector('#seek-boundary').onclick = () => { video.currentTime = ${boundary - 0.3}; };
+    </script></html>`;
+}
+
+async function startFixtureServer(boundary) {
+  const size = (await stat(options.fixture)).size;
+  const html = fixturePage(boundary);
+  const http = createServer((req, res) => {
+    if (req.url === "/") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(html);
+      return;
+    }
+    if (req.url !== "/clip.mp4") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    const match = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || "");
+    const start = match ? Number(match[1]) : 0;
+    const end = match?.[2] ? Math.min(Number(match[2]), size - 1) : size - 1;
+    if ((req.headers.range && !match) || start > end || start >= size) {
+      res.writeHead(416, { "Content-Range": `bytes */${size}` });
+      res.end();
+      return;
+    }
+    res.writeHead(match ? 206 : 200, {
+      "Content-Type": "video/mp4", "Accept-Ranges": "bytes", "Content-Length": end - start + 1,
+      ...(match ? { "Content-Range": `bytes ${start}-${end}/${size}` } : {}),
+    });
+    const stream = createReadStream(options.fixture, { start, end });
+    stream.on("error", () => res.destroy());
+    res.on("close", () => stream.destroy());
+    stream.pipe(res);
+  });
+  await new Promise((resolve, reject) => {
+    http.once("error", reject);
+    http.listen(0, "127.0.0.1", resolve);
+  });
+  return http;
+}
+
+// Runs only in the extension's isolated world. A parallel analyser observes the
+// existing output gain; original connect/start methods and audio routing remain
+// intact. No network, model, decoding or scheduling results are substituted.
+function installAudioObserver() {
+  const observation = globalThis.__nomusicSmoke = { starts: [], contexts: [], maxRms: 0, samples: 0, timers: [] };
+  const connect = AudioNode.prototype.connect;
+  const start = AudioBufferSourceNode.prototype.start;
+  AudioNode.prototype.connect = function (target, ...args) {
+    const result = connect.call(this, target, ...args);
+    if (this instanceof GainNode && target instanceof AudioDestinationNode) {
+      const analyser = this.context.createAnalyser();
+      analyser.fftSize = 2048;
+      connect.call(this, analyser);
+      observation.contexts.push(this.context);
+      const data = new Float32Array(analyser.fftSize);
+      observation.timers.push(setInterval(() => {
+        analyser.getFloatTimeDomainData(data);
+        let squares = 0;
+        for (const value of data) squares += value * value;
+        observation.maxRms = Math.max(observation.maxRms, Math.sqrt(squares / data.length));
+        observation.samples++;
+      }, 50));
+    }
+    return result;
+  };
+  AudioBufferSourceNode.prototype.start = function (...args) {
+    const result = start.apply(this, args);
+    observation.starts.push({ chunk: this._nomusicIdx, duration: this.buffer?.duration });
+    return result;
+  };
+  observation.restore = () => {
+    AudioNode.prototype.connect = connect;
+    AudioBufferSourceNode.prototype.start = start;
+    observation.timers.forEach(clearInterval);
+  };
+}
+
+function decodeExport(file, format, expectedDuration) {
+  const commandOptions = { encoding: "utf8", timeout: 60000, maxBuffer: 1024 * 1024 };
+  const media = JSON.parse(execFileSync("ffprobe", ["-v", "error", "-show_format", "-show_streams", "-of", "json", file], commandOptions));
+  assert.ok(Math.abs(Number(media.format.duration) - expectedDuration) < 0.3, `${format}: container duration`);
+  assert.ok(media.streams.some((stream) => stream.codec_type === "audio"), `${format}: audio stream`);
+  if (format === "mp4") assert.ok(media.streams.some((stream) => stream.codec_type === "video"), "MP4: video stream");
+  // Decode every audio sample and every video frame, failing on decoder errors.
+  execFileSync("ffmpeg", ["-v", "error", "-xerror", "-i", file, "-map", "0", "-f", "null", "-"], commandOptions);
+  const pcm = execFileSync("ffmpeg", ["-v", "error", "-xerror", "-i", file, "-map", "0:a:0", "-f", "f32le", "-ac", "1", "-ar", "48000", "pipe:1"], {
+    timeout: 60000, maxBuffer: 32 * 1024 * 1024,
+  });
+  assert.ok(pcm.length > 0 && pcm.length % 4 === 0, `${format}: decoded PCM`);
+  let squares = 0;
+  for (let index = 0; index < pcm.length; index += 4) {
+    const sample = pcm.readFloatLE(index);
+    assert.ok(Number.isFinite(sample), `${format}: finite samples`);
+    squares += sample * sample;
+  }
+  const seconds = pcm.length / 4 / 48000;
+  const rms = Math.sqrt(squares / (pcm.length / 4));
+  assert.ok(Math.abs(seconds - expectedDuration) < 0.3, `${format}: decoded duration`);
+  assert.ok(rms > 1e-8, `${format}: nonzero decoded audio`);
+  return { durationSeconds: seconds, rms, finite: true, codecs: media.streams.map((stream) => stream.codec_name) };
+}
+
+try {
+  const readiness = await backendJson("/readyz");
+  assert.equal(readiness.ok, true);
+  assert.equal(readiness.state, "ready");
+  const capabilities = await backendJson("/capabilities");
+  assert.match(capabilities.engine.device, /^cpu(?:\s|$)/);
+  const boundary = capabilities.defaults.chunk_seconds - capabilities.defaults.chunk_overlap_seconds;
+  assert.ok(Number.isFinite(boundary) && boundary > 1, "Usable chunk stride");
+  const cache = await backendJson("/cache");
+  assert.equal(cache.total_bytes, 0, "Start the smoke backend with an empty media cache");
+  note("ready-cpu-backend", { readiness, device: capabilities.engine.device, boundary });
+  server = await startFixtureServer(boundary);
+  context = await chromium.launchPersistentContext(path.join(options.output, "profile"), {
+    channel: "chromium", headless: true, acceptDownloads: true, viewport: { width: 1280, height: 800 },
+    args: ["--mute-audio", `--disable-extensions-except=${options.extension}`, `--load-extension=${options.extension}`],
+  });
+  context.setDefaultTimeout(20000);
+  await context.tracing.start({ screenshots: true, snapshots: true });
+  report.browserVersion = context.browser()?.version();
+  const worker = context.serviceWorkers().find((item) => item.url().endsWith("/background.js"))
+    || await context.waitForEvent("serviceworker");
+  const extensionId = new URL(worker.url()).hostname;
+  const manifest = await worker.evaluate(() => chrome.runtime.getManifest());
+  assert.equal(manifest.name, "nomusic");
+  assert.equal(manifest.manifest_version, 3);
+  // Let onInstalled finish writing defaults before replacing the test URL.
+  await until("extension initial settings", async () => (await worker.evaluate(() => chrome.storage.sync.get("autoStart"))).autoStart === false);
+  // Only settings are configured; extension source and host permissions are
+  // unchanged. A fresh profile prevents carrying private accounts or cookies.
+  await worker.evaluate((backendUrl) => chrome.storage.sync.set({ backendUrl, model: null, keepStems: null, autoStart: false }), options.backend);
+  const popup = await context.newPage();
+  popup.on("pageerror", (error) => report.pageErrors.push(`popup: ${error}`));
+  await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+  await popup.locator("#status.ok").waitFor();
+  assert.equal(await popup.locator("#backend").inputValue(), options.backend);
+  await popup.waitForFunction(() => document.querySelector("#cacheSize")?.textContent === "empty");
+  const ping = await popup.evaluate(() => chrome.runtime.sendMessage({ type: "ping-backend" }));
+  assert.equal(ping.ok, true, "Actual service-worker backend ping");
+  await popup.screenshot({ path: path.join(options.output, "settings.png") });
+  await popup.close();
+  note("actual-extension-popup-and-background", { manifestVersion: manifest.manifest_version, ping });
+
+  page = await context.newPage();
+  page.on("pageerror", (error) => report.pageErrors.push(String(error)));
+  page.on("response", (response) => {
+    if (response.url().startsWith(`${options.backend}/`)) report.network.push({ path: new URL(response.url()).pathname, status: response.status() });
+  });
+  page.on("requestfailed", (request) => {
+    if (request.url().startsWith(`${options.backend}/`)) report.network.push({ path: new URL(request.url()).pathname, failed: request.failure() });
+  });
+  const cdp = await context.newCDPSession(page);
+  const worlds = new Map();
+  cdp.on("Runtime.executionContextCreated", ({ context: world }) => worlds.set(world.id, world));
+  cdp.on("Runtime.executionContextDestroyed", ({ executionContextId }) => worlds.delete(executionContextId));
+  cdp.on("Runtime.executionContextsCleared", () => worlds.clear());
+  await cdp.send("Runtime.enable");
+  await page.goto(`http://127.0.0.1:${server.address().port}/`, { waitUntil: "domcontentloaded" });
+  await page.locator(".nomusic-btn").waitFor();
+  await page.waitForFunction(() => document.querySelector("video")?.readyState >= 2);
+  const duration = await page.locator("video").evaluate((video) => video.duration);
+  assert.ok(duration > boundary + 1, "Fixture must extend beyond the first chunk boundary");
+  const world = await until("extension execution world", () => [...worlds.values()].find((item) => item.origin === `chrome-extension://${extensionId}` && !item.auxData?.isDefault));
+  async function isolated(expression) {
+    const response = await cdp.send("Runtime.evaluate", { expression, contextId: world.id, returnByValue: true, awaitPromise: true });
+    assert.ok(!response.exceptionDetails, JSON.stringify(response.exceptionDetails));
+    return response.result.value;
+  }
+  await isolated(`(${installAudioObserver.toString()})()`);
+  const bridge = await page.evaluate(() => ({ volume: window.__nomusicVolumePatched, source: window.__nomusicSourceUrlBridge }));
+  assert.deepEqual(bridge, { volume: true, source: true });
+  note("actual-content-scripts", { bridge, duration });
+  await page.locator("#play").click();
+  const submittedPromise = page.waitForResponse((response) => response.url() === `${options.backend}/process` && response.request().method() === "POST");
+  const clickedAt = performance.now();
+  await page.locator(".nomusic-btn").click();
+  const submitted = await submittedPromise;
+  assert.equal(submitted.status(), 200, await submitted.text());
+  assert.equal(submitted.request().postDataJSON().url, sourceUrl, "Actual page bridge resolved the controlled source");
+  const job = await submitted.json();
+  assert.equal(job.chunks_ready, 0, "Fresh job must require real inference");
+  report.jobId = job.job_id;
+  note("extension-submitted-fresh-job", { jobId: job.job_id });
+  const audioState = () => isolated("({maxRms:__nomusicSmoke.maxRms,samples:__nomusicSmoke.samples,starts:__nomusicSmoke.starts,contexts:__nomusicSmoke.contexts.map(context=>context.state)})");
+  async function measuredAudio(description) {
+    return until(description, async () => {
+      const observed = await audioState();
+      return observed.maxRms > 1e-8 && observed.samples >= 4 && observed.starts.length ? observed : false;
+    }, options.timeoutSeconds * 1000);
+  }
+  const firstAudio = await measuredAudio("first real processed audio");
+  note("processed-audio-observed-before-output-mute", { secondsAfterClick: +((performance.now() - clickedAt) / 1000).toFixed(3), ...firstAudio });
+  const time = await page.locator("video").evaluate((video) => video.currentTime);
+  await page.waitForFunction((previous) => document.querySelector("video").currentTime > previous + 0.5, time);
+  assert.deepEqual(await page.locator("video").evaluate((video) => ({ volume: video.volume, blocked: video.dataset.nomusicVolBlock })), { volume: 0, blocked: "1" });
+  const ready = await until("all real CPU chunks", async () => {
+    const status = await backendJson(`/status/${job.job_id}`);
+    assert.notEqual(status.state, "error", JSON.stringify(status));
+    return status.state === "ready" ? status : false;
+  }, options.timeoutSeconds * 1000);
+  assert.ok(ready.chunks_ready >= 2, "At least two real chunks");
+  assert.ok(Math.abs(ready.duration_seconds - duration) < 0.3);
+  await page.waitForFunction(() => document.querySelector(".nomusic-btn__label")?.textContent === "nomusic on");
+  note("all-chunks-ready", { chunks: ready.chunks_ready, duration: ready.duration_seconds });
+
+  await page.locator("#pause").click();
+  await page.locator("#seek-start").click();
+  await page.waitForFunction(() => !document.querySelector("video").seeking && Math.abs(document.querySelector("video").currentTime - 1) < 0.1);
+  await isolated("__nomusicSmoke.maxRms=0;__nomusicSmoke.samples=0");
+  const priorStarts = (await audioState()).starts.length;
+  await page.locator("#play").click();
+  const resumed = await measuredAudio("audio after backward seek and resume");
+  assert.ok(resumed.starts.slice(priorStarts).some((start) => start.chunk === 0));
+  note("backward-seek-and-resume", { audio: resumed });
+  await page.locator("#pause").click();
+  await sleep(200); // Let already-rendered audio quanta drain before measuring.
+  const pausedAt = await page.locator("video").evaluate((video) => video.currentTime);
+  await isolated("__nomusicSmoke.maxRms=0;__nomusicSmoke.samples=0");
+  await sleep(400);
+  assert.equal(await page.locator("video").evaluate((video) => video.paused), true);
+  assert.ok(Math.abs(await page.locator("video").evaluate((video) => video.currentTime) - pausedAt) < 0.05);
+  assert.ok((await audioState()).maxRms < 1e-7, "Processed audio stops on pause");
+  note("pause-stops-video-and-processed-audio");
+
+  await page.locator("#seek-boundary").click();
+  await page.waitForFunction(() => !document.querySelector("video").seeking);
+  const beforeBoundary = (await audioState()).starts.length;
+  await page.locator("#play").click();
+  await page.waitForFunction((position) => document.querySelector("video").currentTime > position + 0.05, boundary);
+  await isolated("__nomusicSmoke.maxRms=0;__nomusicSmoke.samples=0");
+  const afterBoundary = await measuredAudio("fresh audio after chunk boundary");
+  assert.ok(afterBoundary.starts.slice(beforeBoundary).some((start) => start.chunk === 1));
+  await page.locator("#pause").click();
+  note("forward-seek-and-chunk-boundary", { audio: afterBoundary });
+  await page.screenshot({ path: path.join(options.output, "processed.png") });
+
+  for (const [format, label] of [["mp3", "MP3 — audio only"], ["mp4", "480p"]]) {
+    await page.locator(".nomusic-btn__dl").click();
+    const downloading = page.waitForEvent("download", { timeout: 120000 });
+    await page.getByRole("button", { name: label, exact: true }).click();
+    const download = await downloading;
+    const file = path.join(options.output, `export.${format}`);
+    await download.saveAs(file);
+    assert.equal(await download.failure(), null);
+    note(`${format}-export-decoded`, { bytes: (await stat(file)).size, ...decodeExport(file, format, ready.duration_seconds) });
+  }
+  await page.locator(".nomusic-btn").click();
+  await until("audio context disposed", async () => (await audioState()).contexts.every((state) => state === "closed"));
+  assert.deepEqual(await page.locator("video").evaluate((video) => ({ volume: video.volume, blocked: video.dataset.nomusicVolBlock || "" })), { volume: 1, blocked: "" });
+  await isolated("__nomusicSmoke.restore()");
+  note("toggle-off-restores-source-and-closes-audio");
+  assert.ok(report.network.some((item) => item.path.startsWith("/chunk/") && item.status === 200));
+  const eventPath = `/events/${job.job_id}`;
+  assert.ok(report.network.some((item) => item.path === eventPath && item.status === 200), "Real progress stream opened");
+  // EventSource.close() on ready/pause/disposal can appear as ERR_ABORTED.
+  // The stream opened successfully and this job already reached ready above.
+  // Keep HTTP errors and failures of every other request fatal.
+  const expectedStreamClose = (item) => item.path === eventPath
+    && item.failed?.errorText === "net::ERR_ABORTED";
+  assert.deepEqual(report.network.filter((item) => item.status >= 400 || (item.failed && !expectedStreamClose(item))), [], "Backend browser requests succeed");
+  assert.deepEqual(report.pageErrors, [], "No fixture or extension page errors");
+  assert.equal(timedOut, false);
+  report.passed = true;
+  note("controlled-browser-smoke-passed");
+} catch (error) {
+  report.passed = false;
+  report.error = error.stack || String(error);
+  process.exitCode = 1;
+  console.error(report.error);
+  await page?.screenshot({ path: path.join(options.output, "failure.png"), timeout: 5000 }).catch(() => {});
+} finally {
+  clearTimeout(watchdog);
+  if (context) {
+    await context.tracing.stop({ path: path.join(options.output, "trace.zip") }).catch(() => {});
+    await context.close().catch((error) => {
+      report.passed = false;
+      report.cleanupError = String(error);
+      process.exitCode = 1;
+    });
+  }
+  if (server) {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+  report.finishedAt = new Date().toISOString();
+  await writeFile(path.join(options.output, "report.json"), `${JSON.stringify(report, null, 2)}\n`);
+  console.log(`RESULT ${path.join(options.output, "report.json")}`);
+}

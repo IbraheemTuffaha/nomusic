@@ -152,6 +152,8 @@ can close progress streams before draining HTTP requests.
 
 See [installation and development](docs/installation.md) for the dependency
 lock, commands, model provenance, test boundaries and upgrade workflow.
+The [verification guide](docs/verification.md) covers the shared local/CI test
+command, actual extension and CPU smoke, and separate manual/live-source checks.
 
 ## License
 
