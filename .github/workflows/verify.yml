@@ -60,6 +60,8 @@ jobs:
           sudo apt-get install --no-install-recommends -y ffmpeg
       - name: Install FFmpeg (macOS)
         if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
         run: brew install ffmpeg
       - name: Install locked CPU application through the user installer
         run: NOMUSIC_UV="$(command -v uv)" ./install.sh --profile cpu --dev --skip-system-packages --skip-model-download
