@@ -5,10 +5,15 @@ __pycache__/
 *.so
 .Python
 .venv/
+.venv-*/
 venv/
 env/
 ENV/
 *.egg-info/
+backend/.installer-venv/
+backend/.venv.bak/
+build/
+dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

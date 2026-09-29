@@ -11,9 +11,9 @@ import time
 
 import pytest
 
-import engines
-from engines.base import Engine
-from tools.cli import build_parser
+from nomusic import engines
+from nomusic.engines.base import Engine
+from nomusic.cli import build_parser
 
 
 def test_get_engine_known_name():
@@ -34,7 +34,7 @@ def test_ensure_loaded_loads_once_under_concurrency():
     # the cache and call _ensure_loaded at the same time; the load must happen
     # exactly once (no duplicate weight download / double GPU copy). A lockless
     # check-then-set would invoke the factory more than once here.
-    from engines.mlx_engine import MLXEngine
+    from nomusic.engines.mlx_engine import MLXEngine
 
     calls: list[str] = []
     calls_lock = threading.Lock()

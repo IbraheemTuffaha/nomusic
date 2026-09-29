@@ -8,8 +8,8 @@ their coverage is tracked rather than only reached transitively through server.
 
 from __future__ import annotations
 
-from routes import media, system
-from routes.media import _ExportProgress
+from nomusic.routes import media, system
+from nomusic.routes.media import _ExportProgress
 
 
 def test_export_progress_key_collapses_no_cap():

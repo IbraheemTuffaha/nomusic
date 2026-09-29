@@ -22,8 +22,8 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-from config import SETTINGS
-from engines.base import DEMUCS_STEMS
+from nomusic.config import SETTINGS
+from nomusic.engines.base import DEMUCS_STEMS
 
 from . import JsonDict
 

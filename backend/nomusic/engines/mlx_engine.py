@@ -15,6 +15,7 @@ loading torch, and lets us pin a concrete backend per checkout.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -206,22 +207,45 @@ class MLXEngine(Engine):
 
 
 def _pick_device() -> str:
-    """Return the best torch device available on the current host.
+    """Apply NOMUSIC_DEVICE, or choose the best available device for ``auto``.
 
     Priority: Apple MPS, then CUDA (NVIDIA), then CPU. A CUDA GPU is only chosen
     if this torch build actually ships kernels for its compute capability —
     otherwise inference crashes at launch ("no kernel image is available"), so
     we fall back to CPU instead.
     """
+    requested = os.environ.get("NOMUSIC_DEVICE", "auto").strip().lower()
+    if requested not in {"auto", "cpu", "mps", "cuda"}:
+        raise ValueError(
+            f"Invalid NOMUSIC_DEVICE={requested!r}; choose auto, cpu, mps, or cuda."
+        )
+    if requested == "cpu":
+        return "cpu"
+
     try:
         import torch
 
-        if torch.backends.mps.is_available():
+        if requested in {"auto", "mps"} and torch.backends.mps.is_available():
             return "mps"
-        if torch.cuda.is_available() and _cuda_is_usable(torch):
+        if (
+            requested in {"auto", "cuda"}
+            and torch.cuda.is_available()
+            and _cuda_is_usable(torch)
+        ):
             return "cuda"
-    except Exception:  # torch not installed yet
+    except Exception as exc:  # auto remains usable before torch is installed
+        if requested != "auto":
+            raise RuntimeError(
+                f"Cannot probe NOMUSIC_DEVICE={requested}: check your PyTorch "
+                "installation, or set NOMUSIC_DEVICE=cpu."
+            ) from exc
         log.debug("device probe failed; defaulting to CPU", exc_info=True)
+    if requested != "auto":
+        raise RuntimeError(
+            f"NOMUSIC_DEVICE={requested} is unavailable or unsupported by this "
+            "PyTorch build. Install the matching hardware/runtime profile, "
+            "or set NOMUSIC_DEVICE=cpu."
+        )
     return "cpu"
 
 
@@ -273,7 +297,7 @@ def _cuda_is_usable(torch: Any) -> bool:
     if reals or ptx:
         log.warning(
             "CUDA GPU (sm_%d%d) is not supported by this torch build "
-            "(arch list: %s) — falling back to CPU. Install a torch build that "
+            "(arch list: %s). Install a torch build that "
             "targets your GPU to use it.",
             major, minor, ", ".join(archs),
         )
@@ -287,9 +311,9 @@ class _ModelBundle:
     cheap to swap."""
 
     def __init__(self, model_name: str, device: str) -> None:
-        from demucs.pretrained import get_model
+        from .model_store import load_model
 
-        self.model = get_model(model_name)
+        self.model = load_model(model_name)
         self.model.to(device)
         self.model.eval()
         self.device = device

@@ -21,9 +21,9 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from pipeline import downloader
-from pipeline.cache import CHUNK_MEDIA_TYPE
-from pipeline.export import (
+from nomusic.pipeline import downloader
+from nomusic.pipeline.cache import CHUNK_MEDIA_TYPE
+from nomusic.pipeline.export import (
     MP4_COPYABLE_VCODECS,
     mp3_transcode_cmd,
     mux_video_cmd,

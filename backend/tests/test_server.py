@@ -13,9 +13,9 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-import server
-from engines.base import Engine, EngineCapabilities, SeparationResult
-from routes.jobs import ProcessRequest
+from nomusic import server
+from nomusic.engines.base import Engine, EngineCapabilities, SeparationResult
+from nomusic.routes.jobs import ProcessRequest
 
 
 class _CapsOnlyEngine(Engine):
@@ -237,8 +237,8 @@ def _seed_complete_job(client) -> str:
     """Write a complete cache entry (meta + one chunk) the way the processor
     would, and return its job_id. Lets the HTTP happy path run with no network
     or engine work."""
-    from config import SETTINGS
-    from pipeline.cache import CacheMeta
+    from nomusic.config import SETTINGS
+    from nomusic.pipeline.cache import CacheMeta
 
     cache = client.app.state.cache
     job_id = cache.key(
