@@ -185,6 +185,9 @@ def _fake_fetcher_class(source_tone: Path, duration: float = 10.0):
                 progress_hook({"status": "finished", "downloaded_bytes": 1, "total_bytes": 1})
             return dst
 
+        def close(self):
+            pass
+
     return _FakeFetcher
 
 
@@ -198,7 +201,7 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
 
     from nomusic.pipeline import processor as proc
 
-    def fake_slice_source(src, out_path, *, start, end):
+    def fake_slice_source(src, out_path, *, start, end, pass_fds=()):
         audio, sr = sf.read(str(src), always_2d=True, dtype="float32")
         slice_audio = audio[int(start * sr) : int(end * sr)]
         sf.write(str(out_path), slice_audio, sr, subtype="PCM_16", format="WAV")
@@ -297,7 +300,7 @@ def test_processor_progressive_produces_correct_chunks(tmp_path, monkeypatch):
 
     from nomusic.pipeline import processor as proc
 
-    def fake_slice_source(src, out_path, *, start, end):
+    def fake_slice_source(src, out_path, *, start, end, pass_fds=()):
         audio, sr = sf.read(str(src), always_2d=True, dtype="float32")
         sf.write(str(out_path), audio[int(start * sr) : int(end * sr)], sr,
                  subtype="PCM_16", format="WAV")

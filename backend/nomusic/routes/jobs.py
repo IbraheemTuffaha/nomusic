@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from nomusic.config import SETTINGS
 from nomusic.engines.base import DEMUCS_STEMS
+from nomusic.jobs import RegistryClosed
 
 from . import JsonDict
 
@@ -159,6 +160,8 @@ def process(req: ProcessRequest, request: Request) -> JsonDict:
     keep_stems = list(req.keep_stems or SETTINGS.default_keep_stems)
     try:
         status = registry.submit(req.url, model=model, keep_stems=keep_stems)
+    except RegistryClosed as exc:
+        raise HTTPException(status_code=503, detail="server shutting down") from exc
     except Exception as exc:
         log.exception("submit failed")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -212,13 +215,18 @@ async def events(job_id: str, request: Request) -> Response:
         payload = json.dumps(initial.to_dict())
 
         async def one_shot():
+            if request.app.state.services.stopping:
+                return
             yield f"data: {payload}\n\n"
 
         return StreamingResponse(
             one_shot(), media_type="text/event-stream", headers=_SSE_HEADERS
         )
 
-    queue = registry.subscribe(job_id)
+    try:
+        queue = registry.subscribe(job_id)
+    except RegistryClosed as exc:
+        raise HTTPException(status_code=503, detail="server shutting down") from exc
 
     async def stream() -> AsyncIterator[str]:
         try:
@@ -226,10 +234,14 @@ async def events(job_id: str, request: Request) -> Response:
             # without waiting for the next change. Re-read after subscribe
             # to close the gap where the job finished mid-handshake.
             cur = registry.get(job_id)
-            if cur is not None:
-                yield f"data: {json.dumps(cur.to_dict())}\n\n"
-                if cur.state.value in ("ready", "error"):
-                    return
+            if cur is None or request.app.state.services.stopping:
+                return
+            snapshot = cur.to_dict()
+            if request.app.state.services.stopping:
+                return
+            yield f"data: {json.dumps(snapshot)}\n\n"
+            if snapshot["state"] in ("ready", "error"):
+                return
             # Poll for disconnect every _SSE_DISCONNECT_POLL_SECONDS but
             # only emit a keep-alive comment every sse_keepalive_seconds, so
             # a paused/closed client is noticed promptly (starting the idle
@@ -242,6 +254,11 @@ async def events(job_id: str, request: Request) -> Response:
             )
             idle_polls = 0
             while True:
+                # A stream can outlive its job's subscriber bookkeeping.
+                # Observe the lifecycle independently so it still closes on
+                # shutdown, even if no queue notification can reach it.
+                if request.app.state.services.stopping:
+                    return
                 if await request.is_disconnected():
                     return
                 try:
@@ -249,11 +266,17 @@ async def events(job_id: str, request: Request) -> Response:
                         queue.get(), timeout=_SSE_DISCONNECT_POLL_SECONDS
                     )
                 except asyncio.TimeoutError:
+                    if request.app.state.services.stopping:
+                        return
                     idle_polls += 1
                     if idle_polls >= polls_per_keepalive:
                         idle_polls = 0
                         yield ":\n\n"  # keep-alive comment; ignored by EventSource
                     continue
+                # Shutdown can begin while queue.get() is suspended, including
+                # after a terminal error/ready snapshot was already queued.
+                if request.app.state.services.stopping:
+                    return
                 idle_polls = 0
                 yield f"data: {json.dumps(update)}\n\n"
                 if update.get("state") in ("ready", "error"):
