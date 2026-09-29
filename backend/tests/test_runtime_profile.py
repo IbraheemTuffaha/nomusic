@@ -123,7 +123,8 @@ def test_fetch_uses_immutable_revision_for_every_file_without_loading_models(hub
     assert model_store.fetch_model_files(hub.name) == hub.paths
     assert hub.loaded == []
     assert hub.calls == [
-        {"repo_id": hub.release.repo_id, "filename": filename, "revision": hub.release.revision}
+        {"repo_id": hub.release.repo_id, "filename": filename, "revision": hub.release.revision,
+         "local_files_only": False}
         for filename in hub.paths
     ]
 
@@ -132,6 +133,11 @@ def test_loaded_bag_preserves_member_order_and_stem_weights(hub):
     model = model_store.load_model(hub.name)
     assert model == (hub.signatures, hub.bag["weights"], hub.bag["segment"])
     assert hub.loaded == [f"{sig}.safetensors" for sig in hub.signatures]
+
+
+def test_offline_loading_keeps_all_hub_requests_local(hub):
+    model_store.load_model(hub.name, local_files_only=True)
+    assert hub.calls and all(call["local_files_only"] for call in hub.calls)
 
 
 @pytest.mark.parametrize("name", ["other/htdemucs", "../htdemucs", "mdx_extra", ""])

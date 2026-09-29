@@ -4,6 +4,7 @@ Construction is inert. Shutdown signals cooperative work and joins it before
 releasing services. The CLI may discard daemon model preload at process exit;
 its adapter bounds the total drain and provides an emergency process exit.
 Embedded lifespans still own all their threads through normal cleanup.
+Readiness records default model startup; doctor separately verifies inference.
 """
 
 from __future__ import annotations
@@ -14,10 +15,12 @@ import threading
 from collections.abc import Callable
 
 from nomusic.config import Settings
+from nomusic.diagnostics import check_working_storage
 from nomusic.engines.base import Engine
 from nomusic.jobs import JobRegistry
 from nomusic.pipeline.cache import JobCache
 from nomusic.pipeline.processor import Processor
+from nomusic.runtime import check_runtime
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +39,8 @@ class Services:
         # delay an otherwise drained server. Embedded lifespans still join it.
         self.wait_for_warmup = True
         self.discarded_preload: threading.Thread | None = None
+        self._readiness_lock = threading.Lock()
+        self._readiness: dict[str, object] = {"ok": False, "state": "starting"}
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """Called once inside lifespan, with shutdown guaranteed even on failure."""
@@ -102,13 +107,39 @@ class Services:
         engine = self.engine
         if self._stop.is_set() or engine is None:
             return
-        try:
-            engine.warmup()
-            log.info("Engine warmup complete")
-        except Exception:
-            # Preserve lazy retry on first processing request. Readiness and
-            # initialization diagnostics are separate from thread ownership.
-            log.exception("Engine warmup failed; will load lazily on first job")
+        for name, action in (
+            ("runtime", check_runtime),
+            ("storage", lambda: check_working_storage(self.settings)),
+            ("model", engine.warmup),
+        ):
+            if self._stop.is_set():
+                return
+            self._set_readiness({"ok": False, "state": "warming", "check": name})
+            try:
+                action()
+            except Exception:
+                # Details stay in local logs/doctor, never in an HTTP probe.
+                # Preserve lazy model retry, but startup readiness is sticky
+                # after failure: fix the cause and restart to rerun all checks.
+                log.exception("Startup %s check failed; fix the cause and restart (see nomusic doctor)", name)
+                self._set_readiness({
+                    "ok": False, "state": "failed", "check": name,
+                    "message": "Run nomusic doctor and inspect server logs; fix the cause and restart.",
+                })
+                return
+        self._set_readiness({"ok": True, "state": "ready"})
+        if not self._stop.is_set():
+            log.info("Engine warmup complete; local startup checks passed")
+
+    def _set_readiness(self, state: dict[str, object]) -> None:
+        with self._readiness_lock:
+            if not self._stop.is_set():
+                self._readiness = state
+
+    def readiness(self) -> dict[str, object]:
+        """A cheap snapshot; never performs I/O, model loading or inference."""
+        with self._readiness_lock:
+            return dict(self._readiness)
 
     @property
     def stopping(self) -> bool:
@@ -117,7 +148,9 @@ class Services:
     def begin_shutdown(self) -> None:
         """Stop admission/maintenance and close status streams before HTTP drain."""
         self.shutdown_requested = True
-        self._stop.set()
+        with self._readiness_lock:
+            self._stop.set()
+            self._readiness = {"ok": False, "state": "stopping"}
         if self.registry is not None:
             self.registry.begin_shutdown()
 

@@ -41,6 +41,7 @@ class _CapsOnlyEngine(Engine):
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
+    monkeypatch.setattr("nomusic.services.check_runtime", lambda: {})
     monkeypatch.setattr(server, "get_engine", lambda name: _CapsOnlyEngine())
     monkeypatch.setattr(server, "SETTINGS", replace(server.SETTINGS, cache_dir=tmp_path))
     app = server.create_app()

@@ -19,6 +19,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -56,6 +57,7 @@ class MLXEngine(Engine):
     def __init__(
         self,
         separator_factory: Callable[[str, str], Any] | None = None,
+        *, local_files_only: bool = False,
     ) -> None:
         # Cached separator keyed by model name; demucs loads weights lazily and
         # we only want to pay that cost once per process.
@@ -67,7 +69,7 @@ class MLXEngine(Engine):
         # or a low-VRAM GPU. The per-job GPU lock doesn't cover this: warmup runs
         # outside it.
         self._load_lock = threading.Lock()
-        self._factory = separator_factory or _make_separator
+        self._factory = separator_factory or partial(_make_separator, local_files_only=local_files_only)
         self._device = _pick_device()
 
     def capabilities(self) -> EngineCapabilities:
@@ -310,14 +312,14 @@ class _ModelBundle:
     so the cache key in ``MLXEngine._separators`` is a single object that's
     cheap to swap."""
 
-    def __init__(self, model_name: str, device: str) -> None:
+    def __init__(self, model_name: str, device: str, *, local_files_only: bool = False) -> None:
         from .model_store import load_model
 
-        self.model = load_model(model_name)
+        self.model = load_model(model_name, local_files_only=local_files_only)
         self.model.to(device)
         self.model.eval()
         self.device = device
 
 
-def _make_separator(model_name: str, device: str) -> Any:
-    return _ModelBundle(model_name, device)
+def _make_separator(model_name: str, device: str, *, local_files_only: bool = False) -> Any:
+    return _ModelBundle(model_name, device, local_files_only=local_files_only)
