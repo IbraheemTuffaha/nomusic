@@ -45,6 +45,14 @@ def test_reload_rejects_app_object():
         serve(object(), host="127.0.0.1", port=0, reload=True)
 
 
+def test_shutdown_grace_defaults_to_sixty_seconds_and_can_be_overridden(monkeypatch):
+    from nomusic.config import Settings
+    monkeypatch.delenv("NOMUSIC_SHUTDOWN_GRACE_SECONDS", raising=False)
+    assert Settings().shutdown_grace_seconds == 60
+    monkeypatch.setenv("NOMUSIC_SHUTDOWN_GRACE_SECONDS", "12.5")
+    assert Settings().shutdown_grace_seconds == 12.5
+
+
 _APP = '''\
 import asyncio
 import json
@@ -230,6 +238,30 @@ def test_reload_stops_old_child_before_starting_new_owner(tmp_path):
         assert _pid(base) is None
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Supported server profiles use POSIX signals")
+def test_reload_group_sigterm_announces_stop_once_while_draining(tmp_path):
+    with _running_server(tmp_path, reload=True) as (proc, base):
+        child = _wait_for(lambda: _pid(base))
+        assert child != proc.pid
+        with ThreadPoolExecutor(1) as pool:
+            export = pool.submit(httpx.get, f"{base}/export", timeout=15)
+            _wait_for(lambda: any(e["event"] == "export-start" for e in _events(tmp_path)))
+
+            # Both processes receive this signal. The real Uvicorn reloader
+            # forwards another SIGTERM to its child while joining it.
+            os.killpg(proc.pid, signal.SIGTERM)
+            _wait_for(lambda: any(e["event"] == "stopping" for e in _events(tmp_path)))
+            assert proc.poll() is None
+            assert not export.done()
+            (tmp_path / "release-export").touch()
+            assert export.result(timeout=5).json() == {"complete": True}
+        assert proc.wait(timeout=10) == 0
+        assert _pid(base) is None
+    text = (tmp_path / "server.log").read_text()
+    assert text.count("Stopping: finishing active processing/requests") == 1
+    assert "Forced shutdown" not in text
+
+
 def test_failed_startup_exits_nonzero(tmp_path):
     with _running_server(tmp_path, fail_startup=True) as (proc, base):
         assert proc.wait(timeout=10) == 3
@@ -297,11 +329,14 @@ def export():
 
 
 @contextmanager
-def _work_server(root, *, mode="none", grace=30):
+def _work_server(root, *, mode="none", grace=None):
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(sys.modules[__name__], "_APP", _WORK_APP)
         patch.setenv("FIXTURE_WORK", mode)
-        patch.setenv("NOMUSIC_SHUTDOWN_GRACE_SECONDS", str(grace))
+        if grace is None:
+            patch.delenv("NOMUSIC_SHUTDOWN_GRACE_SECONDS", raising=False)
+        else:
+            patch.setenv("NOMUSIC_SHUTDOWN_GRACE_SECONDS", str(grace))
         with _running_server(root) as running:
             yield running
 

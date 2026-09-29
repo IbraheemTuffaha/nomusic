@@ -91,8 +91,13 @@ class LifecycleServer(uvicorn.Server):
         self._watchdog.start()
 
     def handle_exit(self, sig, frame):
-        if self._received_signal and sig == signal.SIGINT:
-            self._force_exit(repeated=True)
+        if self._received_signal:
+            if sig == signal.SIGINT:
+                self._force_exit(repeated=True)
+            # A process-group SIGTERM can reach both the reloader and its
+            # child, which the reloader then terminates again. Keep the first
+            # announcement and deadline; a repeated Ctrl+C still forces exit.
+            return
         self._received_signal = True
         services = getattr(getattr(self._application, "state", None), "services", None)
         if services is not None:

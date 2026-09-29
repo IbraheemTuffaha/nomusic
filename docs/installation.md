@@ -113,21 +113,25 @@ model loading, downloads or maintenance work. Restarting creates fresh
 in-memory services and preserves the on-disk caches.
 
 Control+C or SIGTERM first stops new job admission and closes progress
-streams. The server then lets active HTTP requests, including exports,
-finish. Lifespan shutdown joins job workers, their download/decode/write
-work, model warmup and maintenance threads before releasing the services.
-Wait for **Service shutdown complete** before treating the backend as stopped.
+streams quietly. Active processing and HTTP requests, including exports,
+have one total grace period of 60 seconds. Configure it with
+`NOMUSIC_SHUTDOWN_GRACE_SECONDS`. The first signal explains the wait;
+Control+C again exits immediately. A model preload alone is not awaited.
 
-This is cooperative shutdown: an active native inference call or network
-operation can delay it. There is no hard deadline or supervised termination
-of a stuck model worker yet. Warmup failure still permits lazy retry on the
-first processing request; `/healthz` and `check-runtime` remain separate from
-model readiness.
+Ordinary shutdown joins owned work before releasing services and logs
+**Service shutdown complete**. If work cannot finish within the grace period,
+the process exits with a **Forced shutdown** message and code 124; a second
+interrupt exits with code 130. Restart and retry unfinished work. On startup,
+cleanup removes abandoned nomusic scratch files whose leases are no longer
+held, while retaining complete cached media and shared model-download
+partials. Warmup failure still permits lazy retry on the first processing
+request; `/healthz` and `check-runtime` remain separate from model readiness.
 
 Use `nomusic serve`, `python -m nomusic serve`, or the compatibility launcher
-above. They use a small Uvicorn adapter to close progress streams before HTTP
-drain. A generic `uvicorn nomusic.server:app` command bypasses that step and
-can wait indefinitely for an open progress stream during shutdown.
+above. They use a small Uvicorn adapter for quiet progress-stream closure and
+bounded process shutdown. A generic `uvicorn nomusic.server:app` command
+bypasses these guarantees. Separate supervised model workers remain future
+work; this adapter exits the whole server if an in-process worker is stuck.
 
 ### Device selection
 
@@ -325,8 +329,8 @@ throughput or subjective listening benchmark.
 
 Keep installation checks, model fetching and CLI help independent of server
 startup. Keep thread cleanup with the service or processor that creates the
-work. Model-readiness diagnostics and hard termination of stuck workers remain
-separate work from the normal lifecycle.
+work. Model-readiness diagnostics and supervision of separate model worker
+processes remain separate work from this bounded server lifecycle.
 
 ### Useful configuration
 
@@ -334,6 +338,7 @@ separate work from the normal lifecycle.
 | --- | --- | --- |
 | `NOMUSIC_DEVICE` | `auto` | `auto`, `cpu`, `mps`, or `cuda` |
 | `NOMUSIC_HOST` / `NOMUSIC_PORT` | `127.0.0.1` / `8723` | API listener |
+| `NOMUSIC_SHUTDOWN_GRACE_SECONDS` | `60` | Total shutdown grace period for active processing and requests; a second Control+C forces exit |
 | `NOMUSIC_ENGINE` | `mlx` | Existing engine name; `demucs` is an alias for the same PyTorch implementation |
 | `NOMUSIC_CACHE_DIR` | `~/.cache/nomusic` | Processed-media cache |
 | `NOMUSIC_CACHE_TTL_DAYS` | `7` | Retention age; `0` disables the sweep's age limit |

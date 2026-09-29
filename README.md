@@ -66,10 +66,12 @@ backend/.venv/bin/nomusic serve
 ```
 
 Keep this Terminal window open while using nomusic. Press **Control + C** to
-stop it, and wait for shutdown to finish. It closes progress streams, lets
-active exports finish, and waits for processing and background work to stop.
-An active model operation or network request can delay shutdown. Next time,
-run the same command.
+stop it. Progress streams close quietly while active processing and requests
+drain for up to 60 seconds. Press **Control + C** again to force quit sooner.
+A model preload alone is not awaited. A forced exit interrupts unfinished
+work; restart and retry it. The next start removes abandoned nomusic scratch
+files while retaining complete cached media and resumable model downloads.
+Run the same command next time.
 
 The server listens at `http://127.0.0.1:8723`. A “Uvicorn running” message means
 the HTTP server is listening; the model can still be loading. The extension
