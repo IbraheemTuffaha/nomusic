@@ -148,3 +148,63 @@ def test_normal_cleanup_and_forced_timeout(ignore_term):
     finally:
         os.close(started_read)
         VERIFY["stop_owned"](process, grace=0.1)
+
+
+def test_timeout_stops_helper_before_browser_handoff_snapshot(tmp_path, monkeypatch):
+    launcher, ownership = VERIFY["browser_launcher"](tmp_path)
+    release = tmp_path / "launch-after-snapshot"
+    helper_ready = tmp_path / "helper-ready"
+    browser_ready = tmp_path / "browser-ready"
+    browser_pid_file = tmp_path / "browser-pid"
+    browser = tmp_path / "browser-process"
+    code = ("import os,time; from pathlib import Path; "
+            "Path(os.environ['TEST_BROWSER_RUNNING']).touch(); time.sleep(60)")
+    browser.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(code)} "$@"\n')
+    browser.chmod(0o700)
+    helper = subprocess.Popen([
+        "node", "--input-type=module", "-e",
+        "import {spawn} from 'node:child_process'; import fs from 'node:fs';"
+        "process.on('SIGTERM',()=>{});"
+        "fs.writeFileSync(process.env.TEST_HELPER_READY,'ready');"
+        "while(!fs.existsSync(process.env.TEST_RELEASE)) await new Promise(r=>setTimeout(r,10));"
+        "const child=spawn(process.env.NOMUSIC_VERIFY_BROWSER_LAUNCHER,"
+        " ['--user-data-dir='+process.env.TEST_PROFILE], {detached:true,stdio:'ignore',"
+        " env:{...process.env,NOMUSIC_VERIFY_BROWSER_HELPER:String(process.pid)}});"
+        "while(!fs.existsSync(process.env.TEST_BROWSER_RUNNING)) await new Promise(r=>setTimeout(r,10));"
+        "fs.writeFileSync(process.env.TEST_BROWSER_PID,String(child.pid));"
+        "setInterval(()=>{},1000);",
+    ], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+       env={**os.environ, "NOMUSIC_VERIFY_BROWSER_LAUNCHER": str(launcher),
+            "NOMUSIC_VERIFY_BROWSER_OWNERSHIP": str(ownership),
+            "NOMUSIC_VERIFY_CHROMIUM": str(browser),
+            "TEST_PROFILE": str(tmp_path / "browser/profile"),
+            "TEST_HELPER_READY": str(helper_ready), "TEST_RELEASE": str(release),
+            "TEST_BROWSER_RUNNING": str(browser_ready), "TEST_BROWSER_PID": str(browser_pid_file)})
+    original_scan = VERIFY["browser_groups"]
+
+    def scan_then_allow_launch(process, directory):
+        snapshot = original_scan(process, directory)
+        if process.poll() is None:
+            # Expose the former race: the ownership snapshot is already taken,
+            # but a helper that ignored SIGTERM can still launch a browser.
+            release.touch()
+            wait_for(browser_pid_file.exists)
+        return snapshot
+
+    monkeypatch.setitem(VERIFY["stop_owned"].__globals__, "browser_groups", scan_then_allow_launch)
+    try:
+        wait_for(helper_ready.exists)
+        assert not VERIFY["stop_owned"](helper, grace=0.1, browser_ownership=ownership)
+        assert helper.returncode == -signal.SIGKILL
+        assert not browser_pid_file.exists()  # helper was dead before the scan
+    finally:
+        try:
+            os.killpg(helper.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        helper.wait(timeout=5)
+        for group in original_scan(helper, ownership):
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass

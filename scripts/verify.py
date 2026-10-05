@@ -76,15 +76,19 @@ def stop_owned(process: subprocess.Popen, grace: float = 10,
         process.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         graceful = False
-    groups = {process.pid}
-    if browser_ownership is not None:
-        groups.update(browser_groups(process, browser_ownership))
-    for group in groups:
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    # Finish stopping the helper before taking its launch handoffs. Otherwise
+    # a timed-out helper can start a detached browser just after the scan.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
     process.wait(timeout=10)
+    if browser_ownership is not None:
+        for group in browser_groups(process, browser_ownership):
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     return graceful
 
 
