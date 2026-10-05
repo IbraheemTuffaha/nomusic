@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import shlex
 import signal
 import socket
 import subprocess
@@ -34,24 +35,38 @@ def announce(message: str) -> None:
     print(message, flush=True)
 
 
-def stop_owned(process: subprocess.Popen, grace: float = 10) -> bool:
-    """Reap our process and descendants, even if the group leader exited first.
+def browser_groups(process: subprocess.Popen, ownership: Path) -> set[int]:
+    """Read launch-time handoffs, never rediscover browsers by name/ancestry."""
+    groups = set()
+    profile = str(ownership.parent / "browser/profile")
+    for manifest in ownership.glob("*.json"):
+        record = json.loads(manifest.read_text())
+        pid = record.get("pid")
+        if (record.get("helper_pid") != process.pid or record.get("profile") != profile
+                or not isinstance(pid, int) or pid <= 1):
+            continue
+        try:
+            if os.getpgid(pid) != pid:
+                continue
+            # A reused PID must not turn an old handoff into permission to kill
+            # another process. The live leader must still use our fresh profile.
+            command = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "args="],
+                                     capture_output=True, text=True, timeout=5)
+            if command.returncode == 0 and f"--user-data-dir={profile}" not in command.stdout:
+                continue
+        except ProcessLookupError:
+            pass  # The browser leader exited; its session may retain children.
+        groups.add(pid)
+    return groups
+
+
+def stop_owned(process: subprocess.Popen, grace: float = 10,
+               browser_ownership: Path | None = None) -> bool:
+    """Reap our session and explicitly handed-off browser sessions.
 
     Returns False if the leader needed SIGKILL. All callers create a new session;
     an unknown service or a process found by name is never a cleanup target.
     """
-    # Playwright launches Chromium in a separate session. Capture descendant
-    # groups while Node is alive; killing only Node's group would miss a hung
-    # browser. Only groups led by this child or one of its descendants qualify.
-    groups = {process.pid}
-    if process.poll() is None:
-        rows = [tuple(map(int, line.split())) for line in subprocess.check_output(
-            ["ps", "-eo", "pid=,ppid=,pgid="], text=True, timeout=5,
-        ).splitlines()]
-        owned = {process.pid}
-        while children := {pid for pid, parent, _ in rows if parent in owned} - owned:
-            owned.update(children)
-        groups.update(group for pid, _, group in rows if pid in owned and group in owned)
     graceful = True
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -61,6 +76,9 @@ def stop_owned(process: subprocess.Popen, grace: float = 10) -> bool:
         process.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         graceful = False
+    groups = {process.pid}
+    if browser_ownership is not None:
+        groups.update(browser_groups(process, browser_ownership))
     for group in groups:
         try:
             os.killpg(group, signal.SIGKILL)
@@ -70,10 +88,27 @@ def stop_owned(process: subprocess.Popen, grace: float = 10) -> bool:
     return graceful
 
 
+def browser_launcher(run: Path) -> tuple[Path, Path]:
+    """Create a private executable and handoff directory for this one helper."""
+    ownership = run / "browser-ownership"
+    ownership.mkdir(mode=0o700)
+    launcher = ownership / "launch"
+    source = E2E / "browser-launcher.py"
+    launcher.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " "
+                        + shlex.quote(str(source)) + ' "$@"\n')
+    launcher.chmod(0o700)
+    return launcher, ownership
+
+
 def run_step(name: str, command: list[str], run: Path, env: dict[str, str],
-             timeout: float = 600) -> None:
+             timeout: float = 600, *, owns_browser: bool = False) -> None:
     announce(f"Running {name}...")
     log = run / f"{name}.log"
+    ownership = None
+    if owns_browser:
+        launcher, ownership = browser_launcher(run)
+        env = {**env, "NOMUSIC_VERIFY_BROWSER_LAUNCHER": str(launcher),
+               "NOMUSIC_VERIFY_BROWSER_OWNERSHIP": str(ownership)}
     with log.open("w") as output:
         process = subprocess.Popen(command, cwd=REPO, env=env, stdout=output,
                                    stderr=subprocess.STDOUT, start_new_session=True)
@@ -84,7 +119,7 @@ def run_step(name: str, command: list[str], run: Path, env: dict[str, str],
         except subprocess.TimeoutExpired as error:
             raise RuntimeError(f"{name} exceeded {timeout}s; see {log}") from error
         finally:
-            stop_owned(process)
+            stop_owned(process, browser_ownership=ownership)
     announce(f"Passed {name}")
 
 
@@ -200,7 +235,7 @@ def smoke(run: Path, env: dict[str, str], port: int, timeout: float) -> dict:
             announce("Test backend and CPU model ready")
             run_step("browser", ["node", str(E2E / "browser.mjs"), "--backend", base,
                                  "--fixture", str(fixture), "--output", str(run / "browser"),
-                                 "--timeout-seconds", str(timeout)], run, env, timeout + 30)
+                                 "--timeout-seconds", str(timeout)], run, env, timeout + 30, owns_browser=True)
         finally:
             announce("Stopping test-owned backend...")
             graceful = stop_owned(process, grace=120)

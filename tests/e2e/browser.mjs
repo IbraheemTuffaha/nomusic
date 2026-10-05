@@ -224,6 +224,11 @@ try {
   note("ready-cpu-backend", { readiness, device: capabilities.engine.device, boundary });
   server = await startFixtureServer(boundary);
   context = await chromium.launchPersistentContext(path.join(options.output, "profile"), {
+    ...(process.env.NOMUSIC_VERIFY_BROWSER_LAUNCHER ? {
+      executablePath: process.env.NOMUSIC_VERIFY_BROWSER_LAUNCHER,
+      env: { ...process.env, NOMUSIC_VERIFY_BROWSER_HELPER: String(process.pid),
+        NOMUSIC_VERIFY_CHROMIUM: chromium.executablePath() },
+    } : {}),
     channel: "chromium", headless: true, acceptDownloads: true, viewport: { width: 1280, height: 800 },
     args: ["--mute-audio", `--disable-extensions-except=${options.extension}`, `--load-extension=${options.extension}`],
   });
