@@ -98,7 +98,13 @@ def _configure_logging() -> None:
 async def lifespan(app: FastAPI):
     _configure_logging()
     _raise_open_file_limit()
-    services = Services(SETTINGS, engine_factory=get_engine)
+    # The CLI selects process ownership before startup, including bind failures
+    # that make Uvicorn enter lifespan shutdown without its normal drain hook.
+    prepare_shutdown = getattr(app.state, "prepare_process_shutdown", None)
+    services = Services(
+        SETTINGS, engine_factory=get_engine,
+        wait_for_warmup=prepare_shutdown is None,
+    )
     app.state.services = services
     try:
         services.start(asyncio.get_running_loop())
@@ -108,6 +114,8 @@ async def lifespan(app: FastAPI):
         app.state.export_progress = _ExportProgress()
         yield
     finally:
+        if prepare_shutdown is not None:
+            prepare_shutdown(services)
         services.begin_shutdown()
         # Joining synchronously here would block final worker-to-SSE callbacks.
         await asyncio.to_thread(services.shutdown)

@@ -148,11 +148,12 @@ def _pid(base):
 
 
 @contextmanager
-def _running_server(root, *, reload=False, fail_startup=False):
+def _running_server(root, *, reload=False, fail_startup=False, port=None):
     (root / "fixture_app.py").write_text(_APP)
-    with socket.socket() as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
+    if port is None:
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
     runner = root / "runner.py"
     runner.write_text(
         "from nomusic.serving import serve\n"
@@ -487,3 +488,76 @@ def test_closed_stderr_cannot_prevent_interrupt_or_forced_exit(monkeypatch):
     with pytest.raises(SystemExit) as deadline:
         server._force_exit()
     assert deadline.value.code == 124
+
+
+@pytest.mark.parametrize("mode", ["warmup", "warmup-executor"])
+def test_bind_failure_discards_active_preload_and_preserves_failure_status(tmp_path, monkeypatch, mode):
+    # Select the real startup race where preload is underway when socket binding
+    # fails. Uvicorn calls lifespan.shutdown directly on this path.
+    app = _WORK_APP + '''
+import asyncio
+from contextlib import asynccontextmanager
+
+original_lifespan = app.router.lifespan_context
+@asynccontextmanager
+async def wait_for_preload(app):
+    async with original_lifespan(app):
+        while not (ROOT / "work-events").exists():
+            await asyncio.sleep(0.01)
+        yield
+app.router.lifespan_context = wait_for_preload
+'''
+    monkeypatch.setattr(sys.modules[__name__], "_APP", app)
+    monkeypatch.setenv("FIXTURE_WORK", mode)
+    monkeypatch.setenv("NOMUSIC_SHUTDOWN_GRACE_SECONDS", "3")
+    completed = tmp_path / "cache" / "completed" / "chunk_000.opus"
+    completed.parent.mkdir(parents=True)
+    completed.write_bytes(b"published audio")
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        with _running_server(tmp_path, port=occupied.getsockname()[1]) as (proc, _):
+            _wait_for(lambda: _work_started(tmp_path, "warmup"))
+            started = time.monotonic()
+            assert proc.wait(timeout=3) == 3
+            assert time.monotonic() - started < 2
+    text = (tmp_path / "server.log").read_text()
+    assert "address already in use" in text.lower()
+    assert "Service shutdown complete" in text
+    assert "Model preload interrupted" in text
+    assert "Forced shutdown" not in text
+    assert "warmup-end" not in (tmp_path / "work-events").read_text()
+    assert completed.read_bytes() == b"published audio"
+
+
+@pytest.mark.parametrize("error, expected", [
+    (SystemExit(3), 3),
+    (SystemExit("startup failed"), 1),
+    (RuntimeError("startup failed"), 1),
+])
+def test_exception_exit_disposes_preload_without_changing_failure_status(monkeypatch, error, expected):
+    server = LifecycleServer(uvicorn.Config(object()))
+    server._shutdown_services = SimpleNamespace(
+        discarded_preload=SimpleNamespace(is_alive=lambda: True),
+    )
+    cancelled = []
+    server._watchdog = SimpleNamespace(cancel=lambda: cancelled.append(True))
+    original_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+
+    def failed_run(self, sockets=None):
+        raise error
+
+    class ProcessExit(BaseException):
+        pass
+
+    def exit_process(code):
+        raise ProcessExit(code)
+
+    monkeypatch.setattr(uvicorn.Server, "run", failed_run)
+    monkeypatch.setattr("nomusic.serving.os._exit", exit_process)
+    with pytest.raises(ProcessExit) as stopped:
+        server.run()
+    assert stopped.value.args == (expected,)
+    assert cancelled == [True]
+    assert not server._running
+    assert {sig: signal.getsignal(sig) for sig in original_handlers} == original_handlers

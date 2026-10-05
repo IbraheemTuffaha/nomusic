@@ -23,7 +23,10 @@ log = logging.getLogger(__name__)
 
 
 class Services:
-    def __init__(self, settings: Settings, engine_factory: Callable[[str], Engine]) -> None:
+    def __init__(
+        self, settings: Settings, engine_factory: Callable[[str], Engine],
+        *, wait_for_warmup: bool = True,
+    ) -> None:
         self.settings = settings
         self._engine_factory = engine_factory
         self.engine: Engine | None = None
@@ -34,12 +37,12 @@ class Services:
         self._threads: list[threading.Thread] = []
         # The CLI owns process termination, so a daemon model preload need not
         # delay an otherwise drained server. Embedded lifespans still join it.
-        self.wait_for_warmup = True
+        self.wait_for_warmup = wait_for_warmup
         self.discarded_preload: threading.Thread | None = None
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """Called once inside lifespan, with shutdown guaranteed even on failure."""
-        if self.engine is not None or self._stop.is_set():
+        if self.engine is not None or self.stopping:
             raise RuntimeError("Services instances cannot be restarted")
         settings = self.settings
         self.engine = self._engine_factory(settings.engine_name)
@@ -52,7 +55,10 @@ class Services:
             keep_source_after_complete=settings.keep_source_after_complete,
             progressive=settings.progressive_download,
         )
-        self.registry = JobRegistry(processor=processor, cache=self.cache)
+        self.registry = JobRegistry(
+            processor=processor, cache=self.cache,
+            is_stopping=lambda: self.shutdown_requested,
+        )
         self.registry.attach_loop(loop)
 
         if settings.cache_ttl_days > 0 and settings.cache_sweep_interval_seconds > 0:
@@ -78,7 +84,7 @@ class Services:
         # Event.wait wakes immediately on stop, even with hour-long intervals.
         if not immediate and self._stop.wait(interval):
             return
-        while not self._stop.is_set():
+        while not self.stopping:
             try:
                 action()
             except Exception:
@@ -100,7 +106,7 @@ class Services:
 
     def _warmup(self) -> None:
         engine = self.engine
-        if self._stop.is_set() or engine is None:
+        if self.stopping or engine is None:
             return
         try:
             engine.warmup()

@@ -146,7 +146,10 @@ class _JobControl:
 
 
 class JobRegistry:
-    def __init__(self, processor: Processor, cache: JobCache) -> None:
+    def __init__(
+        self, processor: Processor, cache: JobCache,
+        *, is_stopping: Callable[[], bool] | None = None,
+    ) -> None:
         self.processor = processor
         self.cache = cache
         self._jobs: dict[str, JobStatus] = {}
@@ -157,6 +160,8 @@ class JobRegistry:
         # workers cannot remove themselves before they have actually exited.
         self._worker_threads: set[threading.Thread] = set()
         self._closed = False
+        # The service's plain signal flag is visible before lock-taking cleanup.
+        self._is_stopping = is_stopping or (lambda: False)
         # Per-job control for chunk ordering. Built lazily inside
         # ``_on_probed`` (once we know total_chunks) and discarded when the
         # worker finishes.
@@ -183,13 +188,17 @@ class JobRegistry:
         # One job runs at a time on the engine; further jobs block here.
         self._gpu_lock = threading.Lock()
 
+    @property
+    def stopping(self) -> bool:
+        return self._closed or self._is_stopping()
+
     # -- SSE subscription ----------------------------------------------------
 
     def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Capture the server's event loop so worker threads can schedule
         queue writes onto it. Called once from the FastAPI lifespan startup."""
         with self._lock:
-            if self._closed:
+            if self.stopping:
                 raise RegistryClosed("job registry is shutting down")
             self._loop = loop
 
@@ -241,7 +250,7 @@ class JobRegistry:
         the idle clock the instant their stream opens."""
         q: asyncio.Queue = asyncio.Queue()
         with self._lock:
-            if self._closed:
+            if self.stopping:
                 raise RegistryClosed("job registry is shutting down")
             self._subscribers.setdefault(key, []).append(q)
             self._last_disconnect_at.pop(key, None)
@@ -271,7 +280,7 @@ class JobRegistry:
         keep_stems: list[str],
     ) -> JobStatus:
         with self._lock:
-            if self._closed:
+            if self.stopping:
                 raise RegistryClosed("job registry is shutting down")
         # No probe here: the yt-dlp metadata call takes 3-6s on YouTube
         # because of the JS challenge, and blocking /process on it made the
@@ -288,7 +297,7 @@ class JobRegistry:
         existing_meta = self.cache.load_meta(key)
 
         with self._lock:
-            if self._closed:
+            if self.stopping:
                 raise RegistryClosed("job registry is shutting down")
             existing = self._jobs.get(key)
             if self._is_live_duplicate(existing, key):
@@ -717,7 +726,7 @@ class JobRegistry:
         provider and the progressive-download abort hook so a pause that lands
         mid-download still releases the GPU promptly."""
         with self._lock:
-            if self._closed or key in self._abandoning:
+            if self.stopping or key in self._abandoning:
                 raise WorkerAbandoned
             if idle_timeout <= 0:
                 return
@@ -771,7 +780,7 @@ class JobRegistry:
         snapshot: dict | None = None
         subs: list[asyncio.Queue] = []
         with self._lock:
-            if self._closed:
+            if self.stopping:
                 return
             status = self._jobs.get(key)
             if status is None:

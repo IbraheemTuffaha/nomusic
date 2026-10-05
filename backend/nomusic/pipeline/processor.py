@@ -515,6 +515,8 @@ class Processor:
         abort_check = hooks.abort_check
         on_wait_for_download = hooks.on_wait_for_download
 
+        if abort_check:
+            abort_check()
         key, meta, info, plans, fetcher = self.prepare_job(
             url, model=model, keep_stems=keep_stems
         )
@@ -524,6 +526,8 @@ class Processor:
             resources.callback(fetcher.close)
         if on_probed:
             on_probed(info, plans, meta)
+        if abort_check:
+            abort_check()
 
         if meta.complete:
             log.info("Cache hit for %s (%d chunks)", url, meta.total_chunks)
@@ -558,14 +562,30 @@ class Processor:
             source_for = lambda plan: dl.source_for(
                 plan, self.chunk_overlap_seconds, abort_check, on_wait_for_download
             )
-        elif fetcher is not None:
-            # First run: download from the session that already extracted info.
-            full = fetcher.download(progress_hook=_yt_hook)
-            source_for = lambda plan: full
         else:
-            # Resume: download the full source up front (cached source returns
-            # immediately); every chunk slices from it.
-            full = download_source(url, source_dir, progress_hook=_yt_hook)
+            def _sync_download_hook(d: dict) -> None:
+                # Cancellation must escape the UI hook's best-effort handler.
+                # SourceFetcher recognizes this exception and never retries it.
+                if abort_check:
+                    try:
+                        abort_check()
+                    except Exception as error:
+                        raise _DownloadCancelled() from error
+                _yt_hook(d)
+
+            try:
+                # Keep the first download in its extraction session; resumed
+                # work downloads directly or reuses an existing source file.
+                if fetcher is not None:
+                    full = fetcher.download(progress_hook=_sync_download_hook)
+                else:
+                    full = download_source(url, source_dir, progress_hook=_sync_download_hook)
+            except _DownloadCancelled:
+                # Restore the caller's control exception (WorkerAbandoned for
+                # jobs), keeping cancellation distinct from processing failure.
+                if abort_check:
+                    abort_check()
+                raise
             source_for = lambda plan: full
 
         plans_by_index = {p.index: p for p in plans}

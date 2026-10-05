@@ -50,7 +50,20 @@ class LifecycleServer(uvicorn.Server):
 
     async def startup(self, sockets=None):
         self._application = self.config.load_app()
-        await super().startup(sockets=sockets)
+        state = getattr(self._application, "state", None)
+        previous = getattr(state, "prepare_process_shutdown", None)
+        if state is not None:
+            state.prepare_process_shutdown = self._prepare_shutdown
+        try:
+            await super().startup(sockets=sockets)
+        finally:
+            # The lifespan captures the callback before creating its owner.
+            # Do not change subsequent embedded lifespans of this app object.
+            if state is not None:
+                if previous is None:
+                    del state.prepare_process_shutdown
+                else:
+                    state.prepare_process_shutdown = previous
 
     @staticmethod
     def _announce(message):
@@ -124,38 +137,51 @@ class LifecycleServer(uvicorn.Server):
             handlers = {sig: signal.signal(sig, self.handle_exit)
                         for sig in (signal.SIGINT, signal.SIGTERM)}
         self._running = True
+        exit_code = 1
         try:
             result = super().run(sockets=sockets)
-            preload = getattr(self._shutdown_services, "discarded_preload", None)
-            if preload is not None and preload.is_alive():
-                # Model download libraries can own ThreadPoolExecutors. Python
-                # joins even their daemon threads during interpreter teardown,
-                # after asyncio.run has returned. Application work is drained;
-                # dispose only this unfinished preload at the process boundary.
-                self._announce("Model preload interrupted; verified downloads can be reused on next start.\n")
-                os._exit(0)
+            exit_code = 0 if self.started else STARTUP_FAILURE
             return result
+        except SystemExit as error:
+            exit_code = (error.code if isinstance(error.code, int)
+                         else 0 if error.code is None else 1)
+            raise
+        except KeyboardInterrupt:
+            exit_code = 130
+            raise
         finally:
-            self._running = False
-            if self._watchdog is not None:
-                self._watchdog.cancel()
-            for sig, handler in handlers.items():
-                signal.signal(sig, handler)
+            try:
+                preload = getattr(self._shutdown_services, "discarded_preload", None)
+                if preload is not None and preload.is_alive():
+                    # Hub downloads can own executor threads that Python joins
+                    # after asyncio.run, including when startup raised SystemExit.
+                    # Preserve failure status while disposing only the preload.
+                    self._announce("Model preload interrupted; verified downloads can be reused on next start.\n")
+                    os._exit(exit_code)
+            finally:
+                self._running = False
+                if self._watchdog is not None:
+                    self._watchdog.cancel()
+                for sig, handler in handlers.items():
+                    signal.signal(sig, handler)
+
+    def _prepare_shutdown(self, services) -> None:
+        """Bound all process-owned teardown, including startup-error lifespans."""
+        self._start_watchdog()
+        self._shutdown_services = services
+        services.begin_shutdown()
+        registry = getattr(services, "registry", None)
+        if not (registry is not None and registry.has_active_workers) and not self.server_state.tasks:
+            # Preload alone is disposable; keep the same deadline if work was
+            # already draining, and never extend it between shutdown phases.
+            self._start_watchdog(min(1.0, self.grace_seconds))
 
     async def shutdown(self, sockets: list[socket] | None = None) -> None:
         self._start_watchdog()
         app = self.config.load_app()
         services = getattr(getattr(app, "state", None), "services", None)
         if services is not None:
-            self._shutdown_services = services
-            services.wait_for_warmup = False
-            services.begin_shutdown()
-            registry = getattr(services, "registry", None)
-            if not (registry is not None and registry.has_active_workers) and not self.server_state.tasks:
-                # Nothing worth draining: do not spend a processing grace period
-                # on a model download or library-finalization thread. Normally
-                # the daemon preload lets the process exit much sooner than this.
-                self._start_watchdog(min(1.0, self.grace_seconds))
+            self._prepare_shutdown(services)
         await super().shutdown(sockets=sockets)
 
 
