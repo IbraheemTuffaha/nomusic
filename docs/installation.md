@@ -376,8 +376,9 @@ The native Mac profile does not use a Linux CUDA package index.
 
 To switch back, stop the helper and run `./install.sh --profile cpu`.
 For editable CUDA development use `uv sync --locked --extra cu126` with the
-same `UV_PROJECT_ENVIRONMENT` and Python pin as above. Always select one extra
-when running uv directly; unqualified `uv sync` resolves the default upstream
-PyTorch build instead of choosing a nomusic accelerator profile.
+same `UV_PROJECT_ENVIRONMENT` and Python pin as above. Unqualified `uv sync`
+uses the CPU build on Linux, just like `--extra cpu`. Select `--extra cu126`
+explicitly for NVIDIA; the two extras remain mutually exclusive. macOS uses
+its native PyTorch wheel.
 
 See [uv's optional accelerator profiles](https://docs.astral.sh/uv/guides/integration/pytorch/#configuring-accelerators-with-optional-dependencies).
