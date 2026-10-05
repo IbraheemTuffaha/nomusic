@@ -74,7 +74,8 @@ def test_failed_initialization_is_actionable_but_http_does_not_leak_details(app,
         assert client.get("/healthz").status_code == 200
 
 
-def test_late_warmup_cannot_overwrite_stopping(app, monkeypatch):
+@pytest.mark.parametrize("signal_only", [False, True])
+def test_late_warmup_cannot_overwrite_stopping(app, monkeypatch, signal_only):
     entered, release = threading.Event(), threading.Event()
     class Engine:
         def warmup(self):
@@ -85,12 +86,48 @@ def test_late_warmup_cannot_overwrite_stopping(app, monkeypatch):
         try:
             assert entered.wait(2)
             owner = app.state.services
-            owner.begin_shutdown()
+            if signal_only:
+                owner.shutdown_requested = True
+            else:
+                owner.begin_shutdown()
+            assert client.get("/readyz").status_code == 503
+            assert owner.readiness() == {"ok": False, "state": "stopping"}
         finally:
             release.set()
         join_warmup(owner)
         assert client.get("/readyz").status_code == 503
         assert owner.readiness() == {"ok": False, "state": "stopping"}
+
+
+def test_signal_revokes_ready_before_async_shutdown(app, monkeypatch):
+    class Engine:
+        def warmup(self):
+            pass
+    monkeypatch.setattr(server, "get_engine", lambda name: Engine())
+    with TestClient(app) as client:
+        owner = app.state.services
+        join_warmup(owner)
+        assert client.get("/readyz").status_code == 200
+        owner.shutdown_requested = True
+        assert not owner._stop.is_set()
+        response = client.get("/readyz")
+        assert response.status_code == 503
+        assert response.json() == {"ok": False, "state": "stopping"}
+
+
+def test_signal_between_startup_checks_prevents_next_check(app, monkeypatch):
+    class Engine:
+        def warmup(self):
+            pytest.fail("model preload started after signal")
+    monkeypatch.setattr(server, "get_engine", lambda name: Engine())
+    def stop():
+        app.state.services.shutdown_requested = True
+    monkeypatch.setattr(services, "check_runtime", stop)
+    monkeypatch.setattr(services, "check_working_storage",
+                        lambda _: pytest.fail("storage check started after signal"))
+    with TestClient(app) as client:
+        join_warmup(app.state.services)
+        assert client.get("/readyz").json() == {"ok": False, "state": "stopping"}
 
 
 def test_new_lifespan_rechecks_a_previous_failure(app, monkeypatch):

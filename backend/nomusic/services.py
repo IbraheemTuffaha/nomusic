@@ -118,7 +118,7 @@ class Services:
             ("storage", lambda: check_working_storage(self.settings)),
             ("model", engine.warmup),
         ):
-            if self._stop.is_set():
+            if self.stopping:
                 return
             self._set_readiness({"ok": False, "state": "warming", "check": name})
             try:
@@ -134,17 +134,19 @@ class Services:
                 })
                 return
         self._set_readiness({"ok": True, "state": "ready"})
-        if not self._stop.is_set():
+        if not self.stopping:
             log.info("Engine warmup complete; local startup checks passed")
 
     def _set_readiness(self, state: dict[str, object]) -> None:
         with self._readiness_lock:
-            if not self._stop.is_set():
+            if not self.stopping:
                 self._readiness = state
 
     def readiness(self) -> dict[str, object]:
         """A cheap snapshot; never performs I/O, model loading or inference."""
         with self._readiness_lock:
+            if self.stopping:
+                return {"ok": False, "state": "stopping"}
             return dict(self._readiness)
 
     @property
