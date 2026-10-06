@@ -173,14 +173,25 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
   await freshAudio("cached long playback starts");
   const replayStart = await videoState();
   const replaySamples = [];
+  let previousStarts = (await audioState()).starts.length;
   await until("75 uninterrupted video seconds across retention windows", async () => {
     const state = await live();
+    const audio = await audioState();
     assertBounds(state);
     assert.equal(state.failed, false);
     assert.equal(state.paused, false, "Cached sustained playback must not pause for missing audio");
+    // The generated fixture's silent syllable gaps are shorter than this
+    // approximately one-second observation window. Reset after every sample:
+    // one early audible buffer cannot hide a silent later scheduler window.
+    assert.ok(audio.samples >= 4 && audio.maxRms > 1e-8,
+      `Fresh processed audio throughout cached playback at ${state.time}s`);
+    const starts = audio.starts.slice(previousStarts);
+    previousStarts = audio.starts.length;
     replaySamples.push({ time: state.time, pcmBytes: state.pcmBytes, decodedChunks: state.decodedChunks,
-      activeRequests: state.activeRequests, indices: state.indices });
+      activeRequests: state.activeRequests, indices: state.indices,
+      rms: audio.maxRms, audioSamples: audio.samples, sourceStarts: starts });
     if (state.time - replayStart.time >= 75) return true;
+    await isolated("__nomusicSmoke.maxRms=0;__nomusicSmoke.samples=0");
     await sleep(900);
     return false;
   }, 120000);
