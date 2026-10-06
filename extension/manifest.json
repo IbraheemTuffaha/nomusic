@@ -49,6 +49,7 @@
         "main.js",
         "settings.js",
         "session.js",
+        "chunk-loader.js",
         "button.js",
         "mute-controller.js",
         "audio-scheduler.js",

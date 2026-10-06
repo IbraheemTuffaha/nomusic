@@ -29,7 +29,7 @@ export class AudioScheduler {
     this._anchorVideo = null;
     this.stretcher = null;
     this.stretchCache = new Map();
-    this._stretchInflight = new Set();
+    this._stretchInflight = new Map();
     this._stretchDisabled = false;
     this.syncTimer = null;
     this.disposed = false;
@@ -96,7 +96,7 @@ export class AudioScheduler {
   }
 
   scheduleChunk(idx, entry) {
-    if (this.disposed || !this.audioCtx) return;
+    if (this.disposed || !this.audioCtx || this.video.paused || this.video.seeking) return;
     // Already playing/scheduled this chunk? Don't stack a second copy. Stale
     // sources are cleared by stopAll() (on every seek/pause/rate change), so a
     // present entry here is always the correct, current one.
@@ -117,6 +117,10 @@ export class AudioScheduler {
         ? this._getStride()
         : origDuration;
     const chunkEnd = chunkStart + exclusiveSpan;
+    // Direct arrivals, reschedules and stretch completions share one window,
+    // checked before allocating a stretched buffer or source.
+    const time = this.video.currentTime;
+    if (chunkStart > time + 30 || chunkEnd <= time) return;
 
     // Pick the buffer + source rate:
     //  * rate == 1: original buffer at srcRate 1.
@@ -233,8 +237,11 @@ export class AudioScheduler {
     const cached = this.stretchCache.get(key);
     if (cached) return cached;
     if (this._stretchInflight.has(key)) return null;
-    this._stretchInflight.add(key);
+    const request = { entry };
+    this._stretchInflight.set(key, request);
     const generation = this._generation;
+    const isCurrent = () => !this.disposed && generation === this._generation &&
+      this._stretchInflight.get(key) === request && this.chunks.get(idx) === entry;
 
     const srcBuf = entry.buffer;
     const sr = srcBuf.sampleRate;
@@ -280,7 +287,7 @@ export class AudioScheduler {
     this.stretcher
       .stretch(channels, rate, sr)
       .then(({ channels: out }) => {
-        if (this.disposed || generation !== this._generation) return;
+        if (!isCurrent()) return;
         this._stretchInflight.delete(key);
         // Drop the stretched lead-in / lead-out pads; keep just this chunk's
         // span (~chunkFrames/rate), which now has warmed-up, continuous edges.
@@ -304,7 +311,7 @@ export class AudioScheduler {
         }
       })
       .catch((err) => {
-        if (this.disposed || generation !== this._generation) return;
+        if (!isCurrent()) return;
         this._stretchInflight.delete(key);
         // One failure → stop trying; fall back to resample for this session.
         this._stretchDisabled = true;
@@ -339,17 +346,13 @@ export class AudioScheduler {
   reschedule() {
     if (this.disposed) return;
     this.stopAll();
+    this.pruneBuffers();
     if (this.video.paused) return;
     // AudioContext starts suspended in some browsers; resume to be safe.
     if (this.audioCtx?.state === "suspended") {
       this.audioCtx.resume();
     }
     for (const [idx, entry] of this.chunks) {
-      const t = this.video.currentTime;
-      if (entry.playStart + entry.buffer.duration <= t) continue;
-      // Schedule chunks within a 30 s look-ahead window; later chunks get
-      // scheduled when the look-ahead catches up to them.
-      if (entry.playStart - t > 30) continue;
       this.scheduleChunk(idx, entry);
     }
   }
@@ -370,6 +373,25 @@ export class AudioScheduler {
     // Drop the clock anchor so the next playback run re-captures it at the
     // current position (post seek/pause/rate change).
     this._anchorAudio = null;
+  }
+
+  /** Retain only the decoded window and the current playback rate. Evicted
+   *  preparations lose their identity so late results cannot refill it. */
+  pruneBuffers() {
+    const rate = this.video.playbackRate || 1;
+    for (const cache of [this.stretchCache, this._stretchInflight]) {
+      for (const key of cache.keys()) {
+        const [idx, preparedRate] = key.split("@").map(Number);
+        if (!this.chunks.has(idx) || preparedRate !== rate) cache.delete(key);
+      }
+    }
+    for (const src of this.activeSources) {
+      if (this.chunks.has(src._nomusicIdx)) continue;
+      src._nomusicStopped = true;
+      src.stop();
+      this.activeSources.delete(src);
+      this._srcByIdx.delete(src._nomusicIdx);
+    }
   }
 
   /** Forget one artifact without replacing the audio graph or volume intent. */

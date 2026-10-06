@@ -46,8 +46,9 @@ function withBridge(bridgeUrl, fn) {
 
 function makeSession() {
   const s = new Session(
-    { paused: true, currentTime: 0, removeEventListener() {} },
-    { showStatus() {}, dispose() {} },
+    { paused: true, currentTime: 0, playbackRate: 1, removeEventListener() {},
+      pause() { this.paused = true; } },
+    { showStatus() {}, setError() {}, dispose() {} },
   );
   // Mirror the backend defaults the session starts with (config.py).
   s.chunkSeconds = 10;
@@ -60,6 +61,8 @@ function deferred() {
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
+
+const settle = () => new Promise(setImmediate);
 
 function attachScheduler(s, decode = async (buffer) => buffer) {
   s.scheduler = new AudioScheduler(s.video, {
@@ -121,7 +124,7 @@ test("requestJob posts the captured sourceUrl, not the live page URL", async () 
 test("_resumeProcessing adopts a changed job_id and refetches chunks", async () => {
   const s = makeSession();
   s.jobId = "OLD";
-  s.fetchedIdx = new Set([0, 1, 2]);
+  s.loader.available = new Set([0, 1, 2]);
   s.chunks.set(0, { buffer: { label: "OLD" }, playStart: 0 });
   const scheduler = attachScheduler(s);
   scheduler.stretchCache.set("0@2", { label: "OLD stretched" });
@@ -146,7 +149,7 @@ test("_resumeProcessing adopts a changed job_id and refetches chunks", async () 
 
   assert.equal(s.jobId, "NEW");
   assert.equal(closed, true); // old stream closed
-  assert.equal(s.fetchedIdx.size, 0); // dedup cleared so chunks refetch
+  assert.equal(s.loader.available.size, 0); // old artifact readiness is invalid
   assert.equal(s.totalChunks, 5);
   assert.equal(opened, 1); // stream reopened on the new id
   assert.equal(s.chunks.size, 0);
@@ -158,7 +161,7 @@ test("_resumeProcessing adopts a changed job_id and refetches chunks", async () 
 test("_resumeProcessing keeps the same job_id when the url is unchanged", async () => {
   const s = makeSession();
   s.jobId = "SAME";
-  s.fetchedIdx = new Set([0, 1]);
+  s.loader.available = new Set([0, 1]);
   const entry = { buffer: { label: "SAME" }, playStart: 0 };
   s.chunks.set(0, entry);
   const scheduler = attachScheduler(s);
@@ -177,7 +180,7 @@ test("_resumeProcessing keeps the same job_id when the url is unchanged", async 
   await s._resumeProcessing();
 
   assert.equal(s.jobId, "SAME");
-  assert.equal(s.fetchedIdx.size, 2); // not cleared; it's the same job
+  assert.equal(s.loader.available.size, 2); // retained for the same artifact
   assert.equal(opened, 1); // reopened the (closed) stream
   assert.equal(s.chunks.get(0), entry);
   assert.equal(scheduler.stretchCache.get("0@2"), stretched);
@@ -210,7 +213,8 @@ test("active requests retain their backend, model and copied stems after setting
 
   s._adoptJob(await s.requestJob());
   await s.fetchCapabilities();
-  await s.fetchAndQueueChunk(0);
+  s.loader.updateAvailable([0]);
+  await settle();
 
   assert.deepEqual(requests.map(({ url }) => url), [
     "https://old.example/process",
@@ -245,8 +249,10 @@ for (const stage of ["fetch", "body", "decode"]) {
       return Promise.resolve(data);
     });
     let oldSignal;
+    let newRequests = 0;
     t.mock.method(globalThis, "fetch", async (url, { signal }) => {
       if (url.includes("/NEW/")) {
+        newRequests++;
         return { ok: true, arrayBuffer: async () => newAudio };
       }
       oldSignal = signal;
@@ -266,13 +272,13 @@ for (const stage of ["fetch", "body", "decode"]) {
       };
     });
 
-    s.fetchedIdx.add(0);
-    const oldRequest = s.fetchAndQueueChunk(0);
+    t.after(() => s.dispose());
+    s.loader.updateAvailable([0]);
     await reached.promise;
     s._adoptJob({ job_id: "NEW", total_chunks: 1 });
     assert.equal(oldSignal.aborted, true);
-    s.fetchedIdx.add(0);
-    await s.fetchAndQueueChunk(0);
+    s.loader.updateAvailable([0]);
+    await settle();
     const current = s.chunks.get(0);
     assert.equal(current.buffer, newAudio);
 
@@ -281,30 +287,37 @@ for (const stage of ["fetch", "body", "decode"]) {
     waiting.resolve(stage === "fetch"
       ? { ok: true, arrayBuffer: async () => oldAudio }
       : oldAudio);
-    await oldRequest;
+    await settle();
     assert.equal(s.chunks.get(0), current);
-    assert.equal(s.fetchedIdx.has(0), true);
+    s.loader.updateAvailable([0]);
+    await settle();
+    assert.equal(newRequests, 1, "old completion cannot force a duplicate NEW fetch");
   });
 }
 
-test("a rejected OLD request cannot remove the NEW chunk's dedup mark", async (t) => {
+test("a rejected OLD request cannot force the NEW chunk to refetch", async (t) => {
   const s = makeSession();
+  t.after(() => s.dispose());
   s._adoptJob({ job_id: "OLD", total_chunks: 1 });
   attachScheduler(s);
   const old = deferred();
   const audio = { label: "NEW" };
-  t.mock.method(globalThis, "fetch", (url) => url.includes("/OLD/")
-    ? old.promise
-    : Promise.resolve({ ok: true, arrayBuffer: async () => audio }));
+  let newRequests = 0;
+  t.mock.method(globalThis, "fetch", (url) => {
+    if (url.includes("/OLD/")) return old.promise;
+    newRequests++;
+    return Promise.resolve({ ok: true, arrayBuffer: async () => audio });
+  });
   const warning = t.mock.method(console, "warn", () => {});
-  s.fetchedIdx.add(0);
-  const pending = s.fetchAndQueueChunk(0);
+  s.loader.updateAvailable([0]);
   s._adoptJob({ job_id: "NEW", total_chunks: 1 });
-  s.fetchedIdx.add(0);
-  await s.fetchAndQueueChunk(0);
+  s.loader.updateAvailable([0]);
+  await settle();
   old.reject(new Error("old connection failed"));
-  await pending;
-  assert.equal(s.fetchedIdx.has(0), true);
+  await settle();
+  s.loader.updateAvailable([0]);
+  await settle();
+  assert.equal(newRequests, 1);
   assert.equal(s.chunks.get(0).buffer, audio);
   assert.equal(warning.mock.callCount(), 0);
 });
@@ -320,14 +333,64 @@ test("disposing a session aborts its fetch and ignores a late response", async (
     signal = options.signal;
     return waiting.promise;
   });
-  const pending = s.fetchAndQueueChunk(0);
+  s.loader.updateAvailable([0]);
   assert.equal(signal.aborted, false);
   s.dispose();
   assert.equal(signal.aborted, true);
   waiting.resolve({ ok: true, arrayBuffer: async () => new ArrayBuffer(0) });
-  await pending;
+  await settle();
   assert.equal(decoded, 0);
   assert.equal(s.chunks.size, 0);
+});
+
+test("a failed final chunk retries after ready closes the status stream", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const s = makeSession();
+  t.after(() => s.dispose());
+  s._adoptJob({ job_id: "JOB", total_chunks: 1 });
+  attachScheduler(s);
+  let closed = false;
+  s.eventSource = { close() { closed = true; } };
+  let attempts = 0;
+  const audio = { label: "final audio" };
+  t.mock.method(globalThis, "fetch", async () => ++attempts === 1
+    ? { ok: false, status: 503 }
+    : { ok: true, arrayBuffer: async () => audio });
+  s.handleStatus({ state: "ready", total_chunks: 1, ready_chunks: [0] });
+  await settle();
+  assert.equal(closed, true);
+  assert.equal(s._streamEnded, true);
+  assert.equal(s.chunks.size, 0);
+  t.mock.timers.tick(500);
+  await settle();
+  assert.equal(attempts, 2);
+  assert.equal(s.chunks.get(0).buffer, audio);
+});
+
+test("terminal chunk failure pauses while retaining original-audio suppression", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const s = makeSession();
+  t.after(() => s.dispose());
+  s._adoptJob({ job_id: "JOB", total_chunks: 1 });
+  attachScheduler(s);
+  let restored = 0;
+  s.muteController = { dispose() { restored++; } };
+  s.video.paused = false;
+  const error = t.mock.method(s.button, "setError", () => {});
+  t.mock.method(globalThis, "fetch", async () => ({ ok: false, status: 503 }));
+  s.handleStatus({ state: "ready", total_chunks: 1, ready_chunks: [0] });
+  await settle();
+  for (const delay of [500, 1000, 2000]) {
+    t.mock.timers.tick(delay);
+    await settle();
+  }
+  assert.equal(s.video.paused, true);
+  assert.equal(s.disposed, false);
+  assert.equal(restored, 0);
+  assert.equal(error.mock.callCount(), 1);
+  s.video.paused = false;
+  s._boundHandlers.play();
+  assert.equal(s.video.paused, true);
 });
 
 test("overlapping resumes share one process request and reopen once", async (t) => {

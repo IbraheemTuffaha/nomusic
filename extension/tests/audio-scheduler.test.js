@@ -8,7 +8,7 @@ import { AudioScheduler } from "../audio-scheduler.js";
 function makeScheduler() {
   const chunks = new Map();
   return new AudioScheduler(
-    /* video */ { playbackRate: 1 },
+    /* video */ { playbackRate: 1, currentTime: 0, paused: false },
     {
       chunks,
       getStride: () => 9.5,
@@ -51,7 +51,7 @@ test("_requestStretched returns the cached buffer on a hit", () => {
 
 test("_requestStretched returns null while a key is already in flight", () => {
   const s = makeScheduler();
-  s._stretchInflight.add("3@1.5");
+  s._stretchInflight.set("3@1.5", {});
   assert.equal(s._requestStretched(3, {}, 1.5), null);
 });
 
@@ -128,8 +128,9 @@ test("_onSourceEnded does NOT continue while the video is paused", () => {
   assert.equal(rescheduled, 0);
 });
 
+for (const change of ["artifact", "eviction", "rate"]) {
 for (const outcome of ["resolve", "reject"]) {
-  test(`an OLD stretch ${outcome} cannot alter NEW cache or in-flight work`, async (t) => {
+  test(`an OLD stretch ${outcome} after ${change} cannot alter NEW work`, async (t) => {
     const s = makeScheduler();
     s.video.paused = false;
     s.video.playbackRate = 2;
@@ -145,7 +146,15 @@ for (const outcome of ["resolve", "reject"]) {
     s.chunks.set(0, oldEntry);
     s._requestStretched(0, oldEntry, 2);
 
-    s.reset();
+    if (change === "artifact") s.reset();
+    else if (change === "eviction") {
+      s.chunks.delete(0);
+      s.pruneBuffers();
+    } else {
+      s.video.playbackRate = 1;
+      s.pruneBuffers();
+      s.video.playbackRate = 2;
+    }
     const newEntry = { buffer: audioBuffer(8, 2), playStart: 0 };
     s.chunks.set(0, newEntry);
     s._requestStretched(0, newEntry, 2);
@@ -171,3 +180,43 @@ for (const outcome of ["resolve", "reject"]) {
     assert.equal(schedule.mock.calls[0].arguments[1], newEntry);
   });
 }
+}
+
+test("direct arrivals outside the lookahead do not stretch or schedule", () => {
+  const s = makeScheduler();
+  s.video.currentTime = 100;
+  s.video.playbackRate = 2;
+  s.audioCtx = { createBufferSource: () => assert.fail("scheduled out of window") };
+  s.stretcher = { available: true };
+  s._requestStretched = () => assert.fail("stretched out of window");
+  s.scheduleChunk(14, { buffer: audioBuffer(80), playStart: 133 });
+  s.scheduleChunk(0, { buffer: audioBuffer(80), playStart: 0 });
+  assert.equal(s.activeSources.size, 0);
+});
+
+test("window/rate pruning releases obsolete cached audio and active sources", () => {
+  const s = makeScheduler();
+  s.video.playbackRate = 2;
+  s.chunks.set(10, {});
+  for (const key of ["0@2", "10@1.5", "10@2"]) {
+    s.stretchCache.set(key, audioBuffer(8));
+  }
+  let stops = 0;
+  const obsolete = { _nomusicIdx: 0, stop: () => stops++ };
+  const current = { _nomusicIdx: 10 };
+  s.activeSources = new Set([obsolete, current]);
+  s._srcByIdx = new Map([[0, obsolete], [10, current]]);
+  s.pruneBuffers();
+  assert.deepEqual([...s.stretchCache.keys()], ["10@2"]);
+  assert.deepEqual([...s.activeSources], [current]);
+  assert.equal(s._srcByIdx.has(0), false);
+  assert.equal(obsolete._nomusicStopped, true);
+  assert.equal(stops, 1);
+  // Every further speed change releases the preceding prepared rate.
+  for (const rate of [0.5, 1, 1.25, 1.5, 2]) {
+    s.video.playbackRate = rate;
+    s.pruneBuffers();
+    s.stretchCache.set(`10@${rate}`, audioBuffer(8));
+    assert.equal(s.stretchCache.size, 1);
+  }
+});

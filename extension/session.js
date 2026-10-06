@@ -1,10 +1,12 @@
 // Session: coordinates playback for one <video>. Owns the job lifecycle (SSE
-// status, chunk fetch+decode), buffer pause/resume, and the video-event glue —
+// status), buffer pause/resume, and the video-event glue. ChunkLoader owns
+// bounded chunk acquisition and retention —
 // and delegates the audio graph + scheduling to AudioScheduler and host muting
 // to MuteController. Split out of the former monolithic content.js.
 import { settings, dlog, SYNC_CHECK_MS } from "./settings.js";
 import { MuteController } from "./mute-controller.js";
 import { AudioScheduler } from "./audio-scheduler.js";
+import { ChunkLoader } from "./chunk-loader.js";
 
 /** Clean a raw URL down to https://www.youtube.com/watch?v=ID, or null if it
  *  isn't a watch URL — so the caller can fall back to the page URL. Stripping
@@ -78,7 +80,18 @@ export class Session {
     // idx -> { buffer: AudioBuffer, playStart: number }. Written here as chunks
     // decode; read by the scheduler (shared reference).
     this.chunks = new Map();
-    this.fetchedIdx = new Set();
+    this._chunkError = false;
+    this.loader = new ChunkLoader({
+      chunks: this.chunks,
+      getTime: () => this.video.currentTime,
+      getStride: () => this.chunkSeconds - this.chunkOverlapSeconds,
+      getTotalChunks: () => this.totalChunks,
+      getChunkUrl: (idx) => `${this.config.backendUrl}/chunk/${this.jobId}/${idx}`,
+      decode: (encoded) => this.scheduler.decode(encoded),
+      onChunk: (idx, entry) => this._chunkArrived(idx, entry),
+      onError: (message) => this._failChunk(message),
+      onWindowChange: () => this.scheduler?.pruneBuffers(),
+    });
     // SSE stream of backend status (replaces /status polling). Opened in
     // start(); closed in dispose() and when a terminal state arrives.
     this.eventSource = null;
@@ -101,6 +114,8 @@ export class Session {
     this._prioritizeTimer = null;
     this._boundHandlers = {
       play: () => {
+        if (this._chunkError) { this.video.pause(); return; }
+        this.loader.reconcile();
         this.scheduler?.reschedule();
         this._onUserPlay();
       },
@@ -117,8 +132,8 @@ export class Session {
           pausedByUs: this._pausedByUs,
           videoPaused: this.video.paused,
         });
-        this.scheduler?.reschedule();
         this._reconcileBufferState();
+        this.scheduler?.reschedule();
         this._sendPrioritizeHint();
       },
       ratechange: () => this.scheduler?.reschedule(),
@@ -320,7 +335,7 @@ export class Session {
   }
 
   async _resumeProcessing() {
-    if (this.disposed) return;
+    if (this.disposed || this._chunkError) return;
     if (this._resuming) return this._resuming;
     this._resuming = this._resumeJob();
     try {
@@ -337,8 +352,8 @@ export class Session {
       this.eventSource?.close();
       this.eventSource = null;
       this.scheduler?.reset();
-      this.chunks.clear();
-      this.fetchedIdx.clear();
+      this.loader.reset();
+      this._chunkError = false;
       this._streamEnded = false;
     }
     this.jobId = info.job_id;
@@ -355,7 +370,7 @@ export class Session {
       // surface the failure (204/CLOSED) without crashing playback.
       dlog("resume requestJob failed", err?.name || err);
     }
-    if (this.disposed) return;
+    if (this.disposed || this._chunkError) return;
     if (info?.job_id) this._adoptJob(info);
     if (!this.eventSource) this._openEventStream();
     // Re-point the worker at where the user actually is, in case it was
@@ -367,7 +382,7 @@ export class Session {
    *  poll loop did per tick: repaint the label, fetch any newly-ready
    *  chunks, and tear down on a terminal state. */
   handleStatus(status) {
-    if (this.disposed) return;
+    if (this.disposed || this._chunkError) return;
     this.totalChunks = status.total_chunks || this.totalChunks;
     // Always reflect the backend phase in the label, even while we're
     // paused for buffering — the pulsing icon + paused video already
@@ -381,20 +396,8 @@ export class Session {
       return;
     }
 
-    // Fetch any newly-ready chunk. With seek-driven reordering, ready
-    // chunks are no longer contiguous from 0, so we iterate the explicit
-    // ``ready_chunks`` set the backend sends. Each chunk knows its own
-    // play_start, so order doesn't matter. fetchedIdx dedups across the
-    // repeated snapshots SSE delivers.
-    const readyChunks = Array.isArray(status.ready_chunks)
-      ? status.ready_chunks
-      : [];
-    for (const i of readyChunks) {
-      if (!this.fetchedIdx.has(i)) {
-        this.fetchedIdx.add(i);
-        this.fetchAndQueueChunk(i);
-      }
-    }
+    this.loader.updateAvailable(Array.isArray(status.ready_chunks)
+      ? status.ready_chunks : []);
 
     if (status.state === "ready") {
       this._streamEnded = true;
@@ -402,59 +405,30 @@ export class Session {
     }
   }
 
-  async fetchAndQueueChunk(idx) {
-    const signal = this._requests.signal;
-    try {
-      // ``cache: "default"`` lets the browser honor the backend's
-      // Cache-Control header (max-age=86400 for 200, no-store for 425).
-      // ``force-cache`` is wrong here because it returns ANY cached
-      // response unconditionally — so a 425 from "chunk not ready yet"
-      // gets remembered forever and poisons every retry, even after the
-      // chunk lands on disk. That manifested as seek-backwards getting
-      // stuck on chunks the backend had finished long ago.
-      const resp = await fetch(
-        `${this.config.backendUrl}/chunk/${this.jobId}/${idx}`,
-        { cache: "default", signal },
-      );
-      if (signal.aborted) return;
-      if (!resp.ok) {
-        // Drop the dedup mark so the next SSE snapshot that re-lists this
-        // chunk in ready_chunks re-attempts the fetch.
-        this.fetchedIdx.delete(idx);
-        return;
-      }
-      const buf = await resp.arrayBuffer();
-      // The session can be disposed mid-fetch (toggle off, SPA navigation,
-      // <video> emptied) — the scheduler is then null. Bail quietly rather
-      // than throwing on a dead session's audio graph.
-      if (signal.aborted || this.disposed || !this.scheduler) return;
-      const decoded = await this.scheduler.decode(buf);
-      if (signal.aborted || this.disposed || !this.scheduler) return;
-      const stride = this.chunkSeconds - this.chunkOverlapSeconds;
-      const entry = {
-        buffer: decoded,
-        playStart: idx * stride,
-      };
-      this.chunks.set(idx, entry);
-      dlog("chunk arrived", {
-        idx,
-        currentTime: this.video.currentTime,
-        currentChunk: this._chunkIdxForTime(this.video.currentTime),
-        pausedByUs: this._pausedByUs,
-        videoPaused: this.video.paused,
-      });
-      // If we paused because this chunk wasn't ready, resume now.
-      if (this._pausedByUs && this._isBuffered(this.video.currentTime)) {
-        this._resumeAfterBuffer();
-      }
-      if (!this.video.paused && !this.disposed) {
-        this.scheduler?.scheduleChunk(idx, entry);
-      }
-    } catch (err) {
-      if (signal.aborted) return;
-      console.warn(`[nomusic] chunk ${idx} fetch/decode failed`, err);
-      this.fetchedIdx.delete(idx);
+  _chunkArrived(idx, entry) {
+    if (this.disposed || this._chunkError) return;
+    if (this._pausedByUs && this._isBuffered(this.video.currentTime)) {
+      this._resumeAfterBuffer();
     }
+    if (!this.video.paused) this.scheduler.scheduleChunk(idx, entry);
+  }
+
+  // T4 supplies the shared recovery UI. Retain suppression while a terminal
+  // acquisition error is visible instead of dispose() restoring original audio.
+  _failChunk(message) {
+    if (this.disposed || this._chunkError) return;
+    this._chunkError = true;
+    this._streamEnded = true;
+    this._requests.abort();
+    this.eventSource?.close();
+    this.eventSource = null;
+    clearTimeout(this.bufferTimer);
+    clearTimeout(this._prioritizeTimer);
+    this.scheduler?.stopAll();
+    this._pausedByUs = false;
+    this.video.pause();
+    this.button.setError(message);
+    this.button._clearErrorRevert?.();
   }
 
 
@@ -550,7 +524,9 @@ export class Session {
    *       prior pause).
    *    3. Pause when we're playing and the current chunk isn't buffered. */
   _reconcileBufferState() {
-    if (this.disposed) return;
+    if (this.disposed || this._chunkError) return;
+    this.loader.reconcile();
+    if (this._chunkError) return;
     if (this._pausedByUs && !this.video.paused) {
       // User overrode us. Don't keep claiming ownership of the pause.
       dlog("reconcile: healing stale _pausedByUs (video resumed externally)");
@@ -599,6 +575,7 @@ export class Session {
     if (this.disposed) return;
     this.disposed = true;
     this._requests.abort();
+    this.loader.dispose();
     this.detachVideoListeners();
     // Tears down the audio graph: stops sources, clears the sync monitor,
     // closes the AudioContext, disposes the stretcher + caches.
@@ -626,7 +603,6 @@ export class Session {
       }
     }
     this.chunks.clear();
-    this.fetchedIdx.clear();
     // Error paths set the button to "error" and rely on its own
     // auto-revert timer for the visual transition. Calling button.dispose
     // here would clobber that.

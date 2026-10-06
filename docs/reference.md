@@ -21,6 +21,7 @@ reuse. MP3/MP4 exports preserve sample-aware chunk concatenation and use FFmpeg.
 | `engines/` | Engine interface, PyTorch implementation and pinned model store |
 | `pipeline/` | Source download, chunk processing, cache and export assembly |
 | `extension/main.js`, `button.js`, `session.js` | Video discovery, controls and per-video networking |
+| `extension/chunk-loader.js` | Bounded chunk acquisition, retries and decoded-audio retention |
 | `audio-scheduler.js`, `mute-controller.js`, `stretch.js` within the extension | Audio scheduling, volume mirroring and time-stretch |
 | `settings.js`, `background.js`, `popup.js`, `page-script.js` within the extension | Saved settings, service worker, popup and page bridge |
 
@@ -29,6 +30,36 @@ draining active work. It has a bounded grace period and an immediate second-inte
 escape; this is still an in-process worker design. A startup interrupted during
 model download can resume from the shared model cache. App-owned abandoned staging
 files are cleaned without removing completed media or shared model-download partials.
+
+### Playback ownership and memory
+
+A session captures its source URL, backend, model and stems. Popup changes take
+effect on the next session. Resuming the same job keeps valid audio; adopting a
+different job aborts old requests and clears decoded, stretched and scheduled
+audio together. Late decode or stretch results cannot repopulate a replaced job.
+
+The chunk loader keeps server availability separate from pending requests and
+decoded buffers. It fetches at most three chunks concurrently, including their
+decode work. Network/body reads time out after 15 seconds. Failed chunks have
+four attempts with 0.5, 1 and 2 second backoffs; retries continue independently
+after the final SSE status. Browser decoding cannot be cancelled, so an obsolete
+decode still occupies its slot until it settles, and its result is discarded.
+A decode exceeding 15 seconds reports a terminal error if it is still needed
+or blocks acquisition; it does not silently free a slot for more work.
+
+Decoded audio stays within 20 seconds behind and 45 seconds ahead of the video
+clock, rounded to whole chunks. Distant seeks release the old window and refetch
+the new one. With the default 9.5-second stride this retains at most nine chunks:
+about 33 MiB of stereo float PCM at 48 kHz and ten seconds per chunk. Up to three
+pending decodes are additional temporary work. Encoded browser HTTP cache and
+backend disk cache are separate from this decoded window.
+
+The scheduler prepares/schedules audio no more than 30 video seconds ahead,
+including direct arrivals. Stretched buffers are retained only for decoded
+chunks and the current playback rate. Their size scales inversely with that
+rate (half-speed audio has twice as many frames); changing rates releases the
+previous prepared rate. These are time-window limits, not a fixed browser heap
+limit: channel count, sample rate and backend chunk settings affect memory.
 
 ## Backend settings
 
