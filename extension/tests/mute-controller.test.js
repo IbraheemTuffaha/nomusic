@@ -45,6 +45,7 @@ test("handleHostVolumeChange adopts a real volume read as user intent and re-sil
     video: { muted: false },
     _userVolume: 0.3,
     _lastMuted: false,
+    _nativeMuted: false,
     _realGetVolume: () => 0.5,
     _realSetVolume: () => {
       reSilenced = true;
@@ -66,6 +67,7 @@ test("handleHostVolumeChange tracks a mute toggle without changing user volume",
     video: { muted: true },
     _userVolume: 0.4,
     _lastMuted: false,
+    _nativeMuted: false,
     _realGetVolume: () => 0, // page reads 0 (our pin) -> no volume intent
     _realSetVolume: () => {},
     _applyVolume: (level) => {
@@ -181,3 +183,42 @@ test("MAIN-world volume coercion stays suppressed and invalid assignments still 
   }
   mc.dispose();
 });
+
+for (const initialMuted of [false, true]) {
+  test(`immediate disposal preserves a native mute change from ${initialMuted}`, async (t) => {
+    const { MediaElement } = mediaFixture(t, { bridge: true });
+    const video = new MediaElement({ volume: 0.4, muted: initialMuted });
+    const mc = new MuteController(video, () => {});
+    video.addEventListener("volumechange", () => mc.handleHostVolumeChange());
+    mc.mute();
+    video.muted = !initialMuted;
+    // MutationObserver source cleanup can precede native media-event tasks.
+    mc.dispose();
+    assert.equal(video.muted, !initialMuted);
+    assert.equal(video.volume, 0.4);
+    await flushMediaEvents();
+    assert.equal(video.muted, !initialMuted);
+  });
+
+  test(`volume-only events preserve polled mute intent over native ${initialMuted}`, async (t) => {
+    const fixture = mediaFixture(t, { bridge: true, youtube: true });
+    fixture.setStoredVolume({ volume: 40, muted: initialMuted });
+    const video = new fixture.MediaElement({ volume: 0.4, muted: initialMuted });
+    const levels = [];
+    const mc = new MuteController(video, (level) => levels.push(level));
+    video.addEventListener("volumechange", () => mc.handleHostVolumeChange());
+    mc.mute();
+    fixture.setStoredVolume({ volume: 40, muted: !initialMuted });
+    fixture.tick();
+    // The native event from our initial volume pin has not fired yet.
+    await flushMediaEvents();
+    assert.equal(levels.at(-1), initialMuted ? 0.4 : 0);
+    video.volume = 0.6; // MAIN-world volume intent is not a mute toggle either.
+    assert.equal(levels.at(-1), initialMuted ? 0.6 : 0);
+    mc.refresh();
+    assert.equal(levels.at(-1), initialMuted ? 0.6 : 0);
+    mc.dispose();
+    assert.equal(video.muted, !initialMuted);
+    assert.equal(video.volume, 0.6);
+  });
+}

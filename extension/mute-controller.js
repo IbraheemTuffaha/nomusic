@@ -31,11 +31,11 @@ export class MuteController {
     // What we track across host events:
     //   _userVolume — last slider position the user set (0..1). Survives
     //                 mute toggles so unmuting restores the right level.
-    //   _lastMuted  — last muted state we observed. Lets the volumechange
-    //                 handler detect mute/unmute clicks (which can fire
-    //                 without a volume change).
+    //   _lastMuted  — latest mute intent, including YouTube's stored choice.
+    //   _nativeMuted — last native value, kept separate so a volume-only
+    //                  event cannot undo a newer stored mute choice.
     this._userVolume = this.video.volume;
-    this._lastMuted = this.video.muted;
+    this._lastMuted = this._nativeMuted = this.video.muted;
 
     // We override only ``volume`` and pin it to 0 via the prototype
     // setter + rAF re-assertion. ``muted`` is left alone: audio is
@@ -57,11 +57,11 @@ export class MuteController {
     // for us.
     this._volIntentHandler = (e) => {
       if (!e || !e.detail) return;
-      const { volume, muted } = e.detail;
+      const { volume } = e.detail;
       if (Number.isFinite(volume) && volume >= 0 && volume <= 1) {
         this._userVolume = volume;
       }
-      if (typeof muted === "boolean") this._lastMuted = muted;
+      this._syncNativeMute();
       this._applyEffectiveVolume();
     };
     this.video.addEventListener("nomusic:vol-intent", this._volIntentHandler);
@@ -149,7 +149,16 @@ export class MuteController {
 
   /** Reapply intent after the owner creates or replaces its audio graph. */
   refresh() {
-    if (!this.disposed) this._applyEffectiveVolume(true);
+    if (this.disposed) return;
+    this._syncNativeMute();
+    this._applyEffectiveVolume(true);
+  }
+
+  _syncNativeMute() {
+    const muted = this.video.muted;
+    if (muted === this._nativeMuted) return false;
+    this._lastMuted = this._nativeMuted = muted;
+    return true;
   }
 
   /**
@@ -163,20 +172,13 @@ export class MuteController {
   handleHostVolumeChange() {
     if (this.disposed || !this._realGetVolume) return;
     const realVol = this._realGetVolume();
-    const muted = this.video.muted;
-
-    let changed = false;
+    let changed = this._syncNativeMute();
     if (realVol > 0) {
       // Page set a real volume — that's the user's intent. (When the
       // page reads back 0 it's our pin, so it doesn't tell us anything.)
       this._userVolume = realVol;
       changed = true;
     }
-    if (muted !== this._lastMuted) {
-      this._lastMuted = muted;
-      changed = true;
-    }
-
     if (changed) this._applyEffectiveVolume();
 
     if (realVol !== 0) {
@@ -208,6 +210,10 @@ export class MuteController {
     delete this.video.dataset.nomusicVolBlock;
 
     if (this._realSetVolume) {
+      // Source replacement/disposal can run before a queued volumechange.
+      // Observe an actual native change now; unchanged native state must not
+      // overwrite newer intent learned from YouTube's volume state.
+      this._syncNativeMute();
       this.video.muted = this._lastMuted;
       this._realSetVolume(this._userVolume);
       this._realSetVolume = null;
