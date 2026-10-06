@@ -408,6 +408,33 @@ test("an exhausted future chunk becomes terminal only when playback reaches it",
   assert.equal(f.errors.length, 1);
 });
 
+for (const time of [19.011, 500]) {
+  test(`the final chunk remains current and exhausts retries at time ${time}`, async (t) => {
+    const f = fixture(t, { totalChunks: 2 });
+    const requested = [];
+    t.mock.method(globalThis, "fetch", async (url) => {
+      const idx = indexFromUrl(url);
+      requested.push(idx);
+      return idx === 1 ? { ok: false, status: 503 } : response(idx);
+    });
+    f.seek(time);
+    f.loader.updateAvailable([0, 1]);
+    await settle();
+    assert.equal(requested[0], 1, "the actual final chunk gets current-audio priority");
+    for (const delay of [500, 1_000, 2_000]) {
+      t.mock.timers.tick(delay);
+      await settle();
+    }
+    assert.equal(requested.filter((idx) => idx === 1).length, 4);
+    assert.deepEqual(f.errors, ["Audio chunk 2 failed after 4 attempts"]);
+    assert.ok(requested.every((idx) => idx >= 0 && idx < 2));
+    t.mock.timers.tick(60_000);
+    await settle();
+    assert.equal(requested.filter((idx) => idx === 1).length, 4);
+    assert.equal(f.errors.length, 1);
+  });
+}
+
 test("dispose aborts downloads and prevents late decoding or timers from publishing work", async (t) => {
   const decode = deferred();
   const requests = [];

@@ -40,10 +40,12 @@ export class ChunkLoader {
     this.retryTimer = null;
     const time = this.getTime();
     const stride = this.getStride();
-    const current = Math.floor(Math.max(0, time) / stride);
+    const final = this.getTotalChunks() - 1;
+    // The last buffer can extend beyond one stride, and the host clock can
+    // outlast the source. Its actual final chunk still owns that position.
+    const current = Math.max(0, Math.min(final, Math.floor(time / stride)));
     const first = Math.floor(Math.max(0, time - BACKWARD_SECONDS) / stride);
-    const last = Math.min(this.getTotalChunks() - 1,
-      Math.floor((time + FORWARD_SECONDS) / stride));
+    const last = Math.min(final, Math.floor((time + FORWARD_SECONDS) / stride));
     const order = [];
     for (let idx = current; idx <= last; idx++) order.push(idx);
     for (let idx = Math.min(current - 1, last); idx >= first; idx--) order.push(idx);
