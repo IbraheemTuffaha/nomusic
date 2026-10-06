@@ -74,6 +74,12 @@ suppression and shows persistent **Retry** and **Return to original** actions.
 Retry restarts processing in the same session without resetting volume or
 play/pause intent. Only an explicit return restores the original track.
 
+Playback checks the final decoded chunk's actual end, including any span beyond
+the usual stride. Once the job is ready, a finite native video end up to 250 ms
+later may finish with original audio still suppressed. A larger or unknown
+uncovered tail reports a persistent playback error instead of buffering forever.
+This tolerance does not stretch audio or correct larger source-duration mismatches.
+
 The session owns SSE reconnection: errors in either connecting or closed state
 receive three retries with 0.5, 1 and 2 second delays. Each retry re-submits the
 job before opening its stream, allowing a restarted backend to resume cached

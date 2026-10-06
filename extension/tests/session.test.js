@@ -172,11 +172,107 @@ test("_chunkIdxForTime never returns a negative index", () => {
 
 test("_isBuffered reflects whether the covering chunk is decoded", () => {
   const s = makeSession();
+  s.totalChunks = 2;
   assert.equal(s._isBuffered(9.5), false);
-  s.chunks.set(1, { buffer: {}, playStart: 9.5 });
+  s.chunks.set(1, { buffer: { duration: 9.5 }, playStart: 9.5 });
   assert.equal(s._isBuffered(9.5), true); // time 9.5 -> chunk 1
   assert.equal(s._isBuffered(0), false); // time 0 -> chunk 0, not buffered
 });
+
+for (const [videoEnd, audioDuration] of [[19, 9.5], [19.021, 9.499977], [19.25, 9.5]]) {
+  test(`ready audio can reach native EOF ${videoEnd} across its final stride boundary`, async (t) => {
+    const s = makeSession(false);
+    t.after(() => s.dispose());
+    s.totalChunks = 2;
+    s._streamEnded = true;
+    s.video.duration = videoEnd;
+    s.video.currentTime = 19;
+    attachScheduler(s);
+    s.chunks.set(1, { buffer: { duration: audioDuration }, playStart: 9.5 });
+    s.playback.hold();
+    await settle();
+    s._reconcileBufferState();
+    await settle();
+    assert.equal(s.failed, false);
+    assert.equal(s.video.paused, false);
+    assert.equal(s.playback.held, false);
+    assert.equal(s.video.playCalls, 1);
+    assert.equal(s._chunkIdxForTime(19), 2); // Prioritize still uses the raw clock.
+  });
+}
+
+test("the final decoded chunk can cover time beyond one nominal stride", (t) => {
+  const s = makeSession();
+  t.after(() => s.dispose());
+  s.totalChunks = 2;
+  s.chunks.set(1, { buffer: { duration: 10.5 }, playStart: 9.5 });
+  assert.equal(s._isBuffered(19.75), true);
+  assert.equal(s._isBuffered(20), false);
+});
+
+test("a codec tail does not resume a user-paused video or a job still processing", async (t) => {
+  const s = makeSession();
+  t.after(() => s.dispose());
+  s.totalChunks = 2;
+  s.video.duration = 19.021;
+  s.video.currentTime = 19.01;
+  attachScheduler(s);
+  s.chunks.set(1, { buffer: { duration: 9.499977 }, playStart: 9.5 });
+  s.playback.hold();
+  s._reconcileBufferState();
+  assert.equal(s._isBuffered(s.video.currentTime), false);
+  assert.equal(s.playback.held, true);
+  s._streamEnded = true;
+  s._reconcileBufferState();
+  await settle();
+  assert.equal(s.playback.held, false);
+  assert.equal(s.video.paused, true);
+  assert.equal(s.video.playCalls, 0);
+});
+
+test("already ended video is not held, relabeled or restarted by a monitor or arrival", (t) => {
+  const s = makeSession(false);
+  t.after(() => s.dispose({ restore: false }));
+  s.totalChunks = 2;
+  s._streamEnded = true;
+  s.video.duration = 19.021;
+  s.video.currentTime = 19.021;
+  attachScheduler(s);
+  s.playback.hold();
+  s.video.ended = true;
+  const status = t.mock.method(s.button, "showStatus");
+  const buffering = t.mock.method(s.button, "setBuffering");
+  const entry = { buffer: { duration: 9.499977 }, playStart: 9.5 };
+  s.chunks.set(1, entry);
+  s._reconcileBufferState();
+  s._chunkArrived(1, entry);
+  assert.equal(s.video.playCalls, 0);
+  assert.equal(status.mock.callCount(), 0);
+  assert.equal(buffering.mock.callCount(), 0);
+  assert.equal(s.failed, false);
+});
+
+for (const videoEnd of [19.251, 30, Infinity, NaN]) {
+  test(`uncovered final audio with native duration ${videoEnd} fails instead of waiting forever`, (t) => {
+    const s = makeSession(false);
+    t.after(() => s.dispose({ restore: false }));
+    s.totalChunks = 2;
+    s._streamEnded = true;
+    s.video.duration = videoEnd;
+    s.video.currentTime = 19.01;
+    attachScheduler(s);
+    s.chunks.set(1, { buffer: { duration: 9.5 }, playStart: 9.5 });
+    const error = t.mock.method(s.button, "setError");
+    s._reconcileBufferState();
+    s._reconcileBufferState();
+    assert.equal(s.failed, true);
+    assert.equal(s.video.paused, true);
+    assert.equal(s.playback.held, true);
+    assert.equal(s.scheduler, null);
+    assert.equal(error.mock.callCount(), 1);
+    assert.match(error.mock.calls[0].arguments[0], /audio ended before the video/);
+  });
+}
 
 test("a different stride shifts the chunk boundaries", () => {
   const s = makeSession();

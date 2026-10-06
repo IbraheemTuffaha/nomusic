@@ -7,6 +7,9 @@ import { AudioScheduler } from "./audio-scheduler.js";
 import { ChunkLoader } from "./chunk-loader.js";
 import { PlaybackIntent } from "./playback-intent.js";
 
+// A short container/codec tail may outlast decoded audio at the native EOF.
+const MAX_END_TAIL_SECONDS = 0.25;
+
 /** Clean a raw URL down to https://www.youtube.com/watch?v=ID, or null if it
  *  isn't a watch URL — so the caller can fall back to the page URL. Stripping
  *  the time/playlist params keeps the same video to one backend cache key. */
@@ -460,7 +463,18 @@ export class Session {
   }
 
   _isBuffered(t) {
-    return this.chunks.has(this._chunkIdxForTime(t));
+    const lastIdx = this.totalChunks - 1;
+    const idx = Math.min(this._chunkIdxForTime(t), lastIdx);
+    const entry = this.chunks.get(idx);
+    if (!entry) return false;
+    if (idx !== lastIdx) return true;
+    const audioEnd = entry.playStart + entry.buffer.duration;
+    if (t < audioEnd) return true;
+    // Keep original audio suppressed while the native player crosses a tiny
+    // final tail. Larger/unknown gaps are not covered by a decoded buffer.
+    return this._streamEnded && Number.isFinite(this.video.duration) &&
+      t <= this.video.duration &&
+      this.video.duration - audioEnd <= MAX_END_TAIL_SECONDS;
   }
 
   _pauseForBuffer({ showBufferingLabel = true } = {}) {
@@ -470,7 +484,7 @@ export class Session {
   }
 
   _resumeAfterBuffer() {
-    if (!this.playback.held || this.disposed) return;
+    if (!this.playback.held || this.disposed || this.video.ended) return;
     if (this._streamEnded && this.button.el.dataset.state === "working") {
       this.button.showStatus({ state: "ready" });
     }
@@ -502,13 +516,22 @@ export class Session {
 
   /** Buffering controls a temporary hold; it never changes user intent. */
   _reconcileBufferState() {
-    if (this.disposed) return;
+    if (this.disposed || this.video.ended) return;
     if (this.failed) { this.playback.hold(); return; }
     if (!this.scheduler) return;
     this.loader.reconcile();
     if (this.failed) return;
-    if (this._isBuffered(this.video.currentTime)) this._resumeAfterBuffer();
-    else this._pauseForBuffer();
+    const time = this.video.currentTime;
+    if (this._isBuffered(time)) {
+      this._resumeAfterBuffer();
+    } else {
+      const last = this.chunks.get(this.totalChunks - 1);
+      if (this._streamEnded && last && time >= last.playStart + last.buffer.duration) {
+        this.fail("Processed audio ended before the video. Retry or return to original.");
+      } else {
+        this._pauseForBuffer();
+      }
+    }
   }
 
   /** Maintain the chunk window and reconcile buffering every SYNC_CHECK_MS. */
