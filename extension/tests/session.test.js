@@ -157,6 +157,43 @@ test("pausing during a pending resume keeps the worker stream closed", async (t)
   assert.equal(open.mock.callCount(), 0);
 });
 
+test("miniplayer navigation keeps the playing identity; another video releases it", async () => {
+  const s = makeSession(false);
+  s.sourceUrl = "https://www.youtube.com/watch?v=OLD";
+  s.mediaSource = { src: "blob:player", current: "blob:player" };
+  s.video.src = s.video.currentSrc = "blob:player";
+  s.playback.hold();
+  await settle();
+  withBridge("https://www.youtube.com/watch?v=OLD&t=30", () => s.checkSource());
+  assert.equal(s.disposed, false);
+  withBridge("https://www.youtube.com/watch?v=NEW", () => s.checkSource());
+  assert.equal(s.disposed, true);
+  assert.equal(s.video.playCalls, 0, "old media must not restart during navigation");
+});
+
+for (const changed of ["src", "currentSrc"]) {
+  test(`${changed} replacement disposes audio even without emptied`, () => {
+    const s = makeSession();
+    s.sourceUrl = "https://test.local/video";
+    s.video.src = s.video.currentSrc = "https://test.local/old.mp4";
+    s.mediaSource = { src: s.video.src, current: s.video.currentSrc };
+    s.video[changed] = "https://test.local/new.mp4";
+    withBridge("", () => s.checkSource());
+    assert.equal(s.disposed, true);
+  });
+}
+
+test("emptied during a buffering hold releases work without restarting old media", async () => {
+  const s = makeSession(false);
+  s.playback.hold();
+  s.attachVideoListeners();
+  await settle();
+  s.video.dispatchEvent(new Event("emptied"));
+  assert.equal(s.disposed, true);
+  assert.equal(s.video.paused, true);
+  assert.equal(s.video.playCalls, 0);
+});
+
 test("_chunkIdxForTime maps a time to its chunk via the stride", () => {
   const s = makeSession();
   assert.equal(s._chunkIdxForTime(0), 0);

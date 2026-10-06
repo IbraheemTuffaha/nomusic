@@ -88,6 +88,15 @@ snapshot has a 15-second deadline; processing requests have 30 seconds, and
 optional capabilities requests have five. User pause cancels reconnect work
 unless a queued export still needs processing.
 
+Discovery reconciles mutation batches against the final DOM. Reparenting a
+connected player preserves its session; removing a video retires its button,
+menus, timers, requests and audio without resuming the detached element. Source
+replacement also stops the old session. YouTube navigation uses the playing
+video ID so opening the miniplayer's surrounding home page does not replace it.
+Layout changes and navigation trigger bounded discovery refreshes; there is no
+continuous full-page scan. Export requests and progress polling belong to their
+button and are cancelled on retry, disable or retirement.
+
 ## Backend settings
 
 Set variables before starting the helper. These are local tuning controls,

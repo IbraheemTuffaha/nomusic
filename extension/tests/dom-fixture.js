@@ -45,10 +45,18 @@ export function domFixture(t) {
       return this === element || this.children.some((child) => child.contains(element));
     }
     focus() { document.activeElement = this; }
-    click() { this.dispatchEvent(new Event("click", { bubbles: true, cancelable: true })); }
+    click() {
+      this.clickCount = (this.clickCount || 0) + 1;
+      this.dispatchEvent(new Event("click", { bubbles: true, cancelable: true }));
+    }
     getBoundingClientRect() { return { top: 10, right: 400, bottom: 40 }; }
   }
-  document.createElement = (tag) => new Element(tag);
+  const elements = [];
+  document.createElement = (tag) => {
+    const element = new Element(tag);
+    elements.push(element);
+    return element;
+  };
   document.body = new Element("body");
   document.activeElement = document.body;
   const window = new BrowserEventTarget();
@@ -69,7 +77,7 @@ export function domFixture(t) {
     });
   }
   return {
-    document, window, timers,
+    document, window, timers, elements,
     tick() {
       const callbacks = [...timers.values()];
       timers.clear();

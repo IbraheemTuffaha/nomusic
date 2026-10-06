@@ -21,6 +21,7 @@ export class Button {
   constructor(video) {
     this.video = video;
     this.session = null;
+    this._retired = false;
     // Set once the user dismisses (×): a re-anchor must never bring a
     // dismissed pill back into view.
     this._dismissed = false;
@@ -85,6 +86,8 @@ export class Button {
     });
     this._menuOpen = false;
     this._downloading = false;
+    this._download = null;
+    this._downloadUrls = new Map();
     // A download requested before the track finished processing: {format,
     // height}. Held until the job reaches "ready", then saved automatically.
     this._pendingDownload = null;
@@ -139,6 +142,7 @@ export class Button {
    *  it via the MutationObserver. A new <video> on SPA navigation gets
    *  its own button. */
   dismiss() {
+    if (this._retired) return;
     if (this.session?.failed && !this.session.disposed) {
       this.openRecovery({ focus: true });
       return;
@@ -147,9 +151,7 @@ export class Button {
       this.session.dispose();
       this.session = null;
     }
-    this.closeMenu();
-    this.closeRecovery();
-    this.menu.remove(); // it lives on document.body, so clean it up
+    this.dispose();
     this._dismissed = true;
     this._pendingDownload = null; // user is leaving — drop any queued download
     this.el.style.display = "none";
@@ -166,6 +168,7 @@ export class Button {
   }
 
   setStarting() {
+    this._cancelDownload();
     this._clearErrorRevert();
     this.closeRecovery();
     this.closeMenu();
@@ -179,7 +182,7 @@ export class Button {
 
   /** ``status`` is the raw JobStatus from the backend. */
   showStatus(status) {
-    if (this.session?.failed) return;
+    if (this._retired || this.session?.failed) return;
     // Remember the title for the download filename; it arrives on every
     // snapshot but isn't otherwise displayed.
     if (status.title) this.title = status.title;
@@ -251,6 +254,7 @@ export class Button {
   }
 
   setError(label) {
+    if (this._retired) return;
     this._clearErrorRevert();
     this.closeMenu();
     this.menu.remove();
@@ -310,6 +314,7 @@ export class Button {
   }
 
   openRecovery({ focus = false } = {}) {
+    if (this._retired) return;
     if (!this.recovery.isConnected) document.body.appendChild(this.recovery);
     this.recovery.hidden = false;
     this._positionPanel(this.recovery);
@@ -333,6 +338,7 @@ export class Button {
   }
 
   async toggle() {
+    if (this._retired) return;
     if (this.session && !this.session.disposed) {
       if (this.session.failed) {
         this.openRecovery({ focus: true });
@@ -351,9 +357,40 @@ export class Button {
     // this, a button torn down on SPA navigation (video emptied) leaves its
     // hidden menu orphaned on document.body, one per navigation. openMenu()
     // re-appends it if this same button is later reused.
+    this._cancelDownload();
+    this._revokeDownloadUrls();
     this.closeMenu();
     this.menu.remove();
     this.setIdle();
+  }
+
+  /** Permanently retire a detached/replaced video's UI and owned work. */
+  destroy() {
+    if (this._retired) return;
+    this._retired = true;
+    this.session?.dispose({ restore: false });
+    this.session = null;
+    this.dispose();
+    this.el.remove();
+  }
+
+  _cancelDownload() {
+    const download = this._download;
+    this._download = null;
+    if (download) {
+      clearTimeout(download.pollTimer);
+      download.controller.abort();
+    }
+    this._downloading = false;
+    this._pendingDownload = null;
+  }
+
+  _revokeDownloadUrls() {
+    for (const [url, timer] of this._downloadUrls) {
+      clearTimeout(timer);
+      URL.revokeObjectURL(url);
+    }
+    this._downloadUrls.clear();
   }
 
   // The download menu. MP3 (audio only) plus MP4 at a few resolution caps.
@@ -407,7 +444,7 @@ export class Button {
   }
 
   openMenu() {
-    if (this._downloading || this.session?.failed) return;
+    if (this._retired || this._downloading || this.session?.failed) return;
     // The menu lives on document.body and is removed on dispose() (so a
     // torn-down button doesn't orphan it). The button itself is reusable
     // after dispose() → setIdle(), so re-attach before measuring/positioning.
@@ -445,7 +482,7 @@ export class Button {
    *  to completion (the user can pause / stop watching), saving automatically
    *  when it's ready. ``format`` is "mp3" or "mp4"; ``height`` caps MP4 res. */
   download(format, height = 0) {
-    if (!this.session?.jobId || this.session.failed) return;
+    if (this._retired || !this.session?.jobId || this.session.disposed || this.session.failed) return;
     if (this._downloading) return; // a fetch is already in flight
     if (this._ready) {
       this._startDownload(format, height);
@@ -465,10 +502,14 @@ export class Button {
    *  <a download> to the backend would have its filename ignored. */
   async _startDownload(format, height = 0) {
     const jobId = this.session?.jobId;
-    if (!jobId || this.session.failed) return;
+    if (this._retired || !jobId || this.session.disposed || this.session.failed) return;
     const backendUrl = this.session.config.backendUrl;
     if (this._downloading) return; // ignore double-clicks mid-download
     this._downloading = true;
+    const download = { controller: new AbortController(), pollTimer: null };
+    this._download = download;
+    const { signal } = download.controller;
+    const current = () => this._download === download && !signal.aborted;
 
     const ext = format === "mp4" ? "mp4" : "mp3";
     const q = height ? `?max_height=${height}` : "";
@@ -486,40 +527,52 @@ export class Button {
 
     // MP4 prep can take a while (download + mux/re-encode); poll the backend
     // so the pill shows real "Fetching N%" / "Encoding N%" progress.
-    let pollTimer = null;
     if (format === "mp4") {
       const progUrl = `${backendUrl}/video/${jobId}/progress${q}`;
       const poll = async () => {
+        if (!current()) return;
         try {
-          const r = await fetch(progUrl, { cache: "no-store" });
-          if (r.ok) this._showExportProgress(await r.json());
+          const r = await fetch(progUrl, { cache: "no-store", signal });
+          if (!current()) return;
+          if (r.ok) {
+            const progress = await r.json();
+            if (!current()) return;
+            this._showExportProgress(progress);
+          }
         } catch (err) {
-          dlog("export progress poll failed (transient)", err?.name || err);
+          if (current()) dlog("export progress poll failed (transient)", err?.name || err);
+        }
+        if (current()) {
+          download.pollTimer = setTimeout(() => {
+            download.pollTimer = null;
+            poll();
+          }, 600);
         }
       };
-      pollTimer = setInterval(poll, 600);
       poll();
     }
 
-    let objUrl = null;
     try {
       // no-store: never reuse a cached response. Older backends served raw
       // Opus at the ?format=mp3 URL with a 24h cache header, which the
       // browser would otherwise keep handing back instead of the real MP3.
-      const resp = await fetch(url, { cache: "no-store" });
+      const resp = await fetch(url, { cache: "no-store", signal });
+      if (!current()) return;
       if (!resp.ok) {
         throw new Error(
           resp.status === 425 ? "not ready" : `HTTP ${resp.status}`,
         );
       }
       const blob = await resp.blob();
-      // Stop progress polling the moment the bytes arrive, before we restore
-      // the label, so a late poll can't overwrite it.
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
-      objUrl = URL.createObjectURL(blob);
+      if (!current()) return;
+      const objUrl = URL.createObjectURL(blob);
+      // Invalidate the operation before saving: a pending progress body must
+      // never repaint the pill after the completed download restores it.
+      this._cancelDownload();
+      const revokeTimer = setTimeout(() => {
+        if (this._downloadUrls.delete(objUrl)) URL.revokeObjectURL(objUrl);
+      }, 10000);
+      this._downloadUrls.set(objUrl, revokeTimer);
       const a = document.createElement("a");
       a.href = objUrl;
       a.download = `${sanitizeFilename(this.title) || "nomusic"}.${ext}`;
@@ -529,14 +582,12 @@ export class Button {
       a.remove();
       this._restoreAfterDownload();
     } catch (err) {
-      console.warn("[nomusic] download failed", err);
-      this._flashDownloadError();
+      if (current()) {
+        console.warn("[nomusic] download failed", err);
+        this._flashDownloadError();
+      }
     } finally {
-      if (pollTimer) clearInterval(pollTimer);
-      this._downloading = false;
-      // Revoke after the click-initiated download has had time to start;
-      // revoking immediately can cancel it in some browsers.
-      if (objUrl) setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
+      if (current()) this._cancelDownload();
     }
   }
 
@@ -555,7 +606,7 @@ export class Button {
   /** Return the pill to its post-download resting visual: "nomusic on" if the
    *  session is still live, otherwise idle. */
   _restoreAfterDownload() {
-    if (this.session?.failed) return;
+    if (this._retired || this.session?.failed) return;
     if (this.session && !this.session.disposed) {
       this.el.dataset.state = "active";
       this.label.textContent = "nomusic on";
@@ -585,7 +636,8 @@ export class Button {
     // Top-right keeps us clear of the bottom control bar / scrubber, which
     // otherwise overlaps the pill (badly at the end of a video when the
     // progress bar is full).
-    host.appendChild(this.el);
+    if (this._retired) return;
+    if (this.el.parentElement !== host) host.appendChild(this.el);
     this.el.style.right = "12px";
     this.el.style.top = "12px";
     if (this.recovery.isConnected) this._positionPanel(this.recovery);

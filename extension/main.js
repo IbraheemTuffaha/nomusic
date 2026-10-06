@@ -19,6 +19,8 @@ function anchorButton(btn) {
     // rather than let it strand in a window-sized fallback host; it re-appears
     // on the next re-anchor once a real player is back.
     btn.el.style.display = "none";
+    btn.closeMenu();
+    btn.closeRecovery();
     return;
   }
   // Our position:absolute needs a positioned host, re-asserted every time: the
@@ -28,6 +30,7 @@ function anchorButton(btn) {
   if (getComputedStyle(host).position === "static") {
     host.style.position = "relative";
   }
+  if (btn.el.parentElement !== host) btn.closeMenu();
   btn.position(host);
   if (!btn._dismissed) btn.el.style.display = "";
 }
@@ -35,17 +38,7 @@ function anchorButton(btn) {
 function attachToVideo(video) {
   // Skip tiny/decorative videos (autoplay ads, etc.).
   if (video.clientWidth > 0 && video.clientWidth < 200) return;
-  const existing = attached.get(video);
-  if (existing) {
-    // Already has a live button — reanchorButtons() handles repositioning it.
-    if (liveButtons.has(existing)) return;
-    // Its button was retired when this element briefly disconnected, but the
-    // same element is back: YouTube reuses one persistent <video> across SPA
-    // routes. Tear the stale button (and any session) down and re-attach below.
-    existing.session?.dispose?.();
-    existing.dispose?.();
-    existing.el.remove();
-  }
+  if (attached.has(video)) return;
   // No visible player box yet — a route change can land before the new player
   // is laid out. Record nothing so the next refresh() pass retries once it has
   // a size, instead of skipping this element forever (the "no button until I
@@ -63,10 +56,12 @@ function attachToVideo(video) {
 function reanchorButtons() {
   for (const btn of liveButtons) {
     if (!btn.video || !btn.video.isConnected) {
-      btn.el.style.display = "none"; // its video is gone — don't leave it stranded
       liveButtons.delete(btn);
+      attached.delete(btn.video);
+      btn.destroy();
       continue;
     }
+    btn.session?.checkSource();
     anchorButton(btn);
   }
 }
@@ -126,10 +121,15 @@ function init() {
         }
       }
     }
+    // Reconcile the final batch state: reparenting a connected miniplayer
+    // keeps its session; actual removal retires every owned resource.
+    reanchorButtons();
   });
   observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
+    attributes: true,
+    attributeFilter: ["src"],
   });
 
   // Re-anchor on layout shifts that re-parent, resize, or remove the player:

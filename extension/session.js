@@ -136,7 +136,9 @@ export class Session {
         this._sendPrioritizeHint();
       },
       ratechange: () => this.scheduler?.reschedule(),
-      emptied: () => this.dispose(),
+      emptied: () => this.dispose({ restore: false }),
+      loadstart: () => this.checkSource(),
+      loadedmetadata: () => this.checkSource(),
       volumechange: () => this.muteController?.handleHostVolumeChange(),
     };
     this.playback = new PlaybackIntent(video, (wantsPlay) =>
@@ -147,6 +149,7 @@ export class Session {
     if (this.disposed || this.failed) return;
     if (this._starting) return this._starting;
     this.sourceUrl ||= resolveSourceUrl();
+    this.mediaSource ||= { src: this.video.src || "", current: this.video.currentSrc || "" };
     // Suppression and the hold belong to the selection, including while the
     // first request is pending or when setup fails. Retry keeps these owners.
     this.playback.hold();
@@ -559,6 +562,24 @@ export class Session {
     for (const [name, handler] of Object.entries(this._boundHandlers)) {
       this.video.removeEventListener(name, handler);
     }
+  }
+
+  /** Navigation can reuse a video without emitting emptied. Compare the
+   *  playing YouTube identity, not its miniplayer's surrounding page URL. */
+  checkSource() {
+    if (this.disposed || !this.sourceUrl || !this.mediaSource) return;
+    const playing = normalizeWatchUrl(resolveSourceUrl());
+    const original = normalizeWatchUrl(this.sourceUrl);
+    const current = this.video.currentSrc || "";
+    if ((playing && original && playing !== original) ||
+        (this.video.src || "") !== this.mediaSource.src ||
+        (current && this.mediaSource.current && current !== this.mediaSource.current)) {
+      this.dispose({ restore: false });
+      return;
+    }
+    // First metadata can arrive after the initial request; remember it once
+    // without confusing resource initialization with a replacement.
+    if (!this.mediaSource.current && current) this.mediaSource.current = current;
   }
 
   dispose({ restore = true } = {}) {
