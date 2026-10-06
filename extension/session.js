@@ -174,7 +174,8 @@ export class Session {
     if (signal.aborted || this.disposed) return;
     this._adoptJob(info);
     if (info.state === "error") { this.fail(info.phase_label || "Processing failed"); return; }
-    this.button.showStatus(info);
+    if (this._streamPausedClosed && !this.button._pendingDownload) this.button.setPaused();
+    else this.button.showStatus(info);
     try {
       const caps = await this.fetchCapabilities();
       if (signal.aborted || this.disposed) return;
@@ -192,8 +193,10 @@ export class Session {
     await this.scheduler.init();
     if (signal.aborted || this.disposed) return;
     this.muteController.refresh();
-    this._sendPrioritizeHint();
-    this._openEventStream();
+    if (!this._streamPausedClosed || this.button._pendingDownload) {
+      this._sendPrioritizeHint();
+      this._openEventStream();
+    }
     this.startBufferMonitor();
   }
 
@@ -287,12 +290,11 @@ export class Session {
   _onPlaybackIntent(wantsPlay) {
     if (this.disposed) return;
     if (this.failed) { this.playback.hold(); return; }
-    if (!this.scheduler) return; // Startup will use the latest captured intent.
     if (wantsPlay) {
       this._onUserPlay();
       this._reconcileBufferState();
     } else {
-      this.scheduler.stopAll();
+      this.scheduler?.stopAll();
       this._onUserPause();
     }
   }
@@ -324,7 +326,7 @@ export class Session {
     if (this.disposed || this._streamEnded) return;
     if (!this.eventSource) {
       this._streamPausedClosed = false;
-      this._resumeProcessing(); // respawn the worker + reopen the stream
+      if (!this._starting) this._resumeProcessing(); // Startup will open its own stream.
     }
   }
 
@@ -334,6 +336,7 @@ export class Session {
   _onUserPlay() {
     if (this.disposed || this._streamEnded || !this._streamPausedClosed) return;
     this._streamPausedClosed = false;
+    if (this._starting) return;
     this._resumeProcessing();
   }
 

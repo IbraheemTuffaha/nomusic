@@ -327,3 +327,76 @@ test("optional capabilities time out after five seconds and startup uses default
   assert.equal(f.session.chunkSeconds, 10);
   assert.equal(f.streams.length, 1);
 });
+
+for (const stage of ["process", "capabilities", "audio init"]) {
+  for (const resume of [false, true]) {
+    test(`an explicit startup pause during ${stage}${resume ? " followed by play uses the original POST" : " keeps processing paused"}`, async (t) => {
+      const pending = deferred(), reached = deferred();
+      const f = fixture(t, {
+        fetch: ({ path }) => {
+          if (path === `/${stage}`) { reached.resolve(); return pending.promise; }
+        },
+        init: async () => {
+          if (stage === "audio init") { reached.resolve(); await pending.promise; }
+        },
+      });
+      const starting = f.session.start();
+      await reached.promise;
+      f.video.pause(); // Already held: MAIN-world intent must still reach startup.
+      await settle();
+      assert.equal(f.session.playback.wantsPlay, false);
+      if (resume) {
+        await f.video.play();
+        await settle();
+        assert.equal(f.session.playback.wantsPlay, true);
+        assert.equal(f.posts().length, 1, "play must not start a competing resume POST");
+      }
+      pending.resolve(stage === "process" ? json(job())
+        : stage === "capabilities" ? json({ defaults: {} }) : undefined);
+      await starting;
+      assert.equal(f.posts().length, 1);
+      assert.equal(f.streams.length, resume ? 1 : 0);
+      if (!resume) {
+        assert.equal(f.session.eventSource, null);
+        assert.equal(f.session.button.el.dataset.state, "paused");
+        t.mock.timers.tick(60_000);
+        await settle();
+        assert.equal(f.posts().length, 1, "a paused startup must not reconnect later");
+      }
+      assert.equal(f.video.volume, 0);
+      assert.equal(f.video.paused, true);
+    });
+  }
+}
+
+test("initially paused activation still starts processing without requesting playback", async (t) => {
+  const f = fixture(t, { paused: true });
+  await f.session.start();
+  assert.equal(f.posts().length, 1);
+  assert.equal(f.streams.length, 1);
+  f.session.chunks.set(0, { buffer: { duration: 10 }, playStart: 0 });
+  f.session._reconcileBufferState();
+  assert.equal(f.session.playback.held, false);
+  assert.equal(f.session.playback.wantsPlay, false);
+  assert.equal(f.video.paused, true);
+  assert.equal(f.video.playCalls, 0);
+});
+
+test("a queued download overrides startup pause without a competing process request", async (t) => {
+  const pending = deferred(), reached = deferred();
+  const f = fixture(t, { init: async () => { reached.resolve(); await pending.promise; } });
+  const starting = f.session.start();
+  await reached.promise;
+  f.video.pause();
+  await settle();
+  f.session.button._pendingDownload = { format: "mp3" };
+  f.session.ensureLiveForDownload();
+  await settle();
+  assert.equal(f.posts().length, 1);
+  pending.resolve();
+  await starting;
+  assert.equal(f.streams.length, 1);
+  assert.equal(f.posts().length, 1);
+  assert.equal(f.session.playback.wantsPlay, false);
+  assert.equal(f.video.paused, true);
+});
