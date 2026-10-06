@@ -68,6 +68,20 @@ without changing whether the user wants it to play. The page bridge observes
 explicit pause calls even when the video is already held; newly available audio
 therefore cannot resume a video the user deliberately paused.
 
+Selecting nomusic pauses and suppresses the original track before contacting
+the backend. A terminal setup, processing, chunk or stream error retains that
+suppression and shows persistent **Retry** and **Return to original** actions.
+Retry restarts processing in the same session without resetting volume or
+play/pause intent. Only an explicit return restores the original track.
+
+The session owns SSE reconnection: errors in either connecting or closed state
+receive three retries with 0.5, 1 and 2 second delays. Each retry re-submits the
+job before opening its stream, allowing a restarted backend to resume cached
+work. A valid status for that job resets the retry budget. An initial stream
+snapshot has a 15-second deadline; processing requests have 30 seconds, and
+optional capabilities requests have five. User pause cancels reconnect work
+unless a queued export still needs processing.
+
 ## Backend settings
 
 Set variables before starting the helper. These are local tuning controls,

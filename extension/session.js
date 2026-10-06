@@ -58,6 +58,10 @@ export class Session {
     };
     this._requests = new AbortController();
     this._resuming = null;
+    this._starting = null;
+    this._reconnectTimer = null;
+    this._streamTimer = null;
+    this._reconnectAttempts = 0;
     // Web Audio graph + chunk scheduling + sync monitor (created in start()).
     this.scheduler = null;
     // Owns host-video muting + volume mirroring; created in start().
@@ -79,7 +83,7 @@ export class Session {
     // idx -> { buffer: AudioBuffer, playStart: number }. The loader writes
     // and evicts entries; the scheduler reads this shared window.
     this.chunks = new Map();
-    this._chunkError = false;
+    this.failed = false;
     this.loader = new ChunkLoader({
       chunks: this.chunks,
       getTime: () => this.video.currentTime,
@@ -88,7 +92,7 @@ export class Session {
       getChunkUrl: (idx) => `${this.config.backendUrl}/chunk/${this.jobId}/${idx}`,
       decode: (encoded) => this.scheduler.decode(encoded),
       onChunk: (idx, entry) => this._chunkArrived(idx, entry),
-      onError: (message) => this._failChunk(message),
+      onError: (message) => this.fail(message),
       onWindowChange: () => this.scheduler?.pruneBuffers(),
     });
     // SSE stream of backend status (replaces /status polling). Opened in
@@ -137,159 +141,152 @@ export class Session {
   }
 
   async start() {
-    // Pin the video's URL up front so every later /process (resume after a
-    // pause/idle-abandon) targets this same video, even if the SPA has since
-    // changed window.location.href. Resolve it from the player rather than the
-    // address bar so starting from the YouTube miniplayer captures the playing
-    // video, not the homepage the user is browsing.
-    this.sourceUrl = resolveSourceUrl();
-    this.video.addEventListener("emptied", this._boundHandlers.emptied);
-    let info;
+    if (this.disposed || this.failed) return;
+    if (this._starting) return this._starting;
+    this.sourceUrl ||= resolveSourceUrl();
+    // Suppression and the hold belong to the selection, including while the
+    // first request is pending or when setup fails. Retry keeps these owners.
+    this.playback.hold();
+    this.attachVideoListeners();
+    this.button.setStarting();
+    const signal = this._requests.signal;
+    const attempt = this._startProcessing(signal);
+    this._starting = attempt;
     try {
-      info = await this.requestJob();
+      await attempt;
     } catch (err) {
-      if (this.disposed) return;
-      console.warn("[nomusic] /process failed", err);
-      this.button.setError("backend unreachable");
-      // Mark the session terminal but leave the error visual alone so
-      // the auto-revert timer can do its 2.5s display. Without this the
-      // first post-error click would just dispose this dead session
-      // instead of starting a fresh one.
-      this.dispose({ preserveButtonState: true });
-      return;
+      if (!signal.aborted && !this.disposed) {
+        dlog("playback setup failed", err?.name || err);
+        this.fail("Could not start playback. Check the backend and site permissions.");
+      }
+    } finally {
+      if (this._starting === attempt) this._starting = null;
     }
-    // start() awaits above (the multi-second probe). If the session was
-    // disposed meanwhile (a second click / toggle started a new session),
-    // abort — otherwise this disposed session would go on to create its own
-    // AudioContext and play in parallel with the live one, two music-removed
-    // streams slightly offset = comb-filter "stutter".
-    if (this.disposed) return;
+  }
 
+  async _startProcessing(signal) {
+    if (!this.muteController) {
+      this.muteController = new MuteController(this.video, (level, immediate) =>
+        this.scheduler?.setVolume(level, immediate));
+      this.muteController.mute();
+    }
+    const info = await this.requestJob();
+    if (signal.aborted || this.disposed) return;
     this._adoptJob(info);
+    if (info.state === "error") { this.fail(info.phase_label || "Processing failed"); return; }
     this.button.showStatus(info);
-
     try {
       const caps = await this.fetchCapabilities();
+      if (signal.aborted || this.disposed) return;
       this.chunkSeconds = caps?.defaults?.chunk_seconds ?? this.chunkSeconds;
-      this.chunkOverlapSeconds =
-        caps?.defaults?.chunk_overlap_seconds ?? this.chunkOverlapSeconds;
+      this.chunkOverlapSeconds = caps?.defaults?.chunk_overlap_seconds ?? this.chunkOverlapSeconds;
     } catch (err) {
-      // capabilities is best-effort; defaults are reasonable.
       dlog("capabilities fetch failed; using defaults", err?.name || err);
     }
-    if (this.disposed) return; // re-check after the second await (see above).
-
-    // The scheduler owns the audio graph, chunk scheduling, the time-stretcher,
-    // and the sync monitor. It reads the shared chunk map and a couple of live
-    // getters (stride/total chunks). init() creates the AudioContext + loads
-    // stretch.js (one more await — re-check disposed after it).
+    if (signal.aborted || this.disposed) return;
     this.scheduler = new AudioScheduler(this.video, {
       chunks: this.chunks,
       getStride: () => this.chunkSeconds - this.chunkOverlapSeconds,
       getTotalChunks: () => this.totalChunks,
     });
     await this.scheduler.init();
-    if (this.disposed) return;
-
-    // Mute the host video and mirror its volume onto our audio output. The
-    // callback hands the effective level to the scheduler's gain.
-    this.muteController = new MuteController(this.video, (level, immediate) =>
-      this.scheduler?.setVolume(level, immediate),
-    );
-    this.muteController.mute();
-    // Pause the host video until chunk 0 is on disk; resume from the
-    // chunk-fetch handler. Better than playing silent: the user doesn't
-    // miss any seconds of content while the first chunk is being made.
-    // This is the initial pause — we deliberately don't relabel the
-    // button to "Buffering" here because the live phase label
-    // (Downloading / Removing music %) is more informative.
-    this._pauseForBuffer({ showBufferingLabel: false });
-    this.attachVideoListeners();
-    // Tell the backend to start where the user actually is, not at
-    // chunk 0 — handles YouTube's "resume from history", &t=NNN URL
-    // params, and any pre-scrub before the user clicked nomusic. The
-    // hint is debounced 250 ms, which still lands well before the
-    // probe + download phases finish on the backend.
-    const startChunk = this._chunkIdxForTime(this.video.currentTime);
-    dlog("session start", {
-      currentTime: this.video.currentTime,
-      chunk: startChunk,
-      totalChunks: this.totalChunks,
-      chunkSeconds: this.chunkSeconds,
-    });
+    if (signal.aborted || this.disposed) return;
+    this.muteController.refresh();
     this._sendPrioritizeHint();
-    // Open the status stream now — after audioCtx + capabilities exist, so
-    // the first event (especially a cached replay's immediate terminal
-    // event) can decode chunks with the right stride. This is still within
-    // a few hundred ms of /process, far inside the backend's idle window.
     this._openEventStream();
     this.startBufferMonitor();
   }
 
-  async requestJob() {
+  async _fetchJSON(path, options, timeoutMs) {
+    const parent = this._requests.signal;
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    parent.addEventListener("abort", abort, { once: true });
+    if (parent.aborted) abort();
+    const timer = setTimeout(abort, timeoutMs);
+    try {
+      const response = await fetch(`${this.config.backendUrl}${path}`, {
+        ...options, signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return await response.json();
+    } finally {
+      clearTimeout(timer);
+      parent.removeEventListener("abort", abort);
+    }
+  }
+
+  requestJob() {
     const body = { url: this.sourceUrl || window.location.href };
     if (this.config.model) body.model = this.config.model;
     if (this.config.keepStems) body.keep_stems = this.config.keepStems;
-    const resp = await fetch(`${this.config.backendUrl}/process`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    return this._fetchJSON("/process", {
+      method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: this._requests.signal,
-    });
-    if (!resp.ok) {
-      const detail = await resp.text().catch(() => "");
-      throw new Error(`${resp.status}: ${detail}`);
-    }
-    return resp.json();
+    }, 30_000);
   }
 
-  async fetchCapabilities() {
-    const resp = await fetch(`${this.config.backendUrl}/capabilities`, {
-      signal: this._requests.signal,
-    });
-    if (!resp.ok) return null;
-    return resp.json();
+  fetchCapabilities() {
+    return this._fetchJSON("/capabilities", {}, 5_000);
   }
 
-  /** Subscribe to the backend's SSE status stream. EventSource handles
-   *  reconnection on transient network drops on its own; the backend
-   *  returns 204 for an unknown job, which drives readyState to CLOSED and
-   *  stops the reconnect loop. */
+  _closeEventStream() {
+    clearTimeout(this._streamTimer);
+    this._streamTimer = null;
+    this.eventSource?.close();
+    this.eventSource = null;
+  }
+
+  /** Own reconnection so CONNECTING and CLOSED failures both have a budget.
+   *  Re-POST before reopening: a restarted backend may need to respawn work. */
   _openEventStream() {
-    if (this.disposed) return;
-    const stream = new EventSource(
-      `${this.config.backendUrl}/events/${this.jobId}`,
-    );
+    if (this.disposed || this.failed) return;
+    this._closeEventStream();
+    let stream;
+    try {
+      stream = new EventSource(`${this.config.backendUrl}/events/${this.jobId}`);
+    } catch {
+      this._recoverStream();
+      return;
+    }
     this.eventSource = stream;
-    stream.onmessage = (e) => {
-      if (this.disposed || this.eventSource !== stream) return;
-      let payload;
-      try {
-        payload = JSON.parse(e.data);
-      } catch (err) {
-        console.warn("[nomusic] bad SSE payload", err);
-        return;
-      }
-      this.handleStatus(payload);
+    // The backend sends an initial snapshot immediately. Once it arrives,
+    // inference may take much longer; SSE keepalives maintain the connection.
+    this._streamTimer = setTimeout(() => this._recoverStream(), 15_000);
+    stream.onmessage = (event) => {
+      if (this.disposed || this.failed || this.eventSource !== stream) return;
+      let status;
+      try { status = JSON.parse(event.data); } catch { return; }
+      if (!status || status.job_id !== this.jobId ||
+          !["queued", "probing", "downloading", "processing", "ready", "error"].includes(status.state)) return;
+      clearTimeout(this._streamTimer);
+      this._streamTimer = null;
+      this._reconnectAttempts = 0;
+      this.handleStatus(status);
     };
     stream.onerror = () => {
-      if (this.disposed || this.eventSource !== stream) return;
-      // A 204 (unknown job) or our own .close() on a terminal state puts
-      // readyState at CLOSED — there's no more stream to wait on. A
-      // transient drop instead sits in CONNECTING while EventSource retries,
-      // so we leave _streamEnded alone in that case.
-      if (
-        this.eventSource &&
-        this.eventSource.readyState === EventSource.CLOSED
-      ) {
-        this._streamEnded = true;
-      }
+      if (this.eventSource === stream) this._recoverStream();
     };
+  }
+
+  _recoverStream() {
+    this._closeEventStream();
+    if (this.disposed || this.failed || this._streamEnded || this._streamPausedClosed) return;
+    if (this._reconnectTimer) return;
+    if (this._reconnectAttempts === 3) {
+      this.fail("Connection lost. Check the backend and retry.");
+      return;
+    }
+    const delay = 500 * 2 ** this._reconnectAttempts++;
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      this._resumeProcessing();
+    }, delay);
   }
 
   _onPlaybackIntent(wantsPlay) {
     if (this.disposed) return;
-    if (this._chunkError) { this.playback.hold(); return; }
+    if (this.failed) { this.playback.hold(); return; }
     if (!this.scheduler) return; // Startup will use the latest captured intent.
     if (wantsPlay) {
       this._onUserPlay();
@@ -311,10 +308,9 @@ export class Session {
     // track finishes processing and the file is delivered even though the user
     // stopped watching. The pill keeps showing "Preparing N%".
     if (this.button && this.button._pendingDownload) return;
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
-    }
+    this._closeEventStream();
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = null;
     this._streamPausedClosed = true;
     // Replace the frozen live label (e.g. "Removing music 41%") with a
     // "Paused" signal so it's clear we've stopped, not stalled.
@@ -342,13 +338,16 @@ export class Session {
   }
 
   async _resumeProcessing() {
-    if (this.disposed || this._chunkError) return;
+    if (this.disposed || this.failed) return;
     if (this._resuming) return this._resuming;
-    this._resuming = this._resumeJob();
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = null;
+    const attempt = this._resumeJob();
+    this._resuming = attempt;
     try {
-      await this._resuming;
+      await attempt;
     } finally {
-      this._resuming = null;
+      if (this._resuming === attempt) this._resuming = null;
     }
   }
 
@@ -356,11 +355,10 @@ export class Session {
     if (this.jobId && info.job_id !== this.jobId) {
       this._requests.abort();
       this._requests = new AbortController();
-      this.eventSource?.close();
-      this.eventSource = null;
+      this._closeEventStream();
       this.scheduler?.reset();
       this.loader.reset();
-      this._chunkError = false;
+      this.failed = false;
       this._streamEnded = false;
     }
     this.jobId = info.job_id;
@@ -369,19 +367,20 @@ export class Session {
   }
 
   async _resumeJob() {
+    const signal = this._requests.signal;
     let info;
     try {
       info = await this.requestJob();
     } catch (err) {
-      // Backend unreachable on resume; reopening the stream below will
-      // surface the failure (204/CLOSED) without crashing playback.
-      dlog("resume requestJob failed", err?.name || err);
+      if (!signal.aborted) this._recoverStream();
+      return;
     }
-    if (this.disposed || this._chunkError) return;
+    if (signal.aborted || this.disposed || this.failed) return;
     // A user can pause again while /process is in flight. That latest choice
     // still owns the stream unless a queued export needs processing to finish.
     if (this._streamPausedClosed && !this.button._pendingDownload) return;
     if (info?.job_id) this._adoptJob(info);
+    if (info?.state === "error") { this.fail(info.phase_label || "Processing failed"); return; }
     if (!this.eventSource) this._openEventStream();
     // Re-point the worker at where the user actually is, in case it was
     // abandoned and respawned with a from-scratch chunk order.
@@ -392,54 +391,63 @@ export class Session {
    *  poll loop did per tick: repaint the label, fetch any newly-ready
    *  chunks, and tear down on a terminal state. */
   handleStatus(status) {
-    if (this.disposed || this._chunkError) return;
+    if (this.disposed || this.failed) return;
     this.totalChunks = status.total_chunks || this.totalChunks;
-    // Always reflect the backend phase in the label, even while we're
-    // paused for buffering — the pulsing icon + paused video already
-    // convey "waiting", and the phase label is more useful content.
-    this.button.showStatus(status);
-
     if (status.state === "error") {
-      this._streamEnded = true;
-      if (this.eventSource) this.eventSource.close();
-      this.dispose({ preserveButtonState: true });
+      this.fail(status.phase_label || "Processing failed");
       return;
     }
+    this.button.showStatus(status);
 
     this.loader.updateAvailable(Array.isArray(status.ready_chunks)
       ? status.ready_chunks : []);
 
     if (status.state === "ready") {
       this._streamEnded = true;
-      if (this.eventSource) this.eventSource.close();
+      this._closeEventStream();
     }
   }
 
   _chunkArrived(idx, entry) {
-    if (this.disposed || this._chunkError) return;
+    if (this.disposed || this.failed) return;
     if (this.playback.held && this._isBuffered(this.video.currentTime)) {
       this._resumeAfterBuffer();
     }
     if (!this.video.paused) this.scheduler.scheduleChunk(idx, entry);
   }
 
-  // T4 supplies the shared recovery UI. Retain suppression while a terminal
-  // acquisition error is visible instead of dispose() restoring original audio.
-  _failChunk(message) {
-    if (this.disposed || this._chunkError) return;
-    this._chunkError = true;
-    this._streamEnded = true;
-    this._requests.abort();
-    this.eventSource?.close();
-    this.eventSource = null;
-    clearTimeout(this.bufferTimer);
-    clearTimeout(this._prioritizeTimer);
-    this.scheduler?.stopAll();
+  /** Failure stops processing/audio work, but selection still owns silence. */
+  fail(message) {
+    if (this.disposed || this.failed) return;
+    this.failed = true;
     this.playback.hold();
+    this._stopProcessing();
     this.button.setError(message);
-    this.button._clearErrorRevert?.();
   }
 
+  async retry() {
+    if (this.disposed || !this.failed) return;
+    this.failed = false;
+    this._requests = new AbortController();
+    this._starting = this._resuming = null;
+    this._reconnectAttempts = 0;
+    this._streamEnded = this._streamPausedClosed = false;
+    this.jobId = null;
+    await this.start();
+  }
+
+  _stopProcessing() {
+    this._requests.abort();
+    this._closeEventStream();
+    for (const key of ["bufferTimer", "_prioritizeTimer", "_reconnectTimer"]) {
+      clearTimeout(this[key]);
+      this[key] = null;
+    }
+    this.scheduler?.dispose();
+    this.scheduler = null;
+    // Keep unabortable decodes charged to this loader even across Retry.
+    this.loader.reset();
+  }
 
   // -- buffer pause/resume -------------------------------------------------
 
@@ -471,11 +479,11 @@ export class Session {
    *  scrub doesn't generate dozens of POSTs. No-op once the stream has
    *  ended because the worker is already done. */
   _sendPrioritizeHint() {
-    if (this.disposed || this._streamEnded || !this.jobId) return;
+    if (this.disposed || this.failed || this._streamEnded || !this.jobId) return;
     if (this._prioritizeTimer) clearTimeout(this._prioritizeTimer);
     this._prioritizeTimer = setTimeout(() => {
       this._prioritizeTimer = null;
-      if (this.disposed || this._streamEnded || !this.jobId) return;
+      if (this.disposed || this.failed || this._streamEnded || !this.jobId) return;
       const fromChunk = this._chunkIdxForTime(this.video.currentTime);
       dlog("prioritize POST", { fromChunk, currentTime: this.video.currentTime });
       fetch(`${this.config.backendUrl}/process/${this.jobId}/prioritize`, {
@@ -491,10 +499,11 @@ export class Session {
 
   /** Buffering controls a temporary hold; it never changes user intent. */
   _reconcileBufferState() {
-    if (this.disposed || !this.scheduler) return;
-    if (this._chunkError) { this.playback.hold(); return; }
+    if (this.disposed) return;
+    if (this.failed) { this.playback.hold(); return; }
+    if (!this.scheduler) return;
     this.loader.reconcile();
-    if (this._chunkError) return;
+    if (this.failed) return;
     if (this._isBuffered(this.video.currentTime)) this._resumeAfterBuffer();
     else this._pauseForBuffer();
   }
@@ -502,7 +511,7 @@ export class Session {
   /** Maintain the chunk window and reconcile buffering every SYNC_CHECK_MS. */
   startBufferMonitor() {
     const tick = () => {
-      if (this.disposed) return;
+      if (this.disposed || this.failed) return;
       this.bufferTimer = setTimeout(tick, SYNC_CHECK_MS);
       this._reconcileBufferState();
     };
@@ -526,29 +535,15 @@ export class Session {
     }
   }
 
-  dispose({ preserveButtonState = false } = {}) {
+  dispose({ restore = true } = {}) {
     if (this.disposed) return;
     this.disposed = true;
-    this._requests.abort();
+    this._stopProcessing();
     this.loader.dispose();
     this.detachVideoListeners();
-    // Tears down the audio graph: stops sources, clears the sync monitor,
-    // closes the AudioContext, disposes the stretcher + caches.
-    this.scheduler?.dispose();
-    this.scheduler = null;
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
-    }
-    if (this.bufferTimer) clearTimeout(this.bufferTimer);
-    if (this._prioritizeTimer) clearTimeout(this._prioritizeTimer);
     this.muteController?.dispose();
     this.muteController = null;
-    this.playback.dispose({ restore: true });
-    this.chunks.clear();
-    // Error paths set the button to "error" and rely on its own
-    // auto-revert timer for the visual transition. Calling button.dispose
-    // here would clobber that.
-    if (!preserveButtonState) this.button.dispose();
+    this.playback.dispose({ restore });
+    this.button.dispose();
   }
 }
