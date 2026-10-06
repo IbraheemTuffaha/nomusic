@@ -25,6 +25,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -32,8 +33,8 @@ from typing import Any, Callable, Optional
 import numpy as np
 import soundfile as sf
 
-from config import SETTINGS
-from engines.base import Engine
+from nomusic.config import SETTINGS
+from nomusic.engines.base import Engine
 
 from .cache import CacheMeta, JobCache
 from .downloader import (
@@ -247,6 +248,18 @@ class _ProgressiveSource:
         progress callback and any chunk waiting in ``source_for`` is released."""
         self._cancel.set()
 
+    def close(self) -> None:
+        """Cancel and wait for the download's own cleanup to finish.
+
+        Cancellation is cooperative: a blocked network call still has to
+        return before the download can unwind. Keep ownership of its files
+        until then, rather than letting the processor exit with a live child.
+        Safe before ``start`` and after an earlier close.
+        """
+        self.cancel()
+        if self._thread.ident is not None:
+            self._thread.join()
+
     def _hook(self, d: dict) -> None:
         # Raising from a yt-dlp progress hook aborts the download — that's how a
         # cancel reaches the network thread.
@@ -388,8 +401,9 @@ class Processor:
         Returns ``(key, meta, info, plans, fetcher)``. ``fetcher`` is a
         :class:`SourceFetcher` holding an open yt-dlp session that already
         extracted ``info`` — the caller downloads from it (same session, no
-        second extraction). It's ``None`` on the resume fast-path, where the
-        duration comes from the cached meta and no extraction happened.
+        second extraction), or closes it if the prepared work is abandoned.
+        It's ``None`` on the resume fast-path, where the duration comes from the
+        cached meta and no extraction happened.
         """
         key = self.cache.key(
             url,
@@ -427,32 +441,36 @@ class Processor:
         # the JS-challenge extraction is paid once, not once here + again at
         # download time.
         fetcher = SourceFetcher(url, self.cache.source_dir(url))
-        info = fetcher.extract()
-        plans = plan_chunks(
-            info.duration_seconds,
-            self.chunk_seconds,
-            self.chunk_overlap_seconds,
-        )
-
-        # Reuse the existing meta only if it matches; otherwise rebuild.
-        if existing and existing.total_chunks == len(plans):
-            meta = existing
-            meta.title = info.title
-            meta.extractor = info.extractor
-        else:
-            meta = CacheMeta(
-                url=url,
-                model=model,
-                keep_stems=sorted(keep_stems),
-                duration_seconds=info.duration_seconds,
-                chunk_seconds=self.chunk_seconds,
-                chunk_overlap_seconds=self.chunk_overlap_seconds,
-                total_chunks=len(plans),
-                title=info.title,
-                extractor=info.extractor,
+        try:
+            info = fetcher.extract()
+            plans = plan_chunks(
+                info.duration_seconds,
+                self.chunk_seconds,
+                self.chunk_overlap_seconds,
             )
-        self.cache.save_meta(key, meta)
-        return key, meta, info, plans, fetcher
+
+            # Reuse the existing meta only if it matches; otherwise rebuild.
+            if existing and existing.total_chunks == len(plans):
+                meta = existing
+                meta.title = info.title
+                meta.extractor = info.extractor
+            else:
+                meta = CacheMeta(
+                    url=url,
+                    model=model,
+                    keep_stems=sorted(keep_stems),
+                    duration_seconds=info.duration_seconds,
+                    chunk_seconds=self.chunk_seconds,
+                    chunk_overlap_seconds=self.chunk_overlap_seconds,
+                    total_chunks=len(plans),
+                    title=info.title,
+                    extractor=info.extractor,
+                )
+            self.cache.save_meta(key, meta)
+            return key, meta, info, plans, fetcher
+        except BaseException:
+            fetcher.close()
+            raise
 
     # -- execution -----------------------------------------------------------
 
@@ -473,7 +491,21 @@ class Processor:
         progress, chunk ordering, abort); see :class:`RunHooks`. The CLI and
         tests usually pass none; jobs.py wires the live ones.
         """
-        hooks = hooks or RunHooks()
+        with ExitStack() as resources:
+            return self._run(
+                url, model=model, keep_stems=keep_stems,
+                hooks=hooks or RunHooks(), resources=resources,
+            )
+
+    def _run(
+        self,
+        url: str,
+        *,
+        model: str,
+        keep_stems: list[str],
+        hooks: RunHooks,
+        resources: ExitStack,
+    ) -> str:
         # Unpack into locals so the pipeline body below reads unchanged — RunHooks
         # only collapses the long optional-callback tail in the signature.
         on_probed = hooks.on_probed
@@ -483,11 +515,19 @@ class Processor:
         abort_check = hooks.abort_check
         on_wait_for_download = hooks.on_wait_for_download
 
+        if abort_check:
+            abort_check()
         key, meta, info, plans, fetcher = self.prepare_job(
             url, model=model, keep_stems=keep_stems
         )
+        if fetcher is not None:
+            # Covers preparation hooks, cache hits and executor setup failures.
+            # Once started, the downloader is joined before this scope exits.
+            resources.callback(fetcher.close)
         if on_probed:
             on_probed(info, plans, meta)
+        if abort_check:
+            abort_check()
 
         if meta.complete:
             log.info("Cache hit for %s (%d chunks)", url, meta.total_chunks)
@@ -519,18 +559,33 @@ class Processor:
             dl = _ProgressiveSource(
                 url, source_dir, info.duration_seconds, _yt_hook, fetcher=fetcher
             )
-            dl.start()
             source_for = lambda plan: dl.source_for(
                 plan, self.chunk_overlap_seconds, abort_check, on_wait_for_download
             )
-        elif fetcher is not None:
-            # First run: download from the session that already extracted info.
-            full = fetcher.download(progress_hook=_yt_hook)
-            source_for = lambda plan: full
         else:
-            # Resume: download the full source up front (cached source returns
-            # immediately); every chunk slices from it.
-            full = download_source(url, source_dir, progress_hook=_yt_hook)
+            def _sync_download_hook(d: dict) -> None:
+                # Cancellation must escape the UI hook's best-effort handler.
+                # SourceFetcher recognizes this exception and never retries it.
+                if abort_check:
+                    try:
+                        abort_check()
+                    except Exception as error:
+                        raise _DownloadCancelled() from error
+                _yt_hook(d)
+
+            try:
+                # Keep the first download in its extraction session; resumed
+                # work downloads directly or reuses an existing source file.
+                if fetcher is not None:
+                    full = fetcher.download(progress_hook=_sync_download_hook)
+                else:
+                    full = download_source(url, source_dir, progress_hook=_sync_download_hook)
+            except _DownloadCancelled:
+                # Restore the caller's control exception (WorkerAbandoned for
+                # jobs), keeping cancellation distinct from processing failure.
+                if abort_check:
+                    abort_check()
+                raise
             source_for = lambda plan: full
 
         plans_by_index = {p.index: p for p in plans}
@@ -602,6 +657,9 @@ class Processor:
                         dl.available_seconds(),
                         info.duration_seconds,
                     )
+                # Source acquisition may have waited past a stop request.
+                if abort_check:
+                    abort_check()
                 return self._decode_chunk(source_path, key, plan, model=model, dl=dl)
 
         # Batch up to BATCH chunks per GPU call: a single chunk leaves the GPU
@@ -621,6 +679,10 @@ class Processor:
                 inflight.append(decode_pool.submit(_next_decoded))
 
         try:
+            # Start only after preparation and executor setup have succeeded,
+            # inside the scope that owns cancellation and joins the child.
+            if dl is not None:
+                dl.start()
             _refill()
             while inflight:
                 # Block for the first ready chunk, then add only chunks that are
@@ -653,6 +715,11 @@ class Processor:
                     m = self.cache.load_meta(key)
                     if m:
                         on_progress(m, "separating")
+                # Prefetched inputs may have passed the provider's abort check
+                # before shutdown began. Recheck at the inference boundary so
+                # draining the current batch never starts another native call.
+                if abort_check:
+                    abort_check()
                 ti = time.perf_counter()
                 results = self.engine.infer_batch([w.prepared for w in batch_works])
                 dt = time.perf_counter() - ti
@@ -674,22 +741,23 @@ class Processor:
                     write_futures.pop(0).result()
             for f in write_futures:
                 f.result()
-        except BaseException:
-            # Abandon (idle), engine failure, or any other abort: stop the
-            # background download so it doesn't keep running (orphaned yt-dlp)
-            # and so a decode thread blocked in source_for waiting for bytes is
-            # released — otherwise the GPU lock stays held until the download
-            # happens to land.
+        finally:
+            # Release a decode waiting for download bytes before draining its
+            # executor. This applies to success as well as aborts: a caller's
+            # queue can finish while the source download is still running.
             if dl is not None:
                 dl.cancel()
-            raise
-        finally:
             # cancel_futures drops decodes still queued behind a cancel; the
-            # in-flight one is released by dl.cancel() above. Writes drain
-            # (wait, no cancel) so any already-separated chunk still lands.
-            decode_pool.shutdown(wait=True, cancel_futures=True)
-            write_pool.shutdown(wait=True)
-            _log_duty()
+            # in-flight one is released above. Writes drain so any already-
+            # separated chunk still lands. Join the downloader before returning
+            # or removing source files, including when executor cleanup fails.
+            try:
+                decode_pool.shutdown(wait=True, cancel_futures=True)
+                write_pool.shutdown(wait=True)
+            finally:
+                if dl is not None:
+                    dl.close()
+                _log_duty()
 
         # Mark complete when every chunk is on disk.
         all_present = all(
@@ -743,10 +811,11 @@ class Processor:
             # ffmpeg's open.
             if dl is not None and not src.exists():
                 src = dl.wait_complete()
-            with tempfile.TemporaryDirectory(prefix="nomusic-") as tmp_str:
+            with tempfile.TemporaryDirectory(prefix="decode-", dir=self.cache.scratch.path) as tmp_str:
                 raw = Path(tmp_str) / f"raw_{plan.index:03d}.wav"
                 t0 = time.perf_counter()
-                slice_source(src, raw, start=plan.start, end=plan.end)
+                slice_source(src, raw, start=plan.start, end=plan.end,
+                             pass_fds=(self.cache.scratch.fd,))
                 t_slice = time.perf_counter() - t0
                 t1 = time.perf_counter()
                 prepared = self.engine.prepare(raw, model=model)
@@ -912,13 +981,16 @@ class Processor:
             trimmed[-click_fade:] *= tail_ramp
 
         out = self.cache.chunk_path(key, plan.index)
-        tmp_path = out.with_suffix(".part")
-        _encode_opus(trimmed, sample_rate, tmp_path)
-        tmp_path.replace(out)
+        with tempfile.TemporaryDirectory(prefix="chunk-", dir=self.cache.scratch.path) as work:
+            tmp_path = Path(work) / "chunk.part"
+            _encode_opus(trimmed, sample_rate, tmp_path, pass_fds=(self.cache.scratch.fd,))
+            tmp_path.replace(out)
 
 
 
-def _encode_opus(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
+def _encode_opus(
+    audio: np.ndarray, sample_rate: int, out_path: Path, *, pass_fds: tuple[int, ...] = (),
+) -> None:
     """Encode ``audio`` (samples, channels) to OGG/Opus at ``out_path``.
 
     Pipes a WAV through ffmpeg's stdin and writes the resulting OGG/Opus
@@ -958,6 +1030,7 @@ def _encode_opus(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
             input=wav_buf.getvalue(),
             capture_output=True,
             timeout=_OPUS_ENCODE_TIMEOUT_SECONDS,
+            pass_fds=pass_fds,
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(

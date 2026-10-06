@@ -38,6 +38,12 @@ class Settings:
     host: str = field(default_factory=lambda: _env("HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: _env_int("PORT", 8723))
 
+    # One total process-level grace period for active jobs and HTTP responses.
+    # Warmup alone is disposable; it never consumes this grace period.
+    shutdown_grace_seconds: float = field(
+        default_factory=lambda: _env_float("SHUTDOWN_GRACE_SECONDS", 60.0)
+    )
+
     engine_name: str = field(default_factory=lambda: _env("ENGINE", "mlx"))
 
     cache_dir: Path = field(

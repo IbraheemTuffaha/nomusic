@@ -21,9 +21,9 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from pipeline import downloader
-from pipeline.cache import CHUNK_MEDIA_TYPE
-from pipeline.export import (
+from nomusic.pipeline import downloader
+from nomusic.pipeline.cache import CHUNK_MEDIA_TYPE
+from nomusic.pipeline.export import (
     MP4_COPYABLE_VCODECS,
     mp3_transcode_cmd,
     mux_video_cmd,
@@ -48,7 +48,7 @@ _STREAM_BLOCK_BYTES = 65536
 _FFMPEG_TIMEOUT_SECONDS = 3600.0
 
 
-def _run_ffmpeg(cmd: list[str]) -> None:
+def _run_ffmpeg(cmd: list[str], *, pass_fds: tuple[int, ...] = ()) -> None:
     """Run an ffmpeg command, surfacing its stderr as a 500 on failure.
 
     Mirrors slice_source's error handling: capture stderr so a failure carries
@@ -56,7 +56,7 @@ def _run_ffmpeg(cmd: list[str]) -> None:
     """
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECONDS
+            cmd, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECONDS, pass_fds=pass_fds
         )
     except subprocess.TimeoutExpired as exc:
         log.error("ffmpeg timed out after %.0fs", _FFMPEG_TIMEOUT_SECONDS)
@@ -70,7 +70,9 @@ def _run_ffmpeg(cmd: list[str]) -> None:
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {detail}")
 
 
-def _run_ffmpeg_progress(cmd: list[str], total_seconds: float, on_pct) -> None:
+def _run_ffmpeg_progress(
+    cmd: list[str], total_seconds: float, on_pct, *, pass_fds: tuple[int, ...] = (),
+) -> None:
     """Run ffmpeg, streaming completion fraction to ``on_pct`` as it encodes.
 
     ``cmd`` must start with ``ffmpeg``; we inject ``-progress pipe:1`` so ffmpeg
@@ -85,7 +87,7 @@ def _run_ffmpeg_progress(cmd: list[str], total_seconds: float, on_pct) -> None:
     # reading stdout — a classic pipe deadlock. A file never blocks the writer.
     with tempfile.TemporaryFile() as errf:
         proc = subprocess.Popen(
-            full, stdout=subprocess.PIPE, stderr=errf, text=True
+            full, stdout=subprocess.PIPE, stderr=errf, text=True, pass_fds=pass_fds
         )
         assert proc.stdout is not None
         # Bound the whole run with a watchdog: the stdout loop below blocks until
@@ -164,9 +166,6 @@ class _ExportProgress:
             return self._by_key.get(key, {"phase": "idle", "percent": 0})
 
 
-_export_progress = _ExportProgress()
-
-
 @router.get("/chunk/{job_id}/{chunk_idx}")
 def chunk(job_id: str, chunk_idx: int, request: Request) -> FileResponse:
     cache = request.app.state.cache
@@ -237,10 +236,10 @@ def audio(job_id: str, request: Request, format: str = "opus") -> Response:
         # FileResponse and delete the dir once the response is sent. A
         # single up-front transcode (rather than a streaming pipe) keeps
         # this simple and is fine for a local single-user backend.
-        tmp_dir = Path(tempfile.mkdtemp(prefix="nomusic-mp3-"))
+        tmp_dir = Path(tempfile.mkdtemp(prefix="mp3-", dir=cache.scratch.path))
         try:
             out = tmp_dir / "full.mp3"
-            _run_ffmpeg(mp3_transcode_cmd(chunk_files, out))
+            _run_ffmpeg(mp3_transcode_cmd(chunk_files, out), pass_fds=(cache.scratch.fd,))
         except BaseException:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
@@ -306,8 +305,9 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
     if not chunk_files:
         raise HTTPException(status_code=425, detail="full audio not ready")
 
-    progress_key = _export_progress.key(job_id, max_height)
-    _export_progress.set(progress_key, "downloading", 0.0)
+    progress = request.app.state.export_progress
+    progress_key = progress.key(job_id, max_height)
+    progress.set(progress_key, "downloading", 0.0)
     tmp_dir: Optional[Path] = None
     try:
         # --- Phase 1: fetch the video stream (cached per url+resolution) ---
@@ -316,9 +316,9 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
                 total = d.get("total_bytes") or d.get("total_bytes_estimate")
                 got = d.get("downloaded_bytes")
                 if total and got is not None:
-                    _export_progress.set(progress_key, "downloading", 100.0 * got / total)
+                    progress.set(progress_key, "downloading", 100.0 * got / total)
             elif d.get("status") == "finished":
-                _export_progress.set(progress_key, "downloading", 100.0)
+                progress.set(progress_key, "downloading", 100.0)
 
         try:
             video_path = downloader.download_video(
@@ -334,13 +334,13 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
             raise HTTPException(status_code=502, detail=f"video download failed: {exc}")
 
         # --- Phase 2: mux the stripped audio over the video ---
-        _export_progress.set(progress_key, "encoding", 0.0)
-        tmp_dir = Path(tempfile.mkdtemp(prefix="nomusic-mp4-"))
+        progress.set(progress_key, "encoding", 0.0)
+        tmp_dir = Path(tempfile.mkdtemp(prefix="mp4-", dir=cache.scratch.path))
         out = tmp_dir / "full.mp4"
         total_seconds = video_duration(video_path)
 
         def _enc_pct(frac: float) -> None:
-            _export_progress.set(progress_key, "encoding", 100.0 * frac)
+            progress.set(progress_key, "encoding", 100.0 * frac)
 
         # Copy H.264/HEVC straight through (fast, lossless); re-encode
         # VP9/AV1 to H.264 so the MP4 plays in QuickTime/Safari too.
@@ -348,7 +348,7 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
         try:
             _run_ffmpeg_progress(
                 mux_video_cmd(video_path, chunk_files, out, reencode_video=reencode),
-                total_seconds, _enc_pct,
+                total_seconds, _enc_pct, pass_fds=(cache.scratch.fd,),
             )
         except HTTPException:
             if reencode:
@@ -360,21 +360,21 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
             )
             # The retry's progress restarts at 0; reset the published
             # percent so the poller doesn't see it jump backward mid-export.
-            _export_progress.set(progress_key, "encoding", 0.0)
+            progress.set(progress_key, "encoding", 0.0)
             _run_ffmpeg_progress(
                 mux_video_cmd(video_path, chunk_files, out, reencode_video=True),
-                total_seconds, _enc_pct,
+                total_seconds, _enc_pct, pass_fds=(cache.scratch.fd,),
             )
     except BaseException:
-        _export_progress.clear(progress_key)
+        progress.clear(progress_key)
         if tmp_dir is not None:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
 
-    _export_progress.set(progress_key, "done", 100.0)
+    progress.set(progress_key, "done", 100.0)
 
     def _cleanup() -> None:
-        _export_progress.clear(progress_key)
+        progress.clear(progress_key)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return FileResponse(
@@ -386,7 +386,7 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
 
 
 @router.get("/video/{job_id}/progress")
-def video_progress(job_id: str, max_height: Optional[int] = None) -> JsonDict:
+def video_progress(job_id: str, request: Request, max_height: Optional[int] = None) -> JsonDict:
     """Current MP4-export progress for the extension's download menu.
 
     Returns ``{"phase": "downloading"|"encoding"|"done"|"idle", "percent":
@@ -397,4 +397,5 @@ def video_progress(job_id: str, max_height: Optional[int] = None) -> JsonDict:
         max_height = None
     if max_height is not None:
         max_height = max(144, min(4320, max_height))
-    return _export_progress.get(_export_progress.key(job_id, max_height))
+    progress = request.app.state.export_progress
+    return progress.get(progress.key(job_id, max_height))

@@ -15,9 +15,11 @@ loading torch, and lets us pin a concrete backend per checkout.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -55,6 +57,7 @@ class MLXEngine(Engine):
     def __init__(
         self,
         separator_factory: Callable[[str, str], Any] | None = None,
+        *, local_files_only: bool = False,
     ) -> None:
         # Cached separator keyed by model name; demucs loads weights lazily and
         # we only want to pay that cost once per process.
@@ -66,7 +69,7 @@ class MLXEngine(Engine):
         # or a low-VRAM GPU. The per-job GPU lock doesn't cover this: warmup runs
         # outside it.
         self._load_lock = threading.Lock()
-        self._factory = separator_factory or _make_separator
+        self._factory = separator_factory or partial(_make_separator, local_files_only=local_files_only)
         self._device = _pick_device()
 
     def capabilities(self) -> EngineCapabilities:
@@ -206,22 +209,45 @@ class MLXEngine(Engine):
 
 
 def _pick_device() -> str:
-    """Return the best torch device available on the current host.
+    """Apply NOMUSIC_DEVICE, or choose the best available device for ``auto``.
 
     Priority: Apple MPS, then CUDA (NVIDIA), then CPU. A CUDA GPU is only chosen
     if this torch build actually ships kernels for its compute capability —
     otherwise inference crashes at launch ("no kernel image is available"), so
     we fall back to CPU instead.
     """
+    requested = os.environ.get("NOMUSIC_DEVICE", "auto").strip().lower()
+    if requested not in {"auto", "cpu", "mps", "cuda"}:
+        raise ValueError(
+            f"Invalid NOMUSIC_DEVICE={requested!r}; choose auto, cpu, mps, or cuda."
+        )
+    if requested == "cpu":
+        return "cpu"
+
     try:
         import torch
 
-        if torch.backends.mps.is_available():
+        if requested in {"auto", "mps"} and torch.backends.mps.is_available():
             return "mps"
-        if torch.cuda.is_available() and _cuda_is_usable(torch):
+        if (
+            requested in {"auto", "cuda"}
+            and torch.cuda.is_available()
+            and _cuda_is_usable(torch)
+        ):
             return "cuda"
-    except Exception:  # torch not installed yet
+    except Exception as exc:  # auto remains usable before torch is installed
+        if requested != "auto":
+            raise RuntimeError(
+                f"Cannot probe NOMUSIC_DEVICE={requested}: check your PyTorch "
+                "installation, or set NOMUSIC_DEVICE=cpu."
+            ) from exc
         log.debug("device probe failed; defaulting to CPU", exc_info=True)
+    if requested != "auto":
+        raise RuntimeError(
+            f"NOMUSIC_DEVICE={requested} is unavailable or unsupported by this "
+            "PyTorch build. Install the matching hardware/runtime profile, "
+            "or set NOMUSIC_DEVICE=cpu."
+        )
     return "cpu"
 
 
@@ -273,7 +299,7 @@ def _cuda_is_usable(torch: Any) -> bool:
     if reals or ptx:
         log.warning(
             "CUDA GPU (sm_%d%d) is not supported by this torch build "
-            "(arch list: %s) — falling back to CPU. Install a torch build that "
+            "(arch list: %s). Install a torch build that "
             "targets your GPU to use it.",
             major, minor, ", ".join(archs),
         )
@@ -286,14 +312,14 @@ class _ModelBundle:
     so the cache key in ``MLXEngine._separators`` is a single object that's
     cheap to swap."""
 
-    def __init__(self, model_name: str, device: str) -> None:
-        from demucs.pretrained import get_model
+    def __init__(self, model_name: str, device: str, *, local_files_only: bool = False) -> None:
+        from .model_store import load_model
 
-        self.model = get_model(model_name)
+        self.model = load_model(model_name, local_files_only=local_files_only)
         self.model.to(device)
         self.model.eval()
         self.device = device
 
 
-def _make_separator(model_name: str, device: str) -> Any:
-    return _ModelBundle(model_name, device)
+def _make_separator(model_name: str, device: str, *, local_files_only: bool = False) -> Any:
+    return _ModelBundle(model_name, device, local_files_only=local_files_only)

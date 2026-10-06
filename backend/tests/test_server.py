@@ -8,14 +8,15 @@ server.py's branching lives.
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
-import server
-from engines.base import Engine, EngineCapabilities, SeparationResult
-from routes.jobs import ProcessRequest
+from nomusic import server
+from nomusic.engines.base import Engine, EngineCapabilities, SeparationResult
+from nomusic.routes.jobs import ProcessRequest
 
 
 class _CapsOnlyEngine(Engine):
@@ -39,8 +40,10 @@ class _CapsOnlyEngine(Engine):
 
 
 @pytest.fixture
-def client(monkeypatch):
+def client(monkeypatch, tmp_path):
+    monkeypatch.setattr("nomusic.services.check_runtime", lambda: {})
     monkeypatch.setattr(server, "get_engine", lambda name: _CapsOnlyEngine())
+    monkeypatch.setattr(server, "SETTINGS", replace(server.SETTINGS, cache_dir=tmp_path))
     app = server.create_app()
     with TestClient(app) as test_client:
         yield test_client
@@ -50,6 +53,13 @@ def test_healthz(client):
     resp = client.get("/healthz")
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
+
+
+def test_process_rejected_during_shutdown(client):
+    client.app.state.services.begin_shutdown()
+    response = client.post("/process", json={"url": "http://example.com/v"})
+    assert response.status_code == 503
+    assert response.json() == {"detail": "server shutting down"}
 
 
 def test_capabilities_reports_stub_engine(client):
@@ -237,8 +247,8 @@ def _seed_complete_job(client) -> str:
     """Write a complete cache entry (meta + one chunk) the way the processor
     would, and return its job_id. Lets the HTTP happy path run with no network
     or engine work."""
-    from config import SETTINGS
-    from pipeline.cache import CacheMeta
+    from nomusic.config import SETTINGS
+    from nomusic.pipeline.cache import CacheMeta
 
     cache = client.app.state.cache
     job_id = cache.key(

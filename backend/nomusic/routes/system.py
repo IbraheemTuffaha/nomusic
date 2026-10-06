@@ -7,8 +7,9 @@ registry from ``request.app.state``.
 from __future__ import annotations
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
-from config import SETTINGS
+from nomusic.config import SETTINGS
 
 from . import JsonDict
 
@@ -18,6 +19,14 @@ router = APIRouter()
 @router.get("/healthz")
 def healthz() -> dict[str, bool]:
     return {"ok": True}
+
+
+@router.get("/readyz")
+def readyz(request: Request) -> JSONResponse:
+    services = getattr(request.app.state, "services", None)
+    status = services.readiness() if services is not None else {"ok": False, "state": "not_started"}
+    return JSONResponse(status, status_code=200 if status["ok"] else 503,
+                        headers={"Cache-Control": "no-store"})
 
 
 @router.get("/capabilities")

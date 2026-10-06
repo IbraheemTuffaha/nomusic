@@ -101,7 +101,7 @@ async function load() {
     $("status").classList.add("bad");
     $("statusText").textContent = "backend not reachable";
     $("err").textContent =
-      "Start the backend: backend/.venv/bin/python backend/server.py";
+      "Start the backend: backend/.venv/bin/nomusic serve";
     // Disable the model/stem controls while offline. persist() already skips
     // writing them when capsLoaded is false (so saved selections survive), but
     // disabling stops the user making an edit here that would be silently
