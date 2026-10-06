@@ -213,7 +213,7 @@ def wait_ready(process: subprocess.Popen, base: str, timeout: float) -> dict:
     raise RuntimeError("Backend readiness timed out; see backend.log")
 
 
-def smoke(run: Path, env: dict[str, str], port: int, timeout: float) -> dict:
+def smoke(run: Path, env: dict[str, str], port: int, timeout: float, *, playback: bool = False) -> dict:
     if not (E2E / "node_modules/playwright/package.json").is_file():
         raise RuntimeError("Run npm ci --prefix tests/e2e, then install its Chromium; "
                            "see docs/verification.md")
@@ -225,7 +225,10 @@ def smoke(run: Path, env: dict[str, str], port: int, timeout: float) -> dict:
             raise RuntimeError(f"Port {port} is occupied; stop its owner or choose --port. "
                                "The runner will not reuse or stop an existing backend.") from error
     fixture = run / "fixture"
-    run_step("fixture", [sys.executable, str(E2E / "fixture.py"), "--output", str(fixture)], run, env, 60)
+    fixture_command = [sys.executable, str(E2E / "fixture.py"), "--output", str(fixture)]
+    if playback:
+        fixture_command += ["--duration", "180"]
+    run_step("fixture", fixture_command, run, env, 60)
     events = run / "backend-events.jsonl"
     base = f"http://127.0.0.1:{port}"
     with (run / "backend.log").open("w") as log:
@@ -237,9 +240,12 @@ def smoke(run: Path, env: dict[str, str], port: int, timeout: float) -> dict:
         try:
             capabilities = wait_ready(process, base, min(timeout, 180))
             announce("Test backend and CPU model ready")
-            run_step("browser", ["node", str(E2E / "browser.mjs"), "--backend", base,
-                                 "--fixture", str(fixture), "--output", str(run / "browser"),
-                                 "--timeout-seconds", str(timeout)], run, env, timeout + 30, owns_browser=True)
+            browser_command = ["node", str(E2E / "browser.mjs"), "--backend", base,
+                               "--fixture", str(fixture), "--output", str(run / "browser"),
+                               "--timeout-seconds", str(timeout)]
+            if playback:
+                browser_command += ["--playback", "true"]
+            run_step("browser", browser_command, run, env, timeout + 30, owns_browser=True)
         finally:
             announce("Stopping test-owned backend...")
             graceful = stop_owned(process, grace=120)
@@ -272,7 +278,7 @@ def verification_env(run: Path, scratch: Path) -> dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=("all", "unit", "smoke"), default="all")
+    parser.add_argument("--suite", choices=("all", "unit", "smoke", "playback"), default="all")
     parser.add_argument("--port", type=int, default=8723)
     parser.add_argument("--timeout-seconds", type=int, default=600, help="Per-suite deadline (default: 600)")
     args = parser.parse_args()
@@ -302,8 +308,10 @@ def main() -> int:
         env["NOMUSIC_TEST_INSTALLED_ROOT"] = report["environment"]["installed_package"]
         if args.suite in ("all", "unit"):
             report["unit"] = unit_suites(run, env, args.timeout_seconds)
-        if args.suite in ("all", "smoke"):
-            report["smoke"] = smoke(run, env, args.port, args.timeout_seconds)
+        if args.suite in ("all", "smoke", "playback"):
+            playback = args.suite == "playback"
+            report["playback" if playback else "smoke"] = smoke(
+                run, env, args.port, args.timeout_seconds, playback=playback)
         report["passed"] = True
     except (Exception, KeyboardInterrupt) as error:
         report["error"] = str(error)
