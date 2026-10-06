@@ -61,6 +61,13 @@ rate (half-speed audio has twice as many frames); changing rates releases the
 previous prepared rate. These are time-window limits, not a fixed browser heap
 limit: channel count, sample rate and backend chunk settings affect memory.
 
+Volume and playback intent have separate owners. The volume controller mirrors
+the latest slider/mute choice, including zero, while suppressing original audio.
+Disabling nomusic restores that latest choice. A buffering hold pauses the media
+without changing whether the user wants it to play. The page bridge observes
+explicit pause calls even when the video is already held; newly available audio
+therefore cannot resume a video the user deliberately paused.
+
 ## Backend settings
 
 Set variables before starting the helper. These are local tuning controls,

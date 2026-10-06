@@ -31,15 +31,18 @@
     },
     set(v) {
       // Fast path: most calls aren't on a tracked element.
-      if (
-        this.dataset &&
-        this.dataset.nomusicVolBlock === "1" &&
-        Number.isFinite(v)
-      ) {
+      if (this.dataset?.nomusicVolBlock === "1") {
+        // Match the native setter's numeric conversion, so e.g. "0.5" cannot
+        // bypass suppression. Invalid assignments retain the native error.
+        const volume = +v;
+        if (!Number.isFinite(volume) || volume < 0 || volume > 1) {
+          origSet.call(this, volume);
+          return;
+        }
         try {
           this.dispatchEvent(
             new CustomEvent("nomusic:vol-intent", {
-              detail: { volume: v, muted: !!this.muted },
+              detail: { volume, muted: !!this.muted },
             }),
           );
         } catch (err) {
@@ -54,6 +57,34 @@
       origSet.call(this, v);
     },
   });
+})();
+
+// Explicit page commands still express intent when they do not change the
+// native paused state. In particular, pause() during our buffering hold emits
+// no native pause event, but must cancel automatic resume.
+(function () {
+  if (window.__nomusicPlaybackPatched) return;
+  window.__nomusicPlaybackPatched = true;
+  const proto = HTMLMediaElement.prototype;
+  for (const method of ["play", "pause"]) {
+    const desc = Object.getOwnPropertyDescriptor(proto, method);
+    const original = desc.value;
+    Object.defineProperty(proto, method, {
+      ...desc,
+      value(...args) {
+        const result = original.apply(this, args);
+        if (
+          this.dataset?.nomusicPlaybackTrack === "1" &&
+          this.dataset.nomusicPlaybackInternal !== "1"
+        ) {
+          this.dispatchEvent(new CustomEvent("nomusic:playback-intent", {
+            detail: { playing: method === "play" },
+          }));
+        }
+        return result;
+      },
+    });
+  }
 })();
 
 // Bridge: answer the content script's request for the currently-playing

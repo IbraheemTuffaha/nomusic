@@ -26,8 +26,7 @@ export class MuteController {
   }
 
   mute() {
-    this.originalMuted = this.video.muted;
-    this.originalVolume = this.video.volume;
+    if (this.disposed || this._realSetVolume) return;
 
     // What we track across host events:
     //   _userVolume — last slider position the user set (0..1). Survives
@@ -35,8 +34,8 @@ export class MuteController {
     //   _lastMuted  — last muted state we observed. Lets the volumechange
     //                 handler detect mute/unmute clicks (which can fire
     //                 without a volume change).
-    this._userVolume = this.originalVolume > 0 ? this.originalVolume : 1.0;
-    this._lastMuted = this.originalMuted;
+    this._userVolume = this.video.volume;
+    this._lastMuted = this.video.muted;
 
     // We override only ``volume`` and pin it to 0 via the prototype
     // setter + rAF re-assertion. ``muted`` is left alone: audio is
@@ -59,7 +58,7 @@ export class MuteController {
     this._volIntentHandler = (e) => {
       if (!e || !e.detail) return;
       const { volume, muted } = e.detail;
-      if (typeof volume === "number" && volume > 0) {
+      if (Number.isFinite(volume) && volume >= 0 && volume <= 1) {
         this._userVolume = volume;
       }
       if (typeof muted === "boolean") this._lastMuted = muted;
@@ -72,7 +71,7 @@ export class MuteController {
     // the shared DOM.
     this.video.dataset.nomusicVolBlock = "1";
 
-    // Initial pin (also exercises the page-script path).
+    // The isolated-world native setter bypasses the MAIN-world intent patch.
     this._realSetVolume(0);
 
     // Fallback rAF re-assertion. If page-script.js failed to load
@@ -114,16 +113,18 @@ export class MuteController {
           typeof wrapper.data === "string"
             ? JSON.parse(wrapper.data)
             : wrapper.data;
-        return {
-          volume: Math.max(0, Math.min(1, (data.volume ?? 100) / 100)),
-          muted: !!data.muted,
-        };
+        if (
+          !Number.isFinite(data.volume) || data.volume < 0 || data.volume > 100
+        ) return null;
+        return { volume: data.volume / 100, muted: !!data.muted };
       } catch (_err) {
         return null;
       }
     };
 
-    let last = null;
+    // Existing storage can be stale relative to the media element. It is a
+    // baseline, not a reason to replace a genuine initial zero or mute state.
+    let last = readYT();
     const tick = () => {
       if (this.disposed) return;
       this._ytVolTimer = setTimeout(tick, 200);
@@ -133,7 +134,7 @@ export class MuteController {
         return;
       }
       last = yt;
-      if (yt.volume > 0) this._userVolume = yt.volume;
+      this._userVolume = yt.volume;
       this._lastMuted = yt.muted;
       this._applyEffectiveVolume();
     };
@@ -144,6 +145,11 @@ export class MuteController {
    *  owner's callback. ``immediate`` skips the ramp (used for the initial seed). */
   _applyEffectiveVolume(immediate = false) {
     this._applyVolume(this._lastMuted ? 0 : this._userVolume, immediate);
+  }
+
+  /** Reapply intent after the owner creates or replaces its audio graph. */
+  refresh() {
+    if (!this.disposed) this._applyEffectiveVolume(true);
   }
 
   /**
@@ -201,10 +207,16 @@ export class MuteController {
     // normally.
     delete this.video.dataset.nomusicVolBlock;
 
-    if (this._realSetVolume) this._realSetVolume(this.originalVolume);
+    if (this._realSetVolume) {
+      this.video.muted = this._lastMuted;
+      this._realSetVolume(this._userVolume);
+      this._realSetVolume = null;
+      this._realGetVolume = null;
+    }
   }
 
   dispose() {
+    if (this.disposed) return;
     this.disposed = true;
     this.unmute();
   }

@@ -1,12 +1,11 @@
-// Session: coordinates playback for one <video>. Owns the job lifecycle (SSE
-// status), buffer pause/resume, and the video-event glue. ChunkLoader owns
-// bounded chunk acquisition and retention —
-// and delegates the audio graph + scheduling to AudioScheduler and host muting
-// to MuteController. Split out of the former monolithic content.js.
+// Session coordinates one video's job, status stream and playback intent.
+// ChunkLoader owns acquisition/retention, AudioScheduler owns the audio graph
+// and scheduling, and MuteController owns host-video suppression.
 import { settings, dlog, SYNC_CHECK_MS } from "./settings.js";
 import { MuteController } from "./mute-controller.js";
 import { AudioScheduler } from "./audio-scheduler.js";
 import { ChunkLoader } from "./chunk-loader.js";
+import { PlaybackIntent } from "./playback-intent.js";
 
 /** Clean a raw URL down to https://www.youtube.com/watch?v=ID, or null if it
  *  isn't a watch URL — so the caller can fall back to the page URL. Stripping
@@ -77,8 +76,8 @@ export class Session {
     this.chunkSeconds = 10;
     this.chunkOverlapSeconds = 0.5;
     this.duration = 0;
-    // idx -> { buffer: AudioBuffer, playStart: number }. Written here as chunks
-    // decode; read by the scheduler (shared reference).
+    // idx -> { buffer: AudioBuffer, playStart: number }. The loader writes
+    // and evicts entries; the scheduler reads this shared window.
     this.chunks = new Map();
     this._chunkError = false;
     this.loader = new ChunkLoader({
@@ -101,10 +100,6 @@ export class Session {
     this._streamPausedClosed = false;
     this.bufferTimer = null;
     this.disposed = false;
-    // When true, we (not the user) called video.pause() because the
-    // chunk for the current timecode isn't on disk yet. We track this so
-    // a manual pause stays paused but a buffering pause auto-resumes.
-    this._pausedByUs = false;
     // Flipped true once the SSE stream ends (state == ready/error, or the
     // server closed it). Tells _resumeAfterBuffer that no future status
     // event will repaint the label, so it has to restore "nomusic on".
@@ -114,14 +109,11 @@ export class Session {
     this._prioritizeTimer = null;
     this._boundHandlers = {
       play: () => {
-        if (this._chunkError) { this.video.pause(); return; }
-        this.loader.reconcile();
+        this._reconcileBufferState();
         this.scheduler?.reschedule();
-        this._onUserPlay();
       },
       pause: () => {
         this.scheduler?.stopAll();
-        this._onUserPause();
       },
       seeking: () => this.scheduler?.stopAll(),
       seeked: () => {
@@ -129,7 +121,7 @@ export class Session {
           currentTime: this.video.currentTime,
           chunk: this._chunkIdxForTime(this.video.currentTime),
           buffered: this._isBuffered(this.video.currentTime),
-          pausedByUs: this._pausedByUs,
+          held: this.playback.held,
           videoPaused: this.video.paused,
         });
         this._reconcileBufferState();
@@ -140,6 +132,8 @@ export class Session {
       emptied: () => this.dispose(),
       volumechange: () => this.muteController?.handleHostVolumeChange(),
     };
+    this.playback = new PlaybackIntent(video, (wantsPlay) =>
+      this._onPlaybackIntent(wantsPlay));
   }
 
   async start() {
@@ -293,13 +287,26 @@ export class Session {
     };
   }
 
+  _onPlaybackIntent(wantsPlay) {
+    if (this.disposed) return;
+    if (this._chunkError) { this.playback.hold(); return; }
+    if (!this.scheduler) return; // Startup will use the latest captured intent.
+    if (wantsPlay) {
+      this._onUserPlay();
+      this._reconcileBufferState();
+    } else {
+      this.scheduler.stopAll();
+      this._onUserPause();
+    }
+  }
+
   /** User paused the video (not a buffer pause). Close the status stream so
    *  the backend sees no subscriber and starts its idle-abandon countdown —
    *  if the user stays away, the worker releases the GPU. Re-established on
    *  play. No-op during a buffer pause: we still need chunk-ready events to
    *  know when to resume, and a fully-processed job has no worker to idle. */
   _onUserPause() {
-    if (this.disposed || this._pausedByUs || this._streamEnded) return;
+    if (this.disposed || this._streamEnded) return;
     // A queued download pins the worker: keep the stream open on pause so the
     // track finishes processing and the file is delivered even though the user
     // stopped watching. The pill keeps showing "Preparing N%".
@@ -371,6 +378,9 @@ export class Session {
       dlog("resume requestJob failed", err?.name || err);
     }
     if (this.disposed || this._chunkError) return;
+    // A user can pause again while /process is in flight. That latest choice
+    // still owns the stream unless a queued export needs processing to finish.
+    if (this._streamPausedClosed && !this.button._pendingDownload) return;
     if (info?.job_id) this._adoptJob(info);
     if (!this.eventSource) this._openEventStream();
     // Re-point the worker at where the user actually is, in case it was
@@ -407,7 +417,7 @@ export class Session {
 
   _chunkArrived(idx, entry) {
     if (this.disposed || this._chunkError) return;
-    if (this._pausedByUs && this._isBuffered(this.video.currentTime)) {
+    if (this.playback.held && this._isBuffered(this.video.currentTime)) {
       this._resumeAfterBuffer();
     }
     if (!this.video.paused) this.scheduler.scheduleChunk(idx, entry);
@@ -425,8 +435,7 @@ export class Session {
     clearTimeout(this.bufferTimer);
     clearTimeout(this._prioritizeTimer);
     this.scheduler?.stopAll();
-    this._pausedByUs = false;
-    this.video.pause();
+    this.playback.hold();
     this.button.setError(message);
     this.button._clearErrorRevert?.();
   }
@@ -444,47 +453,17 @@ export class Session {
   }
 
   _pauseForBuffer({ showBufferingLabel = true } = {}) {
-    if (this._pausedByUs || this.disposed) return;
-    this._pausedByUs = true;
-    // Initial pause at session start (showBufferingLabel:false) leaves the
-    // live phase label alone — the user wants to see Downloading /
-    // Removing music %. A mid-watch buffer pause (the default) overrides
-    // with "Buffering" since at that point the user has been watching
-    // happily and needs to know why playback stopped.
-    if (showBufferingLabel) this.button.setBuffering();
-    dlog("pauseForBuffer", {
-      currentTime: this.video.currentTime,
-      chunk: this._chunkIdxForTime(this.video.currentTime),
-      showBufferingLabel,
-    });
-    try {
-      this.video.pause();
-    } catch (err) {
-      dlog("buffer pause: video element gone", err?.name || err);
-    }
+    if (this.playback.held || this.disposed) return;
+    if (showBufferingLabel && this.playback.wantsPlay) this.button.setBuffering();
+    this.playback.hold();
   }
 
   _resumeAfterBuffer() {
-    if (!this._pausedByUs || this.disposed) return;
-    this._pausedByUs = false;
-    dlog("resumeAfterBuffer", {
-      currentTime: this.video.currentTime,
-      chunk: this._chunkIdxForTime(this.video.currentTime),
-    });
-    // While the SSE stream is live, the next status event overwrites the
-    // "Buffering" label naturally. Once the stream has ended (state was
-    // ready or error) we have to restore the active label ourselves.
+    if (!this.playback.held || this.disposed) return;
     if (this._streamEnded && this.button.el.dataset.state === "working") {
       this.button.showStatus({ state: "ready" });
     }
-    try {
-      const p = this.video.play();
-      if (p && typeof p.catch === "function") {
-        p.catch((err) => dlog("video.play() rejected", err?.name || err));
-      }
-    } catch (err) {
-      dlog("resume: video element gone", err?.name || err);
-    }
+    this.playback.release();
   }
 
   /** After the user seeks, ask the backend to process the chunk at the
@@ -510,41 +489,17 @@ export class Session {
     }, 250);
   }
 
-  /** Bidirectional buffer-state reconciliation. Called every
-   *  SYNC_CHECK_MS by the buffer monitor and synchronously from the
-   *  ``seeked`` handler for immediate response.
-   *
-   *  Three jobs:
-   *    1. Heal a stale ``_pausedByUs`` flag — if the user un-paused the
-   *       video via the host site's controls, our flag is now lying
-   *       about who owns the pause.
-   *    2. Resume when we paused for buffer and the current chunk has
-   *       since landed in ``this.chunks`` (covers the case where a seek
-   *       arrives into already-buffered territory while we still hold a
-   *       prior pause).
-   *    3. Pause when we're playing and the current chunk isn't buffered. */
+  /** Buffering controls a temporary hold; it never changes user intent. */
   _reconcileBufferState() {
-    if (this.disposed || this._chunkError) return;
+    if (this.disposed || !this.scheduler) return;
+    if (this._chunkError) { this.playback.hold(); return; }
     this.loader.reconcile();
     if (this._chunkError) return;
-    if (this._pausedByUs && !this.video.paused) {
-      // User overrode us. Don't keep claiming ownership of the pause.
-      dlog("reconcile: healing stale _pausedByUs (video resumed externally)");
-      this._pausedByUs = false;
-    }
-    const buffered = this._isBuffered(this.video.currentTime);
-    if (this._pausedByUs && buffered) {
-      dlog("reconcile: chunk arrived under our pause -> resume");
-      this._resumeAfterBuffer();
-      return;
-    }
-    if (this.video.paused || this._pausedByUs) return;
-    if (!buffered) this._pauseForBuffer();
+    if (this._isBuffered(this.video.currentTime)) this._resumeAfterBuffer();
+    else this._pauseForBuffer();
   }
 
-  /** rAF-rate check: drives ``_reconcileBufferState`` every
-   *  SYNC_CHECK_MS so playback recovers from any state desync within
-   *  one tick. Cheap (one branch + a Map.has per tick). */
+  /** Maintain the chunk window and reconcile buffering every SYNC_CHECK_MS. */
   startBufferMonitor() {
     const tick = () => {
       if (this.disposed) return;
@@ -587,21 +542,9 @@ export class Session {
     }
     if (this.bufferTimer) clearTimeout(this.bufferTimer);
     if (this._prioritizeTimer) clearTimeout(this._prioritizeTimer);
-    // If we paused for buffering, let the video resume now that we're
-    // letting go of it — otherwise it would stay paused with no audio
-    // override and the user would have to hit play themselves.
-    const resumeOnExit = this._pausedByUs;
-    this._pausedByUs = false;
     this.muteController?.dispose();
     this.muteController = null;
-    if (resumeOnExit) {
-      try {
-        const p = this.video.play();
-        if (p && typeof p.catch === "function") p.catch(() => {});
-      } catch (err) {
-        dlog("dispose: resume video element gone", err?.name || err);
-      }
-    }
+    this.playback.dispose({ restore: true });
     this.chunks.clear();
     // Error paths set the button to "error" and rely on its own
     // auto-revert timer for the visual transition. Calling button.dispose

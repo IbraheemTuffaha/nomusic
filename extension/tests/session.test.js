@@ -44,11 +44,31 @@ function withBridge(bridgeUrl, fn) {
   }
 }
 
-function makeSession() {
+class Media extends EventTarget {
+  constructor(paused) {
+    super();
+    Object.assign(this, { paused, currentTime: 0, playbackRate: 1,
+      dataset: {}, ended: false, playCalls: 0 });
+  }
+  pause() {
+    if (this.paused) return;
+    this.paused = true;
+    queueMicrotask(() => this.dispatchEvent(new Event("pause")));
+  }
+  play() {
+    this.playCalls++;
+    if (!this.paused) return Promise.resolve();
+    this.paused = false;
+    queueMicrotask(() => this.dispatchEvent(new Event("play")));
+    return Promise.resolve();
+  }
+}
+
+function makeSession(paused = true) {
   const s = new Session(
-    { paused: true, currentTime: 0, playbackRate: 1, removeEventListener() {},
-      pause() { this.paused = true; } },
-    { showStatus() {}, setError() {}, dispose() {} },
+    new Media(paused),
+    { el: { dataset: { state: "working" } }, showStatus() {}, setError() {},
+      setPaused() {}, setBuffering() {}, dispose() {} },
   );
   // Mirror the backend defaults the session starts with (config.py).
   s.chunkSeconds = 10;
@@ -73,6 +93,69 @@ function attachScheduler(s, decode = async (buffer) => buffer) {
   s.scheduler.audioCtx = { decodeAudioData: decode, close() {} };
   return s.scheduler;
 }
+
+for (const pause of ["initial", "during buffering"]) {
+  test(`a pause ${pause} survives chunk arrival and disabling nomusic`, async (t) => {
+    const s = makeSession(pause === "initial");
+    t.after(() => s.dispose());
+    s.totalChunks = 2;
+    attachScheduler(s);
+    const schedule = t.mock.method(s.scheduler, "scheduleChunk", () => {});
+    s._pauseForBuffer();
+    await settle();
+    if (pause === "during buffering") {
+      // MAIN-world bridge reports this even when pause() is a native no-op.
+      s.video.dispatchEvent(new CustomEvent("nomusic:playback-intent", {
+        detail: { playing: false },
+      }));
+    }
+    const entry = { buffer: { duration: 10 }, playStart: 0 };
+    s.chunks.set(0, entry);
+    s._chunkArrived(0, entry);
+    await settle();
+    assert.equal(s.video.paused, true);
+    assert.equal(s.video.playCalls, 0);
+    assert.equal(schedule.mock.callCount(), 0);
+    s.dispose();
+    assert.equal(s.video.paused, true);
+    assert.equal(s.video.playCalls, 0);
+  });
+}
+
+test("a buffering hold resumes wanted playback after audio arrives", async (t) => {
+  const s = makeSession(false);
+  t.after(() => s.dispose());
+  s.totalChunks = 2;
+  attachScheduler(s);
+  t.mock.method(s.scheduler, "scheduleChunk", () => {});
+  s._pauseForBuffer();
+  await settle();
+  assert.equal(s.video.paused, true);
+  assert.equal(s.playback.wantsPlay, true);
+  const entry = { buffer: { duration: 10 }, playStart: 0 };
+  s.chunks.set(0, entry);
+  s._chunkArrived(0, entry);
+  await settle();
+  assert.equal(s.video.paused, false);
+  assert.equal(s.video.playCalls, 1);
+});
+
+test("pausing during a pending resume keeps the worker stream closed", async (t) => {
+  const s = makeSession(false);
+  t.after(() => s.dispose());
+  s._adoptJob({ job_id: "JOB", total_chunks: 2 });
+  attachScheduler(s);
+  const pending = deferred();
+  s.requestJob = () => pending.promise;
+  const open = t.mock.method(s, "_openEventStream", () => {});
+  const resume = s._resumeProcessing();
+  s.video.pause();
+  await settle();
+  assert.equal(s._streamPausedClosed, true);
+  pending.resolve({ job_id: "JOB", total_chunks: 2 });
+  await resume;
+  assert.equal(open.mock.callCount(), 0);
+});
 
 test("_chunkIdxForTime maps a time to its chunk via the stride", () => {
   const s = makeSession();
