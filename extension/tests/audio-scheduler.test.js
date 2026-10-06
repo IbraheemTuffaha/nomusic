@@ -1,6 +1,5 @@
-// Unit tests for audio-scheduler.js — constructor wiring and the stretch-cache
-// memoization (the pure paths). The scheduling/AudioContext paths need a real
-// Web Audio graph and are exercised manually in-browser.
+// Scheduler cache, continuation and stale-stretch tests with stubbed audio I/O.
+// Actual Web Audio timing remains covered by the separate browser checks.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -16,6 +15,23 @@ function makeScheduler() {
       getTotalChunks: () => 12,
     },
   );
+}
+
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+function audioBuffer(length, value = 0) {
+  const data = new Float32Array(length).fill(value);
+  return {
+    length,
+    numberOfChannels: 1,
+    sampleRate: 8,
+    duration: length / 8,
+    getChannelData: () => data,
+  };
 }
 
 test("constructor wires the shared chunk map and getters", () => {
@@ -111,3 +127,47 @@ test("_onSourceEnded does NOT continue while the video is paused", () => {
 
   assert.equal(rescheduled, 0);
 });
+
+for (const outcome of ["resolve", "reject"]) {
+  test(`an OLD stretch ${outcome} cannot alter NEW cache or in-flight work`, async (t) => {
+    const s = makeScheduler();
+    s.video.paused = false;
+    s.video.playbackRate = 2;
+    s.audioCtx = { createBuffer: (_channels, frames) => audioBuffer(frames) };
+    const old = deferred();
+    const current = deferred();
+    let calls = 0;
+    s.stretcher = { stretch: () => (++calls === 1 ? old.promise : current.promise) };
+    const schedule = t.mock.method(s, "scheduleChunk", () => {});
+    const reschedule = t.mock.method(s, "reschedule", () => {});
+    const warning = t.mock.method(console, "warn", () => {});
+    const oldEntry = { buffer: audioBuffer(8, 1), playStart: 0 };
+    s.chunks.set(0, oldEntry);
+    s._requestStretched(0, oldEntry, 2);
+
+    s.reset();
+    const newEntry = { buffer: audioBuffer(8, 2), playStart: 0 };
+    s.chunks.set(0, newEntry);
+    s._requestStretched(0, newEntry, 2);
+    if (outcome === "resolve") old.resolve({ channels: [new Float32Array(4).fill(1)] });
+    else old.reject(new Error("old stretch failed"));
+    await new Promise(setImmediate);
+
+    assert.equal(s.stretchCache.size, 0);
+    assert.equal(s._stretchInflight.has("0@2"), true);
+    assert.equal(s._stretchDisabled, false);
+    assert.equal(schedule.mock.callCount(), 0);
+    assert.equal(reschedule.mock.callCount(), 0);
+    assert.equal(warning.mock.callCount(), 0);
+    // A stale completion must not allow a duplicate preparation of NEW.
+    s._requestStretched(0, newEntry, 2);
+    assert.equal(calls, 2);
+
+    current.resolve({ channels: [new Float32Array(4).fill(2)] });
+    await new Promise(setImmediate);
+    assert.deepEqual([...s.stretchCache.get("0@2").getChannelData(0)], [2, 2, 2, 2]);
+    assert.equal(s._stretchInflight.size, 0);
+    assert.equal(schedule.mock.callCount(), 1);
+    assert.equal(schedule.mock.calls[0].arguments[1], newEntry);
+  });
+}

@@ -1,6 +1,6 @@
 // Button: the floating pill UI per <video> — status display, menu, MP4
 // download. Creates/disposes a Session on toggle. Split out of content.js.
-import { settings, dlog } from "./settings.js";
+import { dlog } from "./settings.js";
 import { Session } from "./session.js";
 
 // Strip characters that are illegal in filenames across Windows/macOS/Linux
@@ -378,6 +378,7 @@ export class Button {
   async _startDownload(format, height = 0) {
     const jobId = this.session?.jobId;
     if (!jobId) return;
+    const backendUrl = this.session.config.backendUrl;
     if (this._downloading) return; // ignore double-clicks mid-download
     this._downloading = true;
 
@@ -385,8 +386,8 @@ export class Button {
     const q = height ? `?max_height=${height}` : "";
     const url =
       format === "mp4"
-        ? `${settings.backendUrl}/video/${jobId}${q}`
-        : `${settings.backendUrl}/audio/${jobId}?format=mp3`;
+        ? `${backendUrl}/video/${jobId}${q}`
+        : `${backendUrl}/audio/${jobId}?format=mp3`;
 
     // Busy feedback — freeze the pill while preparing.
     this._clearErrorRevert();
@@ -399,7 +400,7 @@ export class Button {
     // so the pill shows real "Fetching N%" / "Encoding N%" progress.
     let pollTimer = null;
     if (format === "mp4") {
-      const progUrl = `${settings.backendUrl}/video/${jobId}/progress${q}`;
+      const progUrl = `${backendUrl}/video/${jobId}/progress${q}`;
       const poll = async () => {
         try {
           const r = await fetch(progUrl, { cache: "no-store" });
@@ -499,4 +500,3 @@ export class Button {
     this.el.style.top = "12px";
   }
 }
-

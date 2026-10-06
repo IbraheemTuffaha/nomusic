@@ -33,6 +33,7 @@ export class AudioScheduler {
     this._stretchDisabled = false;
     this.syncTimer = null;
     this.disposed = false;
+    this._generation = 0;
   }
 
   /** Create the audio graph, load the time-stretcher, start the sync monitor.
@@ -233,6 +234,7 @@ export class AudioScheduler {
     if (cached) return cached;
     if (this._stretchInflight.has(key)) return null;
     this._stretchInflight.add(key);
+    const generation = this._generation;
 
     const srcBuf = entry.buffer;
     const sr = srcBuf.sampleRate;
@@ -278,8 +280,8 @@ export class AudioScheduler {
     this.stretcher
       .stretch(channels, rate, sr)
       .then(({ channels: out }) => {
+        if (this.disposed || generation !== this._generation) return;
         this._stretchInflight.delete(key);
-        if (this.disposed) return;
         // Drop the stretched lead-in / lead-out pads; keep just this chunk's
         // span (~chunkFrames/rate), which now has warmed-up, continuous edges.
         const discardFront = Math.round(leadIn / rate);
@@ -302,6 +304,7 @@ export class AudioScheduler {
         }
       })
       .catch((err) => {
+        if (this.disposed || generation !== this._generation) return;
         this._stretchInflight.delete(key);
         // One failure → stop trying; fall back to resample for this session.
         this._stretchDisabled = true;
@@ -369,6 +372,15 @@ export class AudioScheduler {
     this._anchorAudio = null;
   }
 
+  /** Forget one artifact without replacing the audio graph or volume intent. */
+  reset() {
+    this._generation++;
+    this.stopAll();
+    this.stretchCache.clear();
+    this._stretchInflight.clear();
+    this._stretchDisabled = false;
+  }
+
   startSyncMonitor() {
     const tick = () => {
       if (this.disposed) return;
@@ -423,7 +435,7 @@ export class AudioScheduler {
 
   dispose() {
     this.disposed = true;
-    this.stopAll();
+    this.reset();
     if (this.syncTimer) clearTimeout(this.syncTimer);
     this.syncTimer = null;
     try {
@@ -434,7 +446,5 @@ export class AudioScheduler {
     this.audioCtx = null;
     this.stretcher?.dispose();
     this.stretcher = null;
-    this.stretchCache.clear();
-    this._stretchInflight.clear();
   }
 }

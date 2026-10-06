@@ -43,12 +43,20 @@ export function resolveSourceUrl() {
 }
 
 // ---------------------------------------------------------------------------
-// Session: drives one <video> at a time. Reused if user toggles off and on.
+// Session: drives one <video> with one captured configuration until disposed.
 // ---------------------------------------------------------------------------
 export class Session {
   constructor(video, button) {
     this.video = video;
     this.button = button;
+    // Settings changes apply to the next session, never half of this artifact.
+    this.config = {
+      backendUrl: settings.backendUrl,
+      model: settings.model,
+      keepStems: settings.keepStems?.slice() ?? null,
+    };
+    this._requests = new AbortController();
+    this._resuming = null;
     // Web Audio graph + chunk scheduling + sync monitor (created in start()).
     this.scheduler = null;
     // Owns host-video muting + volume mirroring; created in start().
@@ -126,10 +134,12 @@ export class Session {
     // address bar so starting from the YouTube miniplayer captures the playing
     // video, not the homepage the user is browsing.
     this.sourceUrl = resolveSourceUrl();
+    this.video.addEventListener("emptied", this._boundHandlers.emptied);
     let info;
     try {
       info = await this.requestJob();
     } catch (err) {
+      if (this.disposed) return;
       console.warn("[nomusic] /process failed", err);
       this.button.setError("backend unreachable");
       // Mark the session terminal but leave the error visual alone so
@@ -146,9 +156,7 @@ export class Session {
     // streams slightly offset = comb-filter "stutter".
     if (this.disposed) return;
 
-    this.jobId = info.job_id;
-    this.totalChunks = info.total_chunks || 1;
-    this.duration = info.duration_seconds || 0;
+    this._adoptJob(info);
     this.button.showStatus(info);
 
     try {
@@ -211,12 +219,13 @@ export class Session {
 
   async requestJob() {
     const body = { url: this.sourceUrl || window.location.href };
-    if (settings.model) body.model = settings.model;
-    if (settings.keepStems) body.keep_stems = settings.keepStems;
-    const resp = await fetch(`${settings.backendUrl}/process`, {
+    if (this.config.model) body.model = this.config.model;
+    if (this.config.keepStems) body.keep_stems = this.config.keepStems;
+    const resp = await fetch(`${this.config.backendUrl}/process`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: this._requests.signal,
     });
     if (!resp.ok) {
       const detail = await resp.text().catch(() => "");
@@ -226,7 +235,9 @@ export class Session {
   }
 
   async fetchCapabilities() {
-    const resp = await fetch(`${settings.backendUrl}/capabilities`);
+    const resp = await fetch(`${this.config.backendUrl}/capabilities`, {
+      signal: this._requests.signal,
+    });
     if (!resp.ok) return null;
     return resp.json();
   }
@@ -237,10 +248,12 @@ export class Session {
    *  stops the reconnect loop. */
   _openEventStream() {
     if (this.disposed) return;
-    this.eventSource = new EventSource(
-      `${settings.backendUrl}/events/${this.jobId}`,
+    const stream = new EventSource(
+      `${this.config.backendUrl}/events/${this.jobId}`,
     );
-    this.eventSource.onmessage = (e) => {
+    this.eventSource = stream;
+    stream.onmessage = (e) => {
+      if (this.disposed || this.eventSource !== stream) return;
       let payload;
       try {
         payload = JSON.parse(e.data);
@@ -250,7 +263,8 @@ export class Session {
       }
       this.handleStatus(payload);
     };
-    this.eventSource.onerror = () => {
+    stream.onerror = () => {
+      if (this.disposed || this.eventSource !== stream) return;
       // A 204 (unknown job) or our own .close() on a terminal state puts
       // readyState at CLOSED — there's no more stream to wait on. A
       // transient drop instead sits in CONNECTING while EventSource retries,
@@ -306,6 +320,33 @@ export class Session {
   }
 
   async _resumeProcessing() {
+    if (this.disposed) return;
+    if (this._resuming) return this._resuming;
+    this._resuming = this._resumeJob();
+    try {
+      await this._resuming;
+    } finally {
+      this._resuming = null;
+    }
+  }
+
+  _adoptJob(info) {
+    if (this.jobId && info.job_id !== this.jobId) {
+      this._requests.abort();
+      this._requests = new AbortController();
+      this.eventSource?.close();
+      this.eventSource = null;
+      this.scheduler?.reset();
+      this.chunks.clear();
+      this.fetchedIdx.clear();
+      this._streamEnded = false;
+    }
+    this.jobId = info.job_id;
+    this.totalChunks = info.total_chunks || this.totalChunks || 1;
+    this.duration = info.duration_seconds ?? this.duration;
+  }
+
+  async _resumeJob() {
     let info;
     try {
       info = await this.requestJob();
@@ -315,20 +356,7 @@ export class Session {
       dlog("resume requestJob failed", err?.name || err);
     }
     if (this.disposed) return;
-    // The cache key is derived from (url, model, stems), so a resume for the
-    // same video returns the same job_id. A DIFFERENT id means the backend
-    // handed us a new job (settings changed, or it had evicted the old one):
-    // adopt it and drop the dedup set so chunks refetch under the new id,
-    // instead of stalling on the dead job's /events stream and stale chunk URLs.
-    if (info && info.job_id && info.job_id !== this.jobId) {
-      if (this.eventSource) {
-        this.eventSource.close();
-        this.eventSource = null;
-      }
-      this.jobId = info.job_id;
-      this.totalChunks = info.total_chunks || this.totalChunks;
-      this.fetchedIdx.clear();
-    }
+    if (info?.job_id) this._adoptJob(info);
     if (!this.eventSource) this._openEventStream();
     // Re-point the worker at where the user actually is, in case it was
     // abandoned and respawned with a from-scratch chunk order.
@@ -375,6 +403,7 @@ export class Session {
   }
 
   async fetchAndQueueChunk(idx) {
+    const signal = this._requests.signal;
     try {
       // ``cache: "default"`` lets the browser honor the backend's
       // Cache-Control header (max-age=86400 for 200, no-store for 425).
@@ -384,9 +413,10 @@ export class Session {
       // chunk lands on disk. That manifested as seek-backwards getting
       // stuck on chunks the backend had finished long ago.
       const resp = await fetch(
-        `${settings.backendUrl}/chunk/${this.jobId}/${idx}`,
-        { cache: "default" },
+        `${this.config.backendUrl}/chunk/${this.jobId}/${idx}`,
+        { cache: "default", signal },
       );
+      if (signal.aborted) return;
       if (!resp.ok) {
         // Drop the dedup mark so the next SSE snapshot that re-lists this
         // chunk in ready_chunks re-attempts the fetch.
@@ -397,9 +427,9 @@ export class Session {
       // The session can be disposed mid-fetch (toggle off, SPA navigation,
       // <video> emptied) — the scheduler is then null. Bail quietly rather
       // than throwing on a dead session's audio graph.
-      if (this.disposed || !this.scheduler) return;
+      if (signal.aborted || this.disposed || !this.scheduler) return;
       const decoded = await this.scheduler.decode(buf);
-      if (this.disposed || !this.scheduler) return;
+      if (signal.aborted || this.disposed || !this.scheduler) return;
       const stride = this.chunkSeconds - this.chunkOverlapSeconds;
       const entry = {
         buffer: decoded,
@@ -421,6 +451,7 @@ export class Session {
         this.scheduler?.scheduleChunk(idx, entry);
       }
     } catch (err) {
+      if (signal.aborted) return;
       console.warn(`[nomusic] chunk ${idx} fetch/decode failed`, err);
       this.fetchedIdx.delete(idx);
     }
@@ -494,10 +525,11 @@ export class Session {
       if (this.disposed || this._streamEnded || !this.jobId) return;
       const fromChunk = this._chunkIdxForTime(this.video.currentTime);
       dlog("prioritize POST", { fromChunk, currentTime: this.video.currentTime });
-      fetch(`${settings.backendUrl}/process/${this.jobId}/prioritize`, {
+      fetch(`${this.config.backendUrl}/process/${this.jobId}/prioritize`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ from_chunk: fromChunk }),
+        signal: this._requests.signal,
       })
         .then((r) => dlog("prioritize response", r.status))
         .catch((err) => dlog("prioritize POST failed", err));
@@ -566,6 +598,7 @@ export class Session {
   dispose({ preserveButtonState = false } = {}) {
     if (this.disposed) return;
     this.disposed = true;
+    this._requests.abort();
     this.detachVideoListeners();
     // Tears down the audio graph: stops sources, clears the sync monitor,
     // closes the AudioContext, disposes the stretcher + caches.
