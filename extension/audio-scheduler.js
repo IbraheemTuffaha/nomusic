@@ -288,7 +288,6 @@ export class AudioScheduler {
       .stretch(channels, rate, sr)
       .then(({ channels: out }) => {
         if (!isCurrent()) return;
-        this._stretchInflight.delete(key);
         // Drop the stretched lead-in / lead-out pads; keep just this chunk's
         // span (~chunkFrames/rate), which now has warmed-up, continuous edges.
         const discardFront = Math.round(leadIn / rate);
@@ -303,6 +302,7 @@ export class AudioScheduler {
               .set(o.subarray(discardFront, discardFront + avail));
           }
         }
+        this._stretchInflight.delete(key);
         this.stretchCache.set(key, buf);
 
         // Play it now if it's still wanted (same rate, still rolling).

@@ -220,3 +220,25 @@ test("window/rate pruning releases obsolete cached audio and active sources", ()
     assert.equal(s.stretchCache.size, 1);
   }
 });
+
+
+test("stretched-buffer allocation failure enables the resampling fallback", async (t) => {
+  const s = makeScheduler();
+  s.video.paused = false;
+  s.video.playbackRate = 2;
+  const entry = { buffer: audioBuffer(8, 1), playStart: 0 };
+  s.chunks.set(0, entry);
+  s.stretcher = { stretch: async () => ({ channels: [new Float32Array(4)] }) };
+  s.audioCtx = { createBuffer() { throw new RangeError("allocation failed"); } };
+  const warning = t.mock.method(console, "warn", () => {});
+  const reschedule = t.mock.method(s, "reschedule", () => {});
+
+  s._requestStretched(0, entry, 2);
+  await new Promise(setImmediate);
+
+  assert.equal(s.stretchCache.size, 0);
+  assert.equal(s._stretchInflight.size, 0);
+  assert.equal(s._stretchDisabled, true);
+  assert.equal(warning.mock.callCount(), 1);
+  assert.equal(reschedule.mock.callCount(), 1);
+});

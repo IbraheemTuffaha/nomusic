@@ -435,3 +435,33 @@ test("dispose aborts downloads and prevents late decoding or timers from publish
   assert.deepEqual(f.delivered, []);
   assert.deepEqual(f.errors, []);
 });
+
+
+test("the fourth attempt can finish before exhaustion is reported", async (t) => {
+  const f = fixture(t, { totalChunks: 1 });
+  const fourth = deferred();
+  let attempts = 0;
+  let fourthSignal;
+  t.mock.method(globalThis, "fetch", (_url, { signal }) => {
+    if (++attempts < 4) return Promise.resolve({ ok: false, status: 503 });
+    fourthSignal = signal;
+    return fourth.promise;
+  });
+  f.loader.updateAvailable([0]);
+  await settle();
+  for (const delay of [500, 1000, 2000]) {
+    t.mock.timers.tick(delay);
+    await settle();
+  }
+  assert.equal(attempts, 4);
+  // A buffer-monitor tick or another completion can reconcile while the last
+  // permitted request is still fetching, reading its body, or decoding.
+  f.loader.reconcile();
+  assert.deepEqual(f.errors, []);
+  assert.equal(fourthSignal.aborted, false);
+  fourth.resolve(response(0));
+  await settle();
+  assert.equal(f.chunks.get(0).buffer.tag, 0);
+  assert.equal(attempts, 4);
+  assert.deepEqual(f.errors, []);
+});

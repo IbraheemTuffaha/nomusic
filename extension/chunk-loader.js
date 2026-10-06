@@ -74,6 +74,8 @@ export class ChunkLoader {
     let nextRetry = Infinity;
     for (const idx of order) {
       if (!this.available.has(idx) || this.chunks.has(idx)) continue;
+      if ([...this.active.values()].some((request) =>
+        request.idx === idx && this._current(request))) continue;
       const retry = this.retries.get(idx);
       if (retry?.attempts >= MAX_ATTEMPTS) {
         if (idx === current) {
@@ -82,8 +84,6 @@ export class ChunkLoader {
         }
         continue;
       }
-      if ([...this.active.values()].some((request) =>
-        request.idx === idx && this._current(request))) continue;
       if (retry?.deadline > now) {
         nextRetry = Math.min(nextRetry, retry.deadline);
         continue;
