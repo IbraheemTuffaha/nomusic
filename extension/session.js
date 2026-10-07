@@ -8,7 +8,10 @@ import { ChunkLoader } from "./chunk-loader.js";
 import { PlaybackIntent } from "./playback-intent.js";
 
 // A short container/codec tail may outlast decoded audio at the native EOF.
-const MAX_END_TAIL_SECONDS = 0.25;
+// Native containers can report a small duration tail beyond the processed
+// artifact. Keep the host muted through that bounded tail instead of entering
+// a permanent buffering state; larger mismatches still fail visibly.
+const MAX_END_TAIL_SECONDS = 1;
 
 /** Clean a raw URL down to https://www.youtube.com/watch?v=ID, or null if it
  *  isn't a watch URL — so the caller can fall back to the page URL. Stripping
@@ -76,10 +79,8 @@ export class Session {
     // rewrite) would target a different video and strand this session.
     this.sourceUrl = null;
     this.totalChunks = 0;
-    // Must mirror the backend defaults (config.py: chunk_seconds=10,
-    // chunk_overlap_seconds=0.5). fetchCapabilities() overwrites these, but
-    // it is best-effort — if it fails these stay in force, and a wrong value
-    // throws stride/playStart ~3x off and desyncs every chunk after the first.
+    // These values are only a temporary placeholder until the mandatory
+    // /capabilities response establishes the backend's actual geometry.
     this.chunkSeconds = 10;
     this.chunkOverlapSeconds = 0.5;
     this.duration = 0;
@@ -87,17 +88,7 @@ export class Session {
     // and evicts entries; the scheduler reads this shared window.
     this.chunks = new Map();
     this.failed = false;
-    this.loader = new ChunkLoader({
-      chunks: this.chunks,
-      getTime: () => this.video.currentTime,
-      getStride: () => this.chunkSeconds - this.chunkOverlapSeconds,
-      getTotalChunks: () => this.totalChunks,
-      getChunkUrl: (idx) => `${this.config.backendUrl}/chunk/${this.jobId}/${idx}`,
-      decode: (encoded) => this.scheduler.decode(encoded),
-      onChunk: (idx, entry) => this._chunkArrived(idx, entry),
-      onError: (message) => this.fail(message),
-      onWindowChange: () => this.scheduler?.pruneBuffers(),
-    });
+    this.loader = this._createLoader();
     // SSE stream of backend status (replaces /status polling). Opened in
     // start(); closed in dispose() and when a terminal state arrives.
     this.eventSource = null;
@@ -145,6 +136,20 @@ export class Session {
       this._onPlaybackIntent(wantsPlay));
   }
 
+  _createLoader() {
+    return new ChunkLoader({
+      chunks: this.chunks,
+      getTime: () => this.video.currentTime,
+      getStride: () => this.chunkSeconds - this.chunkOverlapSeconds,
+      getTotalChunks: () => this.totalChunks,
+      getChunkUrl: (idx) => `${this.config.backendUrl}/chunk/${this.jobId}/${idx}`,
+      decode: (encoded) => this.scheduler.decode(encoded),
+      onChunk: (idx, entry) => this._chunkArrived(idx, entry),
+      onError: (message) => this.fail(message),
+      onWindowChange: () => this.scheduler?.pruneBuffers(),
+    });
+  }
+
   async start() {
     if (this.disposed || this.failed) return;
     if (this._starting) return this._starting;
@@ -182,14 +187,12 @@ export class Session {
     if (info.state === "error") { this.fail(info.phase_label || "Processing failed"); return; }
     if (this._streamPausedClosed && !this.button._pendingDownload) this.button.setPaused();
     else this.button.showStatus(info);
-    try {
-      const caps = await this.fetchCapabilities();
-      if (signal.aborted || this.disposed) return;
-      this.chunkSeconds = caps?.defaults?.chunk_seconds ?? this.chunkSeconds;
-      this.chunkOverlapSeconds = caps?.defaults?.chunk_overlap_seconds ?? this.chunkOverlapSeconds;
-    } catch (err) {
-      dlog("capabilities fetch failed; using defaults", err?.name || err);
-    }
+    // Chunk geometry is part of the backend contract. Falling back to local
+    // constants after a failed or malformed capabilities response can make
+    // playStart disagree with the server's chunk layout and shift every chunk
+    // after the first. Treat the response as mandatory so Retry can recover a
+    // transient failure without silently desynchronizing playback.
+    await this._loadCapabilities(signal);
     if (signal.aborted || this.disposed) return;
     this.scheduler = new AudioScheduler(this.video, {
       chunks: this.chunks,
@@ -237,6 +240,21 @@ export class Session {
 
   fetchCapabilities() {
     return this._fetchJSON("/capabilities", {}, 5_000);
+  }
+
+  async _loadCapabilities(signal = this._requests.signal) {
+    const caps = await this.fetchCapabilities();
+    if (signal.aborted || this.disposed) return false;
+    const chunkSeconds = Number(caps?.defaults?.chunk_seconds);
+    const chunkOverlapSeconds = Number(caps?.defaults?.chunk_overlap_seconds);
+    if (!Number.isFinite(chunkSeconds) || !Number.isFinite(chunkOverlapSeconds) ||
+        chunkSeconds <= 0 || chunkOverlapSeconds < 0 ||
+        chunkSeconds <= chunkOverlapSeconds) {
+      throw new Error("Backend returned invalid chunk geometry");
+    }
+    this.chunkSeconds = chunkSeconds;
+    this.chunkOverlapSeconds = chunkOverlapSeconds;
+    return true;
   }
 
   _closeEventStream() {
@@ -366,7 +384,8 @@ export class Session {
       this._requests = new AbortController();
       this._closeEventStream();
       this.scheduler?.reset();
-      this.loader.reset();
+      this.loader.dispose();
+      this.loader = this._createLoader();
       this.failed = false;
       this._streamEnded = false;
     }
@@ -388,8 +407,21 @@ export class Session {
     // A user can pause again while /process is in flight. That latest choice
     // still owns the stream unless a queued export needs processing to finish.
     if (this._streamPausedClosed && !this.button._pendingDownload) return;
+    const previousJobId = this.jobId;
     if (info?.job_id) this._adoptJob(info);
     if (info?.state === "error") { this.fail(info.phase_label || "Processing failed"); return; }
+    // A same-job resume retains the geometry established at startup. A
+    // changed job can come from a backend with different chunk settings, so
+    // refresh the contract before reopening its stream.
+    if (info?.job_id && previousJobId && info.job_id !== previousJobId) {
+      try {
+        if (!await this._loadCapabilities(this._requests.signal)) return;
+      } catch (err) {
+        if (!signal.aborted) this.fail("Backend capabilities unavailable. Retry when the helper is ready.");
+        return;
+      }
+    }
+    if (this._streamPausedClosed && !this.button._pendingDownload) return;
     if (!this.eventSource) this._openEventStream();
     // Re-point the worker at where the user actually is, in case it was
     // abandoned and respawned with a from-scratch chunk order.
@@ -437,6 +469,11 @@ export class Session {
   async retry() {
     if (this.disposed || !this.failed) return;
     this.failed = false;
+    // A decode timeout cannot be cancelled. Retire the old loader so its
+    // charged slots cannot make Retry fail immediately; late decode results
+    // remain fenced by the disposed loader's generation/ownership checks.
+    this.loader.dispose();
+    this.loader = this._createLoader();
     this._requests = new AbortController();
     this._starting = this._resuming = null;
     this._reconnectAttempts = 0;
@@ -454,7 +491,7 @@ export class Session {
     }
     this.scheduler?.dispose();
     this.scheduler = null;
-    // Keep unabortable decodes charged to this loader even across Retry.
+    // Keep unabortable decodes fenced to this loader until they settle.
     this.loader.reset();
   }
 
@@ -481,7 +518,11 @@ export class Session {
   }
 
   _pauseForBuffer({ showBufferingLabel = true } = {}) {
-    if (this.playback.held || this.disposed) return;
+    if (this.disposed) return;
+    if (this.playback.held) {
+      if (showBufferingLabel && this.playback.wantsPlay) this.button.setBuffering();
+      return;
+    }
     if (showBufferingLabel && this.playback.wantsPlay) this.button.setBuffering();
     this.playback.hold();
   }
@@ -504,7 +545,9 @@ export class Session {
     this._prioritizeTimer = setTimeout(() => {
       this._prioritizeTimer = null;
       if (this.disposed || this.failed || this._streamEnded || !this.jobId) return;
-      const fromChunk = this._chunkIdxForTime(this.video.currentTime);
+      const final = this.totalChunks - 1;
+      if (final < 0) return;
+      const fromChunk = Math.min(final, this._chunkIdxForTime(this.video.currentTime));
       dlog("prioritize POST", { fromChunk, currentTime: this.video.currentTime });
       fetch(`${this.config.backendUrl}/process/${this.jobId}/prioritize`, {
         method: "POST",
@@ -588,6 +631,10 @@ export class Session {
     this._stopProcessing();
     this.loader.dispose();
     this.detachVideoListeners();
+    // Source replacement and detached-video retirement must not restore the
+    // native track while the element is still playing. Pause under the
+    // playback-intent owner before releasing the volume pin.
+    if (!restore) this.playback.hold();
     this.muteController?.dispose();
     this.muteController = null;
     this.playback.dispose({ restore });

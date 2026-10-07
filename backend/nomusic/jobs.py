@@ -116,6 +116,7 @@ class _JobControl:
 
     def __init__(self, total_chunks: int, done: set[int]) -> None:
         self.lock = threading.Lock()
+        self.total_chunks = total_chunks
         self.pending: collections.deque[int] = collections.deque(
             i for i in range(total_chunks) if i not in done
         )
@@ -139,6 +140,7 @@ class _JobControl:
         with self.lock:
             if not self.pending:
                 return
+            from_chunk = max(0, min(from_chunk, self.total_chunks - 1))
             pending = set(self.pending)
             front = sorted(i for i in pending if i >= from_chunk)
             back = sorted(i for i in pending if i < from_chunk)
@@ -758,6 +760,9 @@ class JobRegistry:
                 return False
             control = self._controls.get(key)
             if control is None:
+                status = self._jobs[key]
+                if status.total_chunks:
+                    from_chunk = min(from_chunk, status.total_chunks - 1)
                 self._pending_priority[key] = from_chunk
                 log.info(
                     "prioritize: stashed (control not yet built) key=%s from_chunk=%d",

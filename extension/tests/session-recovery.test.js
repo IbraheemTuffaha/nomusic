@@ -316,16 +316,63 @@ test("a hung process request fails after 30 seconds without restoring original a
   assert.equal(f.video.paused, true);
 });
 
-test("optional capabilities time out after five seconds and startup uses defaults", async (t) => {
+test("capabilities time out after five seconds and startup fails before opening playback", async (t) => {
   const f = fixture(t, { fetch: ({ path, signal }) => path === "/capabilities" ? untilAborted(signal) : undefined });
   const starting = f.session.start();
   await settle();
   t.mock.timers.tick(4_999); await settle();
   assert.equal(f.streams.length, 0);
   t.mock.timers.tick(1); await starting;
-  assert.equal(f.session.failed, false);
+  assert.equal(f.session.failed, true);
   assert.equal(f.session.chunkSeconds, 10);
-  assert.equal(f.streams.length, 1);
+  assert.equal(f.streams.length, 0);
+  assert.equal(f.video.volume, 0);
+  assert.equal(f.video.paused, true);
+});
+
+test("malformed capabilities fail before geometry can desynchronize playback", async (t) => {
+  const f = fixture(t, { fetch: ({ path }) => path === "/capabilities"
+    ? json({ defaults: { chunk_seconds: 30 } }) : undefined });
+  await f.session.start();
+  assert.equal(f.session.failed, true);
+  assert.equal(f.streams.length, 0);
+  assert.equal(f.session.scheduler, null);
+});
+
+test("Retry replaces a loader whose decode timeout left slots charged", async (t) => {
+  const decodes = [];
+  let chunkRequests = 0;
+  const f = fixture(t, {
+    fetch: ({ path }) => path.startsWith("/chunk/")
+      ? { ok: true, arrayBuffer: async () => new ArrayBuffer(0) }
+      : undefined,
+    init: async (scheduler) => {
+      scheduler.audioCtx.decodeAudioData = () => {
+        chunkRequests++;
+        const pending = deferred();
+        decodes.push(pending);
+        return pending.promise;
+      };
+    },
+  });
+  await f.session.start();
+  assert.ok(f.streams[0], `Startup did not open a stream: ${JSON.stringify({ streams: f.streams.length, state: f.session.button.el.dataset.state, failed: f.session.failed, scheduler: !!f.session.scheduler, error: f.errors })}`);
+  f.streams[0].message({ ...job(), total_chunks: 1, ready_chunks: [0] });
+  await settle();
+  assert.equal(chunkRequests, 1);
+
+  t.mock.timers.tick(15_000);
+  await settle();
+  assert.equal(f.session.failed, true);
+
+  await f.session.retry();
+  assert.equal(f.session.failed, false);
+  const retryStream = f.streams.at(-1);
+  assert.ok(retryStream, `Retry did not open a stream: ${JSON.stringify({ streams: f.streams.length, state: f.session.button.el.dataset.state, scheduler: !!f.session.scheduler, jobId: f.session.jobId })}`);
+  retryStream.message({ ...job(), total_chunks: 1, ready_chunks: [0] });
+  await settle();
+  assert.equal(chunkRequests, 2, "Retry must fetch through a fresh loader");
+
 });
 
 for (const stage of ["process", "capabilities", "audio init"]) {
@@ -352,7 +399,7 @@ for (const stage of ["process", "capabilities", "audio init"]) {
         assert.equal(f.posts().length, 1, "play must not start a competing resume POST");
       }
       pending.resolve(stage === "process" ? json(job())
-        : stage === "capabilities" ? json({ defaults: {} }) : undefined);
+        : stage === "capabilities" ? json({ defaults: { chunk_seconds: 10, chunk_overlap_seconds: 0.5 } }) : undefined);
       await starting;
       assert.equal(f.posts().length, 1);
       assert.equal(f.streams.length, resume ? 1 : 0);

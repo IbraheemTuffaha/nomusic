@@ -92,7 +92,7 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
   until, sleep, note, report, options, ready, boundary, expectAborts, expectHttp }) {
   assert.ok(ready.duration_seconds >= 175, "Playback suite needs the 180-second fixture");
   const evidence = report.playback = {
-    limits: { retainedChunks: 9, activeRequests: 3, pcmBytes: 128 * 1024 * 1024, sourceAheadSeconds: 30 },
+    limits: { retainedChunks: 8, activeRequests: 3, pcmBytes: 128 * 1024 * 1024, sourceAheadSeconds: 30 },
     injectedFaults: [], checks: [],
   };
   const read = () => isolated("__nomusicPlayback.read()");

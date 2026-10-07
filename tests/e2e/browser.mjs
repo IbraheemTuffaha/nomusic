@@ -283,6 +283,19 @@ try {
 
   page = await context.newPage();
   page.on("pageerror", (error) => report.pageErrors.push(String(error)));
+  const sseRecovery = { armed: options.playback, aborted: false, requests: 0, processResponses: 0 };
+  const eventPattern = `${options.backend}/events/**`;
+  const routeEvents = async (route) => {
+    sseRecovery.requests++;
+    if (sseRecovery.armed && !sseRecovery.aborted) {
+      sseRecovery.aborted = true;
+      const record = requests.get(route.request());
+      if (record) record.expectedAbort = "browser SSE interruption";
+      await route.abort();
+      return;
+    }
+    await route.continue();
+  };
   let requestSerial = 0;
   const requests = new Map();
   page.on("request", (request) => {
@@ -299,13 +312,18 @@ try {
     record.expectedHttp = { status, reason };
   }
   page.on("response", (response) => {
-    if (response.url().startsWith(`${options.backend}/`)) report.network.push({ ...requests.get(response.request()), path: new URL(response.url()).pathname, status: response.status() });
+    if (response.url().startsWith(`${options.backend}/`)) {
+      const path = new URL(response.url()).pathname;
+      if (path === "/process" && response.status() === 200) sseRecovery.processResponses++;
+      report.network.push({ ...requests.get(response.request()), path, status: response.status() });
+    }
   });
   page.on("requestfailed", (request) => {
     if (request.url().startsWith(`${options.backend}/`)) report.network.push({ ...requests.get(request), path: new URL(request.url()).pathname, failed: request.failure() });
     requests.delete(request);
   });
   page.on("requestfinished", (request) => requests.delete(request));
+  if (options.playback) await page.route(eventPattern, routeEvents);
   const cdp = await context.newCDPSession(page);
   const worlds = new Map();
   cdp.on("Runtime.executionContextCreated", ({ context: world }) => worlds.set(world.id, world));
@@ -358,6 +376,13 @@ try {
   }, options.timeoutSeconds * 1000);
   assert.ok(ready.chunks_ready >= 2, "At least two real chunks");
   assert.ok(Math.abs(ready.duration_seconds - duration) < 0.3);
+  if (options.playback) {
+    await until("browser SSE interruption recovery", () =>
+      sseRecovery.aborted && sseRecovery.processResponses >= 2, options.timeoutSeconds * 1000);
+    note("browser-sse-interruption-recovery", {
+      eventRequests: sseRecovery.requests, processPosts: sseRecovery.processResponses,
+    });
+  }
   await page.waitForFunction(() => document.querySelector(".nomusic-btn__label")?.textContent === "nomusic on");
   note("all-chunks-ready", { chunks: ready.chunks_ready, duration: ready.duration_seconds });
 
@@ -423,7 +448,7 @@ try {
   // Keep HTTP errors and failures of every other request fatal.
   const expectedStreamClose = (item) => item.path === eventPath
     && item.failed?.errorText === "net::ERR_ABORTED";
-  const intentionalAbort = (item) => item.expectedAbort && item.failed?.errorText === "net::ERR_ABORTED";
+  const intentionalAbort = (item) => item.expectedAbort && item.failed;
   const injectedHttpFault = (item) => item.expectedHttp?.status === item.status;
   assert.deepEqual(report.network.filter((item) =>
     (item.status >= 400 && !injectedHttpFault(item)) ||

@@ -35,8 +35,10 @@ Toggle nomusic off and on after changing model or stems. A successful process
 does not guarantee perfect music removal; compare speech clarity and residual
 music on your own recordings.
 
-**Processing failures can restore original audio and resume playback.** Mute
-the site or browser before retrying if avoiding that audio is essential.
+**Processing failures keep original audio suppressed and pause playback.** The
+recovery panel offers **Retry** (which preserves the current volume and
+play/pause intent) and **Return to original** (which explicitly restores the
+native track).
 
 ## Exports and cache
 
@@ -60,8 +62,10 @@ does not cause a long wait. Completed media/model caches survive shutdown;
 unfinished exports may need to be requested again after a forced exit.
 
 Start the helper again, check readiness, and toggle nomusic off/on for the
-video. Reopen the popup or reload the page if needed. Completed audio can be
-reused; interrupted jobs do not yet have reliable automatic reconnect/recovery.
+video. Reopen the popup or reload the page if needed. The extension retries a
+lost status connection and re-submits the same job with bounded backoff. If it
+reaches the terminal recovery panel, use Retry after the helper is healthy;
+completed audio can be reused.
 
 ## When a check fails
 

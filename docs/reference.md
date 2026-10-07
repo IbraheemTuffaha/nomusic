@@ -49,7 +49,7 @@ or blocks acquisition; it does not silently free a slot for more work.
 
 Decoded audio stays within 20 seconds behind and 45 seconds ahead of the video
 clock, rounded to whole chunks. Distant seeks release the old window and refetch
-the new one. With the default 9.5-second stride this retains at most nine chunks:
+the new one. With the default 9.5-second stride this retains at most eight chunks:
 about 33 MiB of stereo float PCM at 48 kHz and ten seconds per chunk. Up to three
 pending decodes are additional temporary work. Encoded browser HTTP cache and
 backend disk cache are separate from this decoded window.
@@ -75,8 +75,8 @@ Retry restarts processing in the same session without resetting volume or
 play/pause intent. Only an explicit return restores the original track.
 
 Playback checks the final decoded chunk's actual end, including any span beyond
-the usual stride. Once the job is ready, a finite native video end up to 250 ms
-later may finish with original audio still suppressed. A larger or unknown
+the usual stride. Once the job is ready, a finite native video end up to one
+second later may finish with original audio still suppressed. A larger or unknown
 uncovered tail reports a persistent playback error instead of buffering forever.
 This tolerance does not stretch audio or correct larger source-duration mismatches.
 

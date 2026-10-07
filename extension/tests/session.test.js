@@ -194,6 +194,16 @@ test("emptied during a buffering hold releases work without restarting old media
   assert.equal(s.video.playCalls, 0);
 });
 
+test("retiring an active video pauses before releasing native-audio suppression", () => {
+  const s = makeSession(false);
+  let disposedWhilePaused = false;
+  s.muteController = { dispose() { disposedWhilePaused = s.video.paused; } };
+  s.dispose({ restore: false });
+  assert.equal(disposedWhilePaused, true);
+  assert.equal(s.video.paused, true);
+  assert.equal(s.video.playCalls, 0);
+});
+
 test("_chunkIdxForTime maps a time to its chunk via the stride", () => {
   const s = makeSession();
   assert.equal(s._chunkIdxForTime(0), 0);
@@ -207,6 +217,32 @@ test("_chunkIdxForTime never returns a negative index", () => {
   assert.equal(s._chunkIdxForTime(-5), 0);
 });
 
+test("prioritize hints clamp seeks beyond the final chunk", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const s = makeSession();
+  t.after(() => { s.dispose(); t.mock.timers.reset(); });
+  s.jobId = "JOB";
+  s.totalChunks = 2;
+  s.video.currentTime = 500;
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true, status: 200 };
+  });
+  s._sendPrioritizeHint();
+  t.mock.timers.tick(250);
+  assert.deepEqual(requests, [{ from_chunk: 1 }]);
+});
+
+test("an already-held wanted video gets the Buffering label", (t) => {
+  const s = makeSession(false);
+  t.after(() => s.dispose({ restore: false }));
+  const buffering = t.mock.method(s.button, "setBuffering");
+  s.playback.hold();
+  s._pauseForBuffer();
+  assert.equal(buffering.mock.callCount(), 1);
+});
+
 test("_isBuffered reflects whether the covering chunk is decoded", () => {
   const s = makeSession();
   s.totalChunks = 2;
@@ -216,7 +252,7 @@ test("_isBuffered reflects whether the covering chunk is decoded", () => {
   assert.equal(s._isBuffered(0), false); // time 0 -> chunk 0, not buffered
 });
 
-for (const [videoEnd, audioDuration] of [[19, 9.5], [19.021, 9.499977], [19.25, 9.5]]) {
+for (const [videoEnd, audioDuration] of [[19, 9.5], [19.021, 9.499977], [19.9, 9.5]]) {
   test(`ready audio can reach native EOF ${videoEnd} across its final stride boundary`, async (t) => {
     const s = makeSession(false);
     t.after(() => s.dispose());
@@ -289,7 +325,7 @@ test("already ended video is not held, relabeled or restarted by a monitor or ar
   assert.equal(s.failed, false);
 });
 
-for (const videoEnd of [19.251, 30, Infinity, NaN]) {
+for (const videoEnd of [20.01, 30, Infinity, NaN]) {
   test(`uncovered final audio with native duration ${videoEnd} fails instead of waiting forever`, (t) => {
     const s = makeSession(false);
     t.after(() => s.dispose({ restore: false }));
@@ -355,6 +391,13 @@ test("_resumeProcessing adopts a changed job_id and refetches chunks", async () 
     },
   };
   s.requestJob = async () => ({ job_id: "NEW", total_chunks: 5 });
+  let capabilities = 0;
+  let capabilitiesSignalAborted;
+  s._loadCapabilities = async (signal) => {
+    capabilities++;
+    capabilitiesSignalAborted = signal.aborted;
+    return true;
+  };
   let opened = 0;
   s._openEventStream = () => {
     opened++;
@@ -367,6 +410,8 @@ test("_resumeProcessing adopts a changed job_id and refetches chunks", async () 
   assert.equal(closed, true); // old stream closed
   assert.equal(s.loader.available.size, 0); // old artifact readiness is invalid
   assert.equal(s.totalChunks, 5);
+  assert.equal(capabilities, 1);
+  assert.equal(capabilitiesSignalAborted, false);
   assert.equal(opened, 1); // stream reopened on the new id
   assert.equal(s.chunks.size, 0);
   assert.equal(scheduler.stretchCache.size, 0);

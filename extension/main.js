@@ -53,7 +53,7 @@ function attachToVideo(video) {
 
 // Re-anchor every live button to its video's current host. Called on layout
 // shifts that can re-parent the player (fullscreen toggle, window resize).
-function reanchorButtons() {
+function reanchorButtons({ checkSource = false } = {}) {
   for (const btn of liveButtons) {
     if (!btn.video || !btn.video.isConnected) {
       liveButtons.delete(btn);
@@ -61,7 +61,7 @@ function reanchorButtons() {
       btn.destroy();
       continue;
     }
-    btn.session?.checkSource();
+    if (checkSource) btn.session?.checkSource();
     anchorButton(btn);
   }
 }
@@ -96,7 +96,7 @@ function scan(root) {
 // live ones for the current layout.
 function refresh() {
   scan(document);
-  reanchorButtons();
+  reanchorButtons({ checkSource: true });
 }
 
 // A route change or layout shift usually lands a beat before the new player has
@@ -128,8 +128,6 @@ function init() {
   observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
-    attributes: true,
-    attributeFilter: ["src"],
   });
 
   // Re-anchor on layout shifts that re-parent, resize, or remove the player:

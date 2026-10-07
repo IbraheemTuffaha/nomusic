@@ -107,8 +107,10 @@ Use the download chevron beside the button for **MP3 audio** or **MP4 video**.
 You can request an export before processing finishes; leave the tab open until
 the file downloads. MP4 preparation may download the video separately.
 
-**A processing error can restore original audio and resume the player.** Mute
-the site or browser before retrying if avoiding that audio is essential.
+**A processing error keeps original audio suppressed and pauses the player.**
+The recovery panel offers **Retry**, which preserves the current volume and
+play/pause intent, and **Return to original**, which explicitly restores the
+native track.
 
 See [local use and troubleshooting](docs/local-workflow.md) for stem settings,
 exports, cache clearing and recovery after a restart.

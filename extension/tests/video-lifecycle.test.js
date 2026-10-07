@@ -15,11 +15,12 @@ function descendants(root, tag) {
 test("discovery preserves reparenting and completely retires disconnected videos", async (t) => {
   const { document, window } = domFixture(t);
   let mutations;
+  let observerOptions;
   const globals = {
     getComputedStyle: () => ({ position: "relative" }),
     MutationObserver: class {
       constructor(callback) { mutations = callback; }
-      observe() {}
+      observe(_root, options) { observerOptions = options; }
     },
     setInterval: () => 1,
   };
@@ -50,6 +51,7 @@ test("discovery preserves reparenting and completely retires disconnected videos
   });
   await import(`../main.js?lifecycle=${Date.now()}`);
   await new Promise(setImmediate);
+  assert.deepEqual(observerOptions, { childList: true, subtree: true });
   assert.equal(buttons.length, 1);
   const button = buttons[0];
   const disposed = [];

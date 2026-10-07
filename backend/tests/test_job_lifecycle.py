@@ -6,7 +6,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from nomusic.jobs import JobRegistry, RegistryClosed
+from nomusic.jobs import JobRegistry, RegistryClosed, _JobControl
+
+
+@pytest.mark.parametrize("hint, expected", [(-10, 0), (2, 2), (99, 4)])
+def test_prioritize_clamps_to_the_job_chunk_range(hint, expected):
+    control = _JobControl(total_chunks=5, done=set())
+    control.prioritize(hint)
+    assert control.pending[0] == expected
 
 
 class _Cache:
