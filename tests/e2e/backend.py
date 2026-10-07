@@ -4,6 +4,15 @@ Only the exact fixture URL receives generated local media; all other URLs are
 rejected before acquisition. Processing, Demucs, chunk encoding, SSE, exports,
 readiness, and shutdown remain real. This is not a deployment entry point and
 does not validate YouTube acquisition. Prefetch the pinned model before use.
+
+The fixture adapter is intentionally installed in this parent process. The
+production supervised worker uses ``spawn`` and must not inherit arbitrary test
+monkeypatches, so this controlled smoke selects the explicit direct-path test
+rollback; the supervisor's termination/restart contract is covered by the
+isolated worker suite. Production defaults remain supervised. The extended
+180-second fixture also uses a ten-minute lease so CPU inference itself can
+exceed the normal pause-retention window; explicit lease expiry is covered by
+the backend unit tests.
 """
 
 from __future__ import annotations
@@ -147,6 +156,7 @@ def main() -> None:
             # supervisor intentionally runs acquisition in a spawned child, so
             # keep this controlled smoke path on the in-process test seam.
             "NOMUSIC_SUPERVISED_WORKER": "0",
+            "NOMUSIC_CLIENT_LEASE_SECONDS": "600",
             "NOMUSIC_RELOAD": "0",
             "NOMUSIC_CACHE_TTL_DAYS": "0",
             "NOMUSIC_CACHE_SWEEP_INTERVAL_SECONDS": "0",
