@@ -46,8 +46,10 @@ The download chevron beside nomusic offers **MP3 — audio only** and **Video
 (MP4)** at several resolutions. You can request either before processing
 finishes; keep the tab open until the download completes. Pausing playback
 does not cancel export preparation. MP4 may require another source download.
-Check saved files have their full expected duration; resolution depends on
-the source and current downloader fallbacks.
+The local policy accepts finite sources up to two hours and 512 MiB of source
+audio. Video exports are capped at 1080p and 2 GiB; a larger selected format
+fails before a download starts. Check saved files have their full expected
+duration; resolution also depends on the source's available formats.
 
 Completed work is cached for reuse, with seven-day default retention. Finish
 playback and exports before clearing it: open the popup, click **Clear**, then

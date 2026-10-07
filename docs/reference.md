@@ -120,6 +120,15 @@ not resource or authorization guarantees for a public service.
 | `NOMUSIC_MEMORY_GC_INTERVAL_SECONDS` | `3600` | Reclaim in-memory entries whose disk cache disappeared; `0` disables |
 | `NOMUSIC_PROGRESSIVE` | `true` | Process decodable early audio while its download continues |
 | `NOMUSIC_DOWNLOAD_RATELIMIT` | Unset | Test download cap in bytes/sec, with optional `K`/`M` suffix |
+| `NOMUSIC_MAX_DURATION_SECONDS` | `7200` | Reject unknown, non-finite or longer source durations |
+| `NOMUSIC_MAX_SOURCE_BYTES` | `512 MiB` | Bound source downloads and reject oversized cached sources |
+| `NOMUSIC_MAX_VIDEO_BYTES` | `2 GiB` | Bound video export downloads and cached video reuse |
+| `NOMUSIC_MAX_VIDEO_HEIGHT` | `1080` | Cap video export format selection and validation; larger requests fail clearly |
+| `NOMUSIC_MAX_DECODE_BYTES` | `64 MiB` | Bound one decoded WAV working buffer |
+| `NOMUSIC_MAX_CHUNK_BYTES` | `16 MiB` | Reject unexpectedly large encoded chunks before publication |
+| `NOMUSIC_MAX_INFERENCE_BATCH` | `2` | Bound model working-set batch size even when `NOMUSIC_GPU_BATCH` is higher |
+| `NOMUSIC_MAX_PREFETCH_CHUNKS` | `2` | Bound decoded chunks waiting for model execution |
+| `NOMUSIC_FINAL_CHUNK_TOLERANCE_SECONDS` | `1` | Allow only this measured source-duration remainder when validating a download |
 | `NOMUSIC_JS_RUNTIME` | Auto-detected | Explicit Node.js 22+ or Deno 2.3+ executable |
 | `NOMUSIC_SHUTDOWN_GRACE_SECONDS` | `60` | Positive finite shutdown deadline for active work; second Ctrl+C exits immediately |
 | `NOMUSIC_DEBUG` | `false` | Enable debug logging |
