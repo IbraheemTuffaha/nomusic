@@ -66,6 +66,9 @@ class WorkerSettings:
     max_inference_batch: int
     max_prefetch_chunks: int
     final_chunk_tolerance_seconds: float
+    max_cache_bytes: int
+    min_free_bytes: int
+    max_export_bytes: int
 
 
 def settings_for_worker(settings: Any) -> WorkerSettings:
@@ -87,6 +90,9 @@ def settings_for_worker(settings: Any) -> WorkerSettings:
         final_chunk_tolerance_seconds=getattr(
             settings, "final_chunk_tolerance_seconds", 1.0
         ),
+        max_cache_bytes=getattr(settings, "max_cache_bytes", 4 * 1024 * 1024 * 1024),
+        min_free_bytes=getattr(settings, "min_free_bytes", 256 * 1024 * 1024),
+        max_export_bytes=getattr(settings, "max_export_bytes", 2 * 1024 * 1024 * 1024),
     )
 
 
@@ -211,7 +217,11 @@ def _worker_main(settings: WorkerSettings, commands: Any, events: Any) -> None:
     cache: JobCache | None = None
     try:
         engine = get_engine(settings.engine_name)
-        cache = JobCache(Path(settings.cache_dir))
+        cache = JobCache(
+            Path(settings.cache_dir),
+            max_bytes=settings.max_cache_bytes,
+            min_free_bytes=settings.min_free_bytes,
+        )
         processor = Processor(
             engine=engine,
             cache=cache,

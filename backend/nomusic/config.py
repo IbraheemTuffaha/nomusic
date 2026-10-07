@@ -197,6 +197,15 @@ class Settings:
     final_chunk_tolerance_seconds: float = field(
         default_factory=lambda: _env_float("FINAL_CHUNK_TOLERANCE_SECONDS", 1.0)
     )
+    max_cache_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_CACHE_BYTES", 4 * 1024 * 1024 * 1024)
+    )
+    min_free_bytes: int = field(
+        default_factory=lambda: _env_int("MIN_FREE_BYTES", 256 * 1024 * 1024)
+    )
+    max_export_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_EXPORT_BYTES", 2 * 1024 * 1024 * 1024)
+    )
 
 
 SETTINGS = Settings()

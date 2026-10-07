@@ -88,7 +88,9 @@ def video_duration(path: Path) -> float:
     return 0.0
 
 
-def snapshot_chunk_files(cache, job_id: str, total_chunks: int) -> list[tuple[Path, int]]:
+def snapshot_chunk_files(
+    cache, job_id: str, total_chunks: int, *, require_complete: bool = False
+) -> list[tuple[Path, int]]:
     """Snapshot the contiguous run of on-disk chunk files for ``job_id`` ONCE.
 
     Returns ``(path, size)`` pairs for the contiguous prefix that exists,
@@ -105,6 +107,8 @@ def snapshot_chunk_files(cache, job_id: str, total_chunks: int) -> list[tuple[Pa
         except FileNotFoundError:
             break
         chunk_files.append((p, size))
+    if require_complete and len(chunk_files) != total_chunks:
+        return []
     return chunk_files
 
 

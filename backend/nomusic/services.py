@@ -54,7 +54,11 @@ class Services:
             raise RuntimeError("Services instances cannot be restarted")
         settings = self.settings
         self.engine = self._engine_factory(settings.engine_name)
-        self.cache = JobCache(settings.cache_dir)
+        self.cache = JobCache(
+            settings.cache_dir,
+            max_bytes=settings.max_cache_bytes,
+            min_free_bytes=settings.min_free_bytes,
+        )
         processor = Processor(
             engine=self.engine,
             cache=self.cache,

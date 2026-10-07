@@ -556,6 +556,18 @@ class Processor:
 
         if abort_check:
             abort_check()
+        # Hold the content namespace from metadata publication through the
+        # final chunk/completion write. Eviction and /cache/clear skip this
+        # directory while the lease is held.
+        provisional_key = self.cache.key(
+            url,
+            model,
+            keep_stems,
+            chunk_seconds=self.chunk_seconds,
+            chunk_overlap_seconds=self.chunk_overlap_seconds,
+        )
+        job_lease = self.cache.job_lease(provisional_key)
+        resources.callback(job_lease.close)
         key, meta, info, plans, fetcher = self.prepare_job(
             url, model=model, keep_stems=keep_stems,
             publish_check=publish_check,
@@ -577,6 +589,9 @@ class Processor:
             if on_download_progress:
                 on_download_progress(1.0)
             return key
+
+        source_lease = self.cache.source_lease(url)
+        resources.callback(source_lease.close)
 
         # Download the full source once. Each chunk is sliced from this file
         # so cuts are sample-accurate (yt-dlp's per-range download cuts at the
