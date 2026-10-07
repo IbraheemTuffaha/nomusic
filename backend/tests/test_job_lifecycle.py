@@ -6,7 +6,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from nomusic.jobs import JobRegistry, RegistryClosed
+from nomusic.jobs import JobRegistry, JobState, JobStatus, RegistryClosed, _JobControl
+
+
+@pytest.mark.parametrize("hint, expected", [(-10, 0), (2, 2), (99, 4)])
+def test_prioritize_clamps_to_the_job_chunk_range(hint, expected):
+    control = _JobControl(total_chunks=5, done=set())
+    control.prioritize(hint)
+    assert control.pending[0] == expected
 
 
 class _Cache:
@@ -44,6 +51,24 @@ class _GatedProcessor:
 
 def _submit(registry, key="first"):
     return registry.submit(key, model="fake", keep_stems=["vocals"])
+
+
+def test_replaced_worker_cannot_publish_or_cleanup_new_generation():
+    registry = JobRegistry(_GatedProcessor(), _Cache())
+    old = JobStatus("same", state=JobState.PROCESSING)
+    new = JobStatus("same", state=JobState.PROCESSING)
+    control = _JobControl(total_chunks=3, done=set())
+    with registry._lock:
+        registry._jobs["same"] = new
+        registry._controls["same"] = control
+        registry._pending_priority["same"] = 2
+
+    registry._update("same", owner=old, title="stale")
+    registry._cleanup_worker("same", old, abandoned=True)
+
+    assert new.title == ""
+    assert registry._controls["same"] is control
+    assert registry._pending_priority["same"] == 2
 
 
 @pytest.mark.parametrize("supersede", [False, True], ids=["queued", "superseded"])

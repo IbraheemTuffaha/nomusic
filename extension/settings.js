@@ -1,6 +1,6 @@
 // Shared config + the in-memory settings cache that mirrors chrome.storage.
-// chrome.storage drives the popup; this content-script copy is read on every
-// request. Imported by session.js, button.js, and the content.js entry (main.js).
+// chrome.storage drives the popup; each new Session snapshots this cache.
+// Active sessions keep one backend/model/stem identity until toggled off/on.
 
 export const DEFAULT_BACKEND = "http://127.0.0.1:8723";
 export const SYNC_TOLERANCE_S = 0.08;

@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -20,21 +22,33 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fixture import DURATION, FIXTURE_ID, FIXTURE_URL
+from fixture import FIXTURE_ID, FIXTURE_URL
 
 
-def verify_fixture(fixture: Path) -> None:
+def verify_fixture(fixture: Path) -> float:
     manifest = json.loads((fixture / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("fixture_url") != FIXTURE_URL or manifest.get("duration_seconds") != DURATION:
+    duration = manifest.get("duration_seconds")
+    if (manifest.get("fixture_url") != FIXTURE_URL or isinstance(duration, bool)
+            or not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration <= 0):
         raise ValueError("Fixture manifest does not match this runner; regenerate with fixture.py")
     for name in ("soundtrack.wav", "clip.mp4"):
         with (fixture / name).open("rb") as source:
             actual = hashlib.file_digest(source, "sha256").hexdigest()
         if actual != manifest.get("sha256", {}).get(name):
             raise ValueError(f"Fixture file {name} does not match its manifest; regenerate with fixture.py")
+        probe = json.loads(subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(fixture / name)],
+            text=True, timeout=15,
+        ))
+        actual_duration = float(probe["format"]["duration"])
+        expected_types = {"audio", "video"} if name == "clip.mp4" else {"audio"}
+        if (abs(actual_duration - duration) > 0.05
+                or {stream["codec_type"] for stream in probe["streams"]} != expected_types):
+            raise ValueError(f"Fixture file {name} has unexpected duration or streams; regenerate with fixture.py")
+    return float(duration)
 
 
-def install_adapter(fixture: Path, record) -> None:
+def install_adapter(fixture: Path, duration: float, record) -> None:
     import nomusic.pipeline.downloader as downloader
 
     def check_url(url: str) -> None:
@@ -48,7 +62,7 @@ def install_adapter(fixture: Path, record) -> None:
         return downloader.VideoMetadata(
             id=FIXTURE_ID,
             title="nomusic generated smoke fixture",
-            duration_seconds=DURATION,
+            duration_seconds=duration,
             extractor="local-e2e-fixture-adapter",
             webpage_url=FIXTURE_URL,
         )
@@ -98,7 +112,7 @@ def main() -> None:
         parser.error("--port must be between 1 and 65535")
     fixture, cache, events = args.fixture.resolve(), args.cache_dir.resolve(), args.events.resolve()
     try:
-        verify_fixture(fixture)
+        duration = verify_fixture(fixture)
         cache.mkdir(parents=True, exist_ok=True)
         if any(cache.iterdir()):
             raise ValueError("Refusing a populated job cache; choose a fresh --cache-dir")
@@ -106,7 +120,7 @@ def main() -> None:
             raise ValueError("Keep --events outside --cache-dir")
         events.parent.mkdir(parents=True, exist_ok=True)
         events.touch(exist_ok=False)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"Smoke backend setup failed: {exc}\n")
 
     event_lock = threading.Lock()
@@ -145,7 +159,7 @@ def main() -> None:
         sys.dont_write_bytecode = True
         # TemporaryDirectory above initialized tempfile's cache before TMPDIR.
         tempfile.tempdir = scratch
-        install_adapter(fixture, record)
+        install_adapter(fixture, duration, record)
 
         # Processor imports acquisition symbols directly, so the adapter must
         # precede the first server import. No app/model behavior is replaced.

@@ -19,6 +19,8 @@ function anchorButton(btn) {
     // rather than let it strand in a window-sized fallback host; it re-appears
     // on the next re-anchor once a real player is back.
     btn.el.style.display = "none";
+    btn.closeMenu();
+    btn.closeRecovery();
     return;
   }
   // Our position:absolute needs a positioned host, re-asserted every time: the
@@ -28,6 +30,7 @@ function anchorButton(btn) {
   if (getComputedStyle(host).position === "static") {
     host.style.position = "relative";
   }
+  if (btn.el.parentElement !== host) btn.closeMenu();
   btn.position(host);
   if (!btn._dismissed) btn.el.style.display = "";
 }
@@ -35,17 +38,7 @@ function anchorButton(btn) {
 function attachToVideo(video) {
   // Skip tiny/decorative videos (autoplay ads, etc.).
   if (video.clientWidth > 0 && video.clientWidth < 200) return;
-  const existing = attached.get(video);
-  if (existing) {
-    // Already has a live button — reanchorButtons() handles repositioning it.
-    if (liveButtons.has(existing)) return;
-    // Its button was retired when this element briefly disconnected, but the
-    // same element is back: YouTube reuses one persistent <video> across SPA
-    // routes. Tear the stale button (and any session) down and re-attach below.
-    existing.session?.dispose?.();
-    existing.dispose?.();
-    existing.el.remove();
-  }
+  if (attached.has(video)) return;
   // No visible player box yet — a route change can land before the new player
   // is laid out. Record nothing so the next refresh() pass retries once it has
   // a size, instead of skipping this element forever (the "no button until I
@@ -60,13 +53,15 @@ function attachToVideo(video) {
 
 // Re-anchor every live button to its video's current host. Called on layout
 // shifts that can re-parent the player (fullscreen toggle, window resize).
-function reanchorButtons() {
+function reanchorButtons({ checkSource = false } = {}) {
   for (const btn of liveButtons) {
     if (!btn.video || !btn.video.isConnected) {
-      btn.el.style.display = "none"; // its video is gone — don't leave it stranded
       liveButtons.delete(btn);
+      attached.delete(btn.video);
+      btn.destroy();
       continue;
     }
+    if (checkSource) btn.session?.checkSource();
     anchorButton(btn);
   }
 }
@@ -101,7 +96,7 @@ function scan(root) {
 // live ones for the current layout.
 function refresh() {
   scan(document);
-  reanchorButtons();
+  reanchorButtons({ checkSource: true });
 }
 
 // A route change or layout shift usually lands a beat before the new player has
@@ -118,7 +113,14 @@ function scheduleRefresh() {
 function init() {
   scan(document);
   const observer = new MutationObserver((mutations) => {
+    let needsReanchor = false;
     for (const m of mutations) {
+      for (const node of m.removedNodes) {
+        if (node.nodeType === 1 &&
+            (node.tagName === "VIDEO" || node.querySelector?.("video"))) {
+          needsReanchor = true;
+        }
+      }
       for (const node of m.addedNodes) {
         if (node.nodeType === 1) {
           if (node.tagName === "VIDEO") attachToVideo(node);
@@ -126,6 +128,12 @@ function init() {
         }
       }
     }
+    // Reconcile only batches that can have changed an existing video's host.
+    // Reanchoring reads layout for every live video, so doing it for every
+    // YouTube subtree insertion would force synchronous layout on hot pages.
+    // Reparenting a connected miniplayer includes a removal; fullscreen,
+    // resize and navigation handlers cover the other layout changes.
+    if (needsReanchor) reanchorButtons();
   });
   observer.observe(document.documentElement, {
     childList: true,

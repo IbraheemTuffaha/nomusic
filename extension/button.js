@@ -1,6 +1,6 @@
 // Button: the floating pill UI per <video> — status display, menu, MP4
 // download. Creates/disposes a Session on toggle. Split out of content.js.
-import { settings, dlog } from "./settings.js";
+import { dlog } from "./settings.js";
 import { Session } from "./session.js";
 
 // Strip characters that are illegal in filenames across Windows/macOS/Linux
@@ -21,10 +21,11 @@ export class Button {
   constructor(video) {
     this.video = video;
     this.session = null;
+    this._retired = false;
     // Set once the user dismisses (×): a re-anchor must never bring a
     // dismissed pill back into view.
     this._dismissed = false;
-    // Error state is intentionally transient — see _scheduleErrorRevert.
+    // Only download errors expire; playback failures require an explicit choice.
     this._errorRevertTimer = null;
     this.el = document.createElement("button");
     this.el.className = "nomusic-btn";
@@ -58,6 +59,8 @@ export class Button {
     }
     this.label = document.createElement("span");
     this.label.className = "nomusic-btn__label";
+    this.label.setAttribute("aria-live", "polite");
+    this.label.setAttribute("aria-atomic", "true");
     this.label.textContent = "nomusic";
     this.pct = document.createElement("span");
     this.pct.className = "nomusic-btn__pct";
@@ -83,6 +86,8 @@ export class Button {
     });
     this._menuOpen = false;
     this._downloading = false;
+    this._download = null;
+    this._downloadUrls = new Map();
     // A download requested before the track finished processing: {format,
     // height}. Held until the job reaches "ready", then saved automatically.
     this._pendingDownload = null;
@@ -90,6 +95,8 @@ export class Button {
     // whether it can fetch now or must queue and wait.
     this._ready = false;
     this.menu = this._buildMenu();
+    this.recovery = this._buildRecovery();
+    this._onRecoveryReposition = () => this._positionPanel(this.recovery);
     // Close the menu on an outside click / scroll / resize. Capture phase so
     // we see the event even if the host page stops propagation.
     this._onDocClick = (e) => {
@@ -135,12 +142,16 @@ export class Button {
    *  it via the MutationObserver. A new <video> on SPA navigation gets
    *  its own button. */
   dismiss() {
+    if (this._retired) return;
+    if (this.session?.failed && !this.session.disposed) {
+      this.openRecovery({ focus: true });
+      return;
+    }
     if (this.session && !this.session.disposed) {
       this.session.dispose();
       this.session = null;
     }
-    this.closeMenu();
-    this.menu.remove(); // it lives on document.body, so clean it up
+    this.dispose();
     this._dismissed = true;
     this._pendingDownload = null; // user is leaving — drop any queued download
     this.el.style.display = "none";
@@ -148,14 +159,30 @@ export class Button {
 
   setIdle() {
     this._clearErrorRevert();
+    this.closeRecovery();
+    this.el.title = "Strip music (nomusic)";
     this.el.dataset.state = "idle";
     this.label.textContent = "nomusic";
     this.pct.textContent = "";
     this.fill.style.width = "0%";
   }
 
+  setStarting() {
+    this._cancelDownload();
+    this._clearErrorRevert();
+    this.closeRecovery();
+    this.closeMenu();
+    this._ready = false;
+    this.el.title = "Strip music (nomusic)";
+    this.el.dataset.state = "working";
+    this.label.textContent = "Connecting";
+    this.pct.textContent = "";
+    this.fill.style.width = "0%";
+  }
+
   /** ``status`` is the raw JobStatus from the backend. */
   showStatus(status) {
+    if (this._retired || this.session?.failed) return;
     // Remember the title for the download filename; it arrives on every
     // snapshot but isn't otherwise displayed.
     if (status.title) this.title = status.title;
@@ -207,7 +234,7 @@ export class Button {
     // An in-flight export owns the pill (Preparing/Encoding N%); a playback
     // buffer event must not clobber it. _showExportProgress has the inverse
     // guard, so the export display is fully isolated while _downloading.
-    if (this._downloading) return;
+    if (this._downloading || this.session?.failed) return;
     this._clearErrorRevert();
     this.el.dataset.state = "working";
     this.label.textContent = "Buffering";
@@ -220,29 +247,87 @@ export class Button {
    *  idle. Keeps the current % + fill so the frozen progress is visible,
    *  and the non-"working" state stops the icon pulse. */
   setPaused() {
-    if (this._downloading) return; // export owns the pill — see setBuffering
+    if (this._downloading || this.session?.failed) return;
     this._clearErrorRevert();
     this.el.dataset.state = "paused";
     this.label.textContent = "Paused";
   }
 
   setError(label) {
+    if (this._retired) return;
+    this._clearErrorRevert();
+    this.closeMenu();
+    this.menu.remove();
+    this._pendingDownload = null;
+    this._ready = false;
     this.el.dataset.state = "error";
-    this.label.textContent = label || "Error";
+    this.label.textContent = "Playback failed";
+    this.recoveryDetail.textContent = label || "Playback could not continue.";
+    this.el.title = `${this.recoveryDetail.textContent} Choose Retry or Return to original.`;
     this.pct.textContent = "";
     this.fill.style.width = "0%";
-    this._scheduleErrorRevert();
+    this.openRecovery();
   }
 
-  // Error is transient feedback, not a sticky mode. After a brief moment
-  // the pill returns to its idle shape so the user can click again
-  // cleanly instead of staring at a red bar.
-  _scheduleErrorRevert() {
-    this._clearErrorRevert();
-    this._errorRevertTimer = setTimeout(() => {
-      this._errorRevertTimer = null;
-      if (this.el.dataset.state === "error") this.setIdle();
-    }, 2500);
+  _buildRecovery() {
+    const panel = document.createElement("div");
+    panel.className = "nomusic-menu nomusic-recovery";
+    panel.setAttribute("role", "group");
+    panel.setAttribute("aria-label", "Playback recovery");
+    panel.hidden = true;
+    this.recoveryDetail = document.createElement("p");
+    this.recoveryDetail.className = "nomusic-recovery__message";
+    const explanation = document.createElement("p");
+    explanation.className = "nomusic-recovery__message";
+    explanation.textContent = "Original audio is still off.";
+    this.retryBtn = document.createElement("button");
+    this.retryBtn.type = "button";
+    this.retryBtn.className = "nomusic-menu__item";
+    this.retryBtn.textContent = "Retry";
+    this.retryBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      event.preventDefault();
+      this.el.focus();
+      this.session?.retry();
+    });
+    this.returnBtn = document.createElement("button");
+    this.returnBtn.type = "button";
+    this.returnBtn.className = "nomusic-menu__item";
+    this.returnBtn.textContent = "Return to original";
+    this.returnBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      event.preventDefault();
+      this.session?.dispose();
+      this.session = null;
+      this.setIdle();
+      this.el.focus();
+    });
+    panel.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      event.stopPropagation();
+      event.preventDefault();
+      this.closeRecovery();
+      this.el.focus();
+    });
+    panel.append(this.recoveryDetail, explanation, this.retryBtn, this.returnBtn);
+    return panel;
+  }
+
+  openRecovery({ focus = false } = {}) {
+    if (this._retired) return;
+    if (!this.recovery.isConnected) document.body.appendChild(this.recovery);
+    this.recovery.hidden = false;
+    this._positionPanel(this.recovery);
+    window.addEventListener("scroll", this._onRecoveryReposition, true);
+    window.addEventListener("resize", this._onRecoveryReposition, true);
+    if (focus) this.retryBtn.focus();
+  }
+
+  closeRecovery() {
+    this.recovery.hidden = true;
+    this.recovery.remove();
+    window.removeEventListener("scroll", this._onRecoveryReposition, true);
+    window.removeEventListener("resize", this._onRecoveryReposition, true);
   }
 
   _clearErrorRevert() {
@@ -253,7 +338,12 @@ export class Button {
   }
 
   async toggle() {
+    if (this._retired) return;
     if (this.session && !this.session.disposed) {
+      if (this.session.failed) {
+        this.openRecovery({ focus: true });
+        return;
+      }
       this.session.dispose();
       this.session = null;
       return;
@@ -267,9 +357,40 @@ export class Button {
     // this, a button torn down on SPA navigation (video emptied) leaves its
     // hidden menu orphaned on document.body, one per navigation. openMenu()
     // re-appends it if this same button is later reused.
+    this._cancelDownload();
+    this._revokeDownloadUrls();
     this.closeMenu();
     this.menu.remove();
     this.setIdle();
+  }
+
+  /** Permanently retire a detached/replaced video's UI and owned work. */
+  destroy() {
+    if (this._retired) return;
+    this._retired = true;
+    this.session?.dispose({ restore: false });
+    this.session = null;
+    this.dispose();
+    this.el.remove();
+  }
+
+  _cancelDownload() {
+    const download = this._download;
+    this._download = null;
+    if (download) {
+      clearTimeout(download.pollTimer);
+      download.controller.abort();
+    }
+    this._downloading = false;
+    this._pendingDownload = null;
+  }
+
+  _revokeDownloadUrls() {
+    for (const [url, timer] of this._downloadUrls) {
+      clearTimeout(timer);
+      URL.revokeObjectURL(url);
+    }
+    this._downloadUrls.clear();
   }
 
   // The download menu. MP3 (audio only) plus MP4 at a few resolution caps.
@@ -323,24 +444,28 @@ export class Button {
   }
 
   openMenu() {
-    if (this._downloading) return; // no menu while a download is in flight
+    if (this._retired || this._downloading || this.session?.failed) return;
     // The menu lives on document.body and is removed on dispose() (so a
     // torn-down button doesn't orphan it). The button itself is reusable
     // after dispose() → setIdle(), so re-attach before measuring/positioning.
     if (!this.menu.isConnected) document.body.appendChild(this.menu);
-    const r = this.el.getBoundingClientRect();
     this.menu.hidden = false; // unhide first so offsetWidth/Height are real
-    const mw = this.menu.offsetWidth;
-    const mh = this.menu.offsetHeight;
-    let left = Math.max(8, r.right - mw); // right-align to the pill
-    let top = r.bottom + 6;
-    if (top + mh > window.innerHeight - 8) top = r.top - 6 - mh; // flip up
-    this.menu.style.left = `${Math.round(left)}px`;
-    this.menu.style.top = `${Math.round(Math.max(8, top))}px`;
+    this._positionPanel(this.menu);
     this._menuOpen = true;
     document.addEventListener("click", this._onDocClick, true);
     window.addEventListener("scroll", this._onReposition, true);
     window.addEventListener("resize", this._onReposition, true);
+  }
+
+  _positionPanel(panel) {
+    const r = this.el.getBoundingClientRect();
+    const mw = panel.offsetWidth;
+    const mh = panel.offsetHeight;
+    let left = Math.max(8, r.right - mw); // right-align to the pill
+    let top = r.bottom + 6;
+    if (top + mh > window.innerHeight - 8) top = r.top - 6 - mh; // flip up
+    panel.style.left = `${Math.round(left)}px`;
+    panel.style.top = `${Math.round(Math.max(8, top))}px`;
   }
 
   closeMenu() {
@@ -357,7 +482,7 @@ export class Button {
    *  to completion (the user can pause / stop watching), saving automatically
    *  when it's ready. ``format`` is "mp3" or "mp4"; ``height`` caps MP4 res. */
   download(format, height = 0) {
-    if (!this.session?.jobId) return;
+    if (this._retired || !this.session?.jobId || this.session.disposed || this.session.failed) return;
     if (this._downloading) return; // a fetch is already in flight
     if (this._ready) {
       this._startDownload(format, height);
@@ -377,16 +502,21 @@ export class Button {
    *  <a download> to the backend would have its filename ignored. */
   async _startDownload(format, height = 0) {
     const jobId = this.session?.jobId;
-    if (!jobId) return;
+    if (this._retired || !jobId || this.session.disposed || this.session.failed) return;
+    const backendUrl = this.session.config.backendUrl;
     if (this._downloading) return; // ignore double-clicks mid-download
     this._downloading = true;
+    const download = { controller: new AbortController(), pollTimer: null };
+    this._download = download;
+    const { signal } = download.controller;
+    const current = () => this._download === download && !signal.aborted;
 
     const ext = format === "mp4" ? "mp4" : "mp3";
     const q = height ? `?max_height=${height}` : "";
     const url =
       format === "mp4"
-        ? `${settings.backendUrl}/video/${jobId}${q}`
-        : `${settings.backendUrl}/audio/${jobId}?format=mp3`;
+        ? `${backendUrl}/video/${jobId}${q}`
+        : `${backendUrl}/audio/${jobId}?format=mp3`;
 
     // Busy feedback — freeze the pill while preparing.
     this._clearErrorRevert();
@@ -397,40 +527,52 @@ export class Button {
 
     // MP4 prep can take a while (download + mux/re-encode); poll the backend
     // so the pill shows real "Fetching N%" / "Encoding N%" progress.
-    let pollTimer = null;
     if (format === "mp4") {
-      const progUrl = `${settings.backendUrl}/video/${jobId}/progress${q}`;
+      const progUrl = `${backendUrl}/video/${jobId}/progress${q}`;
       const poll = async () => {
+        if (!current()) return;
         try {
-          const r = await fetch(progUrl, { cache: "no-store" });
-          if (r.ok) this._showExportProgress(await r.json());
+          const r = await fetch(progUrl, { cache: "no-store", signal });
+          if (!current()) return;
+          if (r.ok) {
+            const progress = await r.json();
+            if (!current()) return;
+            this._showExportProgress(progress);
+          }
         } catch (err) {
-          dlog("export progress poll failed (transient)", err?.name || err);
+          if (current()) dlog("export progress poll failed (transient)", err?.name || err);
+        }
+        if (current()) {
+          download.pollTimer = setTimeout(() => {
+            download.pollTimer = null;
+            poll();
+          }, 600);
         }
       };
-      pollTimer = setInterval(poll, 600);
       poll();
     }
 
-    let objUrl = null;
     try {
       // no-store: never reuse a cached response. Older backends served raw
       // Opus at the ?format=mp3 URL with a 24h cache header, which the
       // browser would otherwise keep handing back instead of the real MP3.
-      const resp = await fetch(url, { cache: "no-store" });
+      const resp = await fetch(url, { cache: "no-store", signal });
+      if (!current()) return;
       if (!resp.ok) {
         throw new Error(
           resp.status === 425 ? "not ready" : `HTTP ${resp.status}`,
         );
       }
       const blob = await resp.blob();
-      // Stop progress polling the moment the bytes arrive, before we restore
-      // the label, so a late poll can't overwrite it.
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
-      objUrl = URL.createObjectURL(blob);
+      if (!current()) return;
+      const objUrl = URL.createObjectURL(blob);
+      // Invalidate the operation before saving: a pending progress body must
+      // never repaint the pill after the completed download restores it.
+      this._cancelDownload();
+      const revokeTimer = setTimeout(() => {
+        if (this._downloadUrls.delete(objUrl)) URL.revokeObjectURL(objUrl);
+      }, 10000);
+      this._downloadUrls.set(objUrl, revokeTimer);
       const a = document.createElement("a");
       a.href = objUrl;
       a.download = `${sanitizeFilename(this.title) || "nomusic"}.${ext}`;
@@ -440,20 +582,18 @@ export class Button {
       a.remove();
       this._restoreAfterDownload();
     } catch (err) {
-      console.warn("[nomusic] download failed", err);
-      this._flashDownloadError();
+      if (current()) {
+        console.warn("[nomusic] download failed", err);
+        this._flashDownloadError();
+      }
     } finally {
-      if (pollTimer) clearInterval(pollTimer);
-      this._downloading = false;
-      // Revoke after the click-initiated download has had time to start;
-      // revoking immediately can cancel it in some browsers.
-      if (objUrl) setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
+      if (current()) this._cancelDownload();
     }
   }
 
   /** Render a polled export-progress snapshot onto the pill. */
   _showExportProgress(p) {
-    if (!this._downloading || !p) return;
+    if (!this._downloading || !p || this.session?.failed) return;
     if (p.phase === "idle" || p.phase === "done") return;
     const label = p.phase === "downloading" ? "Fetching" : "Encoding";
     const pct = Math.max(0, Math.min(100, Math.round(p.percent || 0)));
@@ -466,6 +606,7 @@ export class Button {
   /** Return the pill to its post-download resting visual: "nomusic on" if the
    *  session is still live, otherwise idle. */
   _restoreAfterDownload() {
+    if (this._retired || this.session?.failed) return;
     if (this.session && !this.session.disposed) {
       this.el.dataset.state = "active";
       this.label.textContent = "nomusic on";
@@ -477,6 +618,7 @@ export class Button {
   }
 
   _flashDownloadError() {
+    if (this.session?.failed) return;
     this.el.dataset.state = "error";
     this.label.textContent = "Download failed";
     this.pct.textContent = "";
@@ -494,9 +636,10 @@ export class Button {
     // Top-right keeps us clear of the bottom control bar / scrubber, which
     // otherwise overlaps the pill (badly at the end of a video when the
     // progress bar is full).
-    host.appendChild(this.el);
+    if (this._retired) return;
+    if (this.el.parentElement !== host) host.appendChild(this.el);
     this.el.style.right = "12px";
     this.el.style.top = "12px";
+    if (this.recovery.isConnected) this._positionPanel(this.recovery);
   }
 }
-

@@ -29,11 +29,15 @@
   overflow: visible; /* dismiss × sits slightly outside the pill */
 }
 
-/* The pill stays faded in every state once the mouse leaves; only hover lifts
-   it to full opacity. Focus is deliberately excluded so it doesn't get stuck
-   at full opacity after a click (some browsers leave the element focused until
-   the next user click). */
-.nomusic-btn:hover { opacity: 1; }
+/* Keyboard focus is visible without leaving pointer clicks permanently lit. */
+.nomusic-btn:hover,
+.nomusic-btn:focus-visible { opacity: 1; }
+
+.nomusic-btn:focus-visible,
+.nomusic-menu__item:focus-visible {
+  outline: 2px solid #b4ddff;
+  outline-offset: 2px;
+}
 
 .nomusic-btn:hover { background: rgba(28, 30, 38, 0.88); }
 .nomusic-btn:active { transform: translateY(1px); }
@@ -173,6 +177,20 @@
 }
 .nomusic-menu__item:hover {
   background: rgba(70, 95, 160, 0.55);
+}
+
+.nomusic-recovery {
+  box-sizing: border-box;
+  width: 230px;
+  max-width: calc(100vw - 16px);
+}
+.nomusic-recovery__message {
+  margin: 0;
+  padding: 6px 9px;
+  color: #ccd4e4;
+  line-height: 1.4;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* Clip wrapper for the progress fill: matches the pill's rounding and hides

@@ -1,18 +1,31 @@
-// Session: coordinates playback for one <video>. Owns the job lifecycle (SSE
-// status, chunk fetch+decode), buffer pause/resume, and the video-event glue —
-// and delegates the audio graph + scheduling to AudioScheduler and host muting
-// to MuteController. Split out of the former monolithic content.js.
+// Session coordinates one video's job, status stream and playback intent.
+// ChunkLoader owns acquisition/retention, AudioScheduler owns the audio graph
+// and scheduling, and MuteController owns host-video suppression.
 import { settings, dlog, SYNC_CHECK_MS } from "./settings.js";
 import { MuteController } from "./mute-controller.js";
 import { AudioScheduler } from "./audio-scheduler.js";
+import { ChunkLoader } from "./chunk-loader.js";
+import { PlaybackIntent } from "./playback-intent.js";
+
+// The source metadata can round down by almost one processing chunk while the
+// native player reports the container's full duration. Keep the host muted
+// through that bounded tail instead of failing after the last processed chunk;
+// larger mismatches still fail visibly.
+const MAX_END_TAIL_SECONDS = 10;
 
 /** Clean a raw URL down to https://www.youtube.com/watch?v=ID, or null if it
  *  isn't a watch URL — so the caller can fall back to the page URL. Stripping
  *  the time/playlist params keeps the same video to one backend cache key. */
 export function normalizeWatchUrl(raw) {
-  if (!raw || !/[?&]v=/.test(raw)) return null;
+  if (!raw) return null;
   try {
-    const id = new URL(raw, location.href).searchParams.get("v");
+    const url = new URL(raw, location.href);
+    const host = url.hostname.toLowerCase();
+    const isYouTube = host === "youtu.be" || host === "youtube.com" ||
+      host.endsWith(".youtube.com");
+    if (!isYouTube) return null;
+    const id = url.searchParams.get("v") ||
+      (host === "youtu.be" ? url.pathname.slice(1) : null);
     return id ? `https://www.youtube.com/watch?v=${id}` : null;
   } catch {
     return null;
@@ -43,12 +56,24 @@ export function resolveSourceUrl() {
 }
 
 // ---------------------------------------------------------------------------
-// Session: drives one <video> at a time. Reused if user toggles off and on.
+// Session: drives one <video> with one captured configuration until disposed.
 // ---------------------------------------------------------------------------
 export class Session {
   constructor(video, button) {
     this.video = video;
     this.button = button;
+    // Settings changes apply to the next session, never half of this artifact.
+    this.config = {
+      backendUrl: settings.backendUrl,
+      model: settings.model,
+      keepStems: settings.keepStems?.slice() ?? null,
+    };
+    this._requests = new AbortController();
+    this._resuming = null;
+    this._starting = null;
+    this._reconnectTimer = null;
+    this._streamTimer = null;
+    this._reconnectAttempts = 0;
     // Web Audio graph + chunk scheduling + sync monitor (created in start()).
     this.scheduler = null;
     // Owns host-video muting + volume mirroring; created in start().
@@ -60,17 +85,16 @@ export class Session {
     // rewrite) would target a different video and strand this session.
     this.sourceUrl = null;
     this.totalChunks = 0;
-    // Must mirror the backend defaults (config.py: chunk_seconds=10,
-    // chunk_overlap_seconds=0.5). fetchCapabilities() overwrites these, but
-    // it is best-effort — if it fails these stay in force, and a wrong value
-    // throws stride/playStart ~3x off and desyncs every chunk after the first.
+    // These values are only a temporary placeholder until the mandatory
+    // /capabilities response establishes the backend's actual geometry.
     this.chunkSeconds = 10;
     this.chunkOverlapSeconds = 0.5;
     this.duration = 0;
-    // idx -> { buffer: AudioBuffer, playStart: number }. Written here as chunks
-    // decode; read by the scheduler (shared reference).
+    // idx -> { buffer: AudioBuffer, playStart: number }. The loader writes
+    // and evicts entries; the scheduler reads this shared window.
     this.chunks = new Map();
-    this.fetchedIdx = new Set();
+    this.failed = false;
+    this.loader = this._createLoader();
     // SSE stream of backend status (replaces /status polling). Opened in
     // start(); closed in dispose() and when a terminal state arrives.
     this.eventSource = null;
@@ -80,25 +104,21 @@ export class Session {
     this._streamPausedClosed = false;
     this.bufferTimer = null;
     this.disposed = false;
-    // When true, we (not the user) called video.pause() because the
-    // chunk for the current timecode isn't on disk yet. We track this so
-    // a manual pause stays paused but a buffering pause auto-resumes.
-    this._pausedByUs = false;
     // Flipped true once the SSE stream ends (state == ready/error, or the
     // server closed it). Tells _resumeAfterBuffer that no future status
     // event will repaint the label, so it has to restore "nomusic on".
     this._streamEnded = false;
+    this._statusState = null;
     // Debounce timer for the /prioritize POST on seek so scrubbing a
     // timeline doesn't fire one request per intermediate frame.
     this._prioritizeTimer = null;
     this._boundHandlers = {
       play: () => {
+        this._reconcileBufferState();
         this.scheduler?.reschedule();
-        this._onUserPlay();
       },
       pause: () => {
         this.scheduler?.stopAll();
-        this._onUserPause();
       },
       seeking: () => this.scheduler?.stopAll(),
       seeked: () => {
@@ -106,162 +126,209 @@ export class Session {
           currentTime: this.video.currentTime,
           chunk: this._chunkIdxForTime(this.video.currentTime),
           buffered: this._isBuffered(this.video.currentTime),
-          pausedByUs: this._pausedByUs,
+          held: this.playback.held,
           videoPaused: this.video.paused,
         });
-        this.scheduler?.reschedule();
         this._reconcileBufferState();
+        this.scheduler?.reschedule();
         this._sendPrioritizeHint();
       },
       ratechange: () => this.scheduler?.reschedule(),
-      emptied: () => this.dispose(),
+      emptied: () => this.dispose({ restore: false }),
+      loadstart: () => this.checkSource(),
+      loadedmetadata: () => this.checkSource(),
       volumechange: () => this.muteController?.handleHostVolumeChange(),
     };
+    this.playback = new PlaybackIntent(video, (wantsPlay) =>
+      this._onPlaybackIntent(wantsPlay));
+  }
+
+  _createLoader() {
+    return new ChunkLoader({
+      chunks: this.chunks,
+      getTime: () => this.video.currentTime,
+      getStride: () => this.chunkSeconds - this.chunkOverlapSeconds,
+      getTotalChunks: () => this.totalChunks,
+      getChunkUrl: (idx) => `${this.config.backendUrl}/chunk/${this.jobId}/${idx}`,
+      decode: (encoded) => this.scheduler.decode(encoded),
+      onChunk: (idx, entry) => this._chunkArrived(idx, entry),
+      onError: (message) => this.fail(message),
+      onWindowChange: () => this.scheduler?.pruneBuffers(),
+    });
   }
 
   async start() {
-    // Pin the video's URL up front so every later /process (resume after a
-    // pause/idle-abandon) targets this same video, even if the SPA has since
-    // changed window.location.href. Resolve it from the player rather than the
-    // address bar so starting from the YouTube miniplayer captures the playing
-    // video, not the homepage the user is browsing.
-    this.sourceUrl = resolveSourceUrl();
-    let info;
+    if (this.disposed || this.failed) return;
+    if (this._starting) return this._starting;
+    this.sourceUrl ||= resolveSourceUrl();
+    this.mediaSource ||= { src: this.video.src || "", current: this.video.currentSrc || "" };
+    // Suppression and the hold belong to the selection, including while the
+    // first request is pending or when setup fails. Retry keeps these owners.
+    this.playback.hold();
+    this.attachVideoListeners();
+    this.button.setStarting();
+    const signal = this._requests.signal;
+    const attempt = this._startProcessing(signal);
+    this._starting = attempt;
     try {
-      info = await this.requestJob();
+      await attempt;
     } catch (err) {
-      console.warn("[nomusic] /process failed", err);
-      this.button.setError("backend unreachable");
-      // Mark the session terminal but leave the error visual alone so
-      // the auto-revert timer can do its 2.5s display. Without this the
-      // first post-error click would just dispose this dead session
-      // instead of starting a fresh one.
-      this.dispose({ preserveButtonState: true });
-      return;
+      if (!signal.aborted && !this.disposed) {
+        dlog("playback setup failed", err?.name || err);
+        this.fail("Could not start playback. Check the backend and site permissions.");
+      }
+    } finally {
+      if (this._starting === attempt) this._starting = null;
     }
-    // start() awaits above (the multi-second probe). If the session was
-    // disposed meanwhile (a second click / toggle started a new session),
-    // abort — otherwise this disposed session would go on to create its own
-    // AudioContext and play in parallel with the live one, two music-removed
-    // streams slightly offset = comb-filter "stutter".
-    if (this.disposed) return;
+  }
 
-    this.jobId = info.job_id;
-    this.totalChunks = info.total_chunks || 1;
-    this.duration = info.duration_seconds || 0;
-    this.button.showStatus(info);
-
-    try {
-      const caps = await this.fetchCapabilities();
-      this.chunkSeconds = caps?.defaults?.chunk_seconds ?? this.chunkSeconds;
-      this.chunkOverlapSeconds =
-        caps?.defaults?.chunk_overlap_seconds ?? this.chunkOverlapSeconds;
-    } catch (err) {
-      // capabilities is best-effort; defaults are reasonable.
-      dlog("capabilities fetch failed; using defaults", err?.name || err);
+  async _startProcessing(signal) {
+    if (!this.muteController) {
+      this.muteController = new MuteController(this.video, (level, immediate) =>
+        this.scheduler?.setVolume(level, immediate));
+      this.muteController.mute();
     }
-    if (this.disposed) return; // re-check after the second await (see above).
-
-    // The scheduler owns the audio graph, chunk scheduling, the time-stretcher,
-    // and the sync monitor. It reads the shared chunk map and a couple of live
-    // getters (stride/total chunks). init() creates the AudioContext + loads
-    // stretch.js (one more await — re-check disposed after it).
+    const info = await this.requestJob();
+    if (signal.aborted || this.disposed) return;
+    this._adoptJob(info);
+    this._statusState = info.state;
+    if (info.state === "error") { this.fail(info.phase_label || "Processing failed"); return; }
+    if (this._streamPausedClosed && !this.button._pendingDownload) this.button.setPaused();
+    else this.button.showStatus(info);
+    // Chunk geometry is part of the backend contract. Falling back to local
+    // constants after a failed or malformed capabilities response can make
+    // playStart disagree with the server's chunk layout and shift every chunk
+    // after the first. Treat the response as mandatory so Retry can recover a
+    // transient failure without silently desynchronizing playback.
+    await this._loadCapabilities(signal);
+    if (signal.aborted || this.disposed) return;
     this.scheduler = new AudioScheduler(this.video, {
       chunks: this.chunks,
       getStride: () => this.chunkSeconds - this.chunkOverlapSeconds,
       getTotalChunks: () => this.totalChunks,
     });
     await this.scheduler.init();
-    if (this.disposed) return;
-
-    // Mute the host video and mirror its volume onto our audio output. The
-    // callback hands the effective level to the scheduler's gain.
-    this.muteController = new MuteController(this.video, (level, immediate) =>
-      this.scheduler?.setVolume(level, immediate),
-    );
-    this.muteController.mute();
-    // Pause the host video until chunk 0 is on disk; resume from the
-    // chunk-fetch handler. Better than playing silent: the user doesn't
-    // miss any seconds of content while the first chunk is being made.
-    // This is the initial pause — we deliberately don't relabel the
-    // button to "Buffering" here because the live phase label
-    // (Downloading / Removing music %) is more informative.
-    this._pauseForBuffer({ showBufferingLabel: false });
-    this.attachVideoListeners();
-    // Tell the backend to start where the user actually is, not at
-    // chunk 0 — handles YouTube's "resume from history", &t=NNN URL
-    // params, and any pre-scrub before the user clicked nomusic. The
-    // hint is debounced 250 ms, which still lands well before the
-    // probe + download phases finish on the backend.
-    const startChunk = this._chunkIdxForTime(this.video.currentTime);
-    dlog("session start", {
-      currentTime: this.video.currentTime,
-      chunk: startChunk,
-      totalChunks: this.totalChunks,
-      chunkSeconds: this.chunkSeconds,
-    });
-    this._sendPrioritizeHint();
-    // Open the status stream now — after audioCtx + capabilities exist, so
-    // the first event (especially a cached replay's immediate terminal
-    // event) can decode chunks with the right stride. This is still within
-    // a few hundred ms of /process, far inside the backend's idle window.
-    this._openEventStream();
+    if (signal.aborted || this.disposed) return;
+    this.muteController.refresh();
+    if (!this._streamPausedClosed || this.button._pendingDownload) {
+      this._sendPrioritizeHint();
+      this._openEventStream();
+    }
     this.startBufferMonitor();
   }
 
-  async requestJob() {
-    const body = { url: this.sourceUrl || window.location.href };
-    if (settings.model) body.model = settings.model;
-    if (settings.keepStems) body.keep_stems = settings.keepStems;
-    const resp = await fetch(`${settings.backendUrl}/process`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      const detail = await resp.text().catch(() => "");
-      throw new Error(`${resp.status}: ${detail}`);
+  async _fetchJSON(path, options, timeoutMs) {
+    const parent = this._requests.signal;
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    parent.addEventListener("abort", abort, { once: true });
+    if (parent.aborted) abort();
+    const timer = setTimeout(abort, timeoutMs);
+    try {
+      const response = await fetch(`${this.config.backendUrl}${path}`, {
+        ...options, signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return await response.json();
+    } finally {
+      clearTimeout(timer);
+      parent.removeEventListener("abort", abort);
     }
-    return resp.json();
   }
 
-  async fetchCapabilities() {
-    const resp = await fetch(`${settings.backendUrl}/capabilities`);
-    if (!resp.ok) return null;
-    return resp.json();
+  requestJob() {
+    const body = { url: this.sourceUrl || window.location.href };
+    if (this.config.model) body.model = this.config.model;
+    if (this.config.keepStems) body.keep_stems = this.config.keepStems;
+    return this._fetchJSON("/process", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }, 30_000);
   }
 
-  /** Subscribe to the backend's SSE status stream. EventSource handles
-   *  reconnection on transient network drops on its own; the backend
-   *  returns 204 for an unknown job, which drives readyState to CLOSED and
-   *  stops the reconnect loop. */
+  fetchCapabilities() {
+    return this._fetchJSON("/capabilities", {}, 5_000);
+  }
+
+  async _loadCapabilities(signal = this._requests.signal) {
+    const caps = await this.fetchCapabilities();
+    if (signal.aborted || this.disposed) return false;
+    const chunkSeconds = Number(caps?.defaults?.chunk_seconds);
+    const chunkOverlapSeconds = Number(caps?.defaults?.chunk_overlap_seconds);
+    if (!Number.isFinite(chunkSeconds) || !Number.isFinite(chunkOverlapSeconds) ||
+        chunkSeconds <= 0 || chunkOverlapSeconds < 0 ||
+        chunkSeconds <= chunkOverlapSeconds) {
+      throw new Error("Backend returned invalid chunk geometry");
+    }
+    this.chunkSeconds = chunkSeconds;
+    this.chunkOverlapSeconds = chunkOverlapSeconds;
+    return true;
+  }
+
+  _closeEventStream() {
+    clearTimeout(this._streamTimer);
+    this._streamTimer = null;
+    this.eventSource?.close();
+    this.eventSource = null;
+  }
+
+  /** Own reconnection so CONNECTING and CLOSED failures both have a budget.
+   *  Re-POST before reopening: a restarted backend may need to respawn work. */
   _openEventStream() {
+    if (this.disposed || this.failed) return;
+    this._closeEventStream();
+    let stream;
+    try {
+      stream = new EventSource(`${this.config.backendUrl}/events/${this.jobId}`);
+    } catch {
+      this._recoverStream();
+      return;
+    }
+    this.eventSource = stream;
+    // The backend sends an initial snapshot immediately. Once it arrives,
+    // inference may take much longer; SSE keepalives maintain the connection.
+    this._streamTimer = setTimeout(() => this._recoverStream(), 15_000);
+    stream.onmessage = (event) => {
+      if (this.disposed || this.failed || this.eventSource !== stream) return;
+      let status;
+      try { status = JSON.parse(event.data); } catch { return; }
+      if (!status || status.job_id !== this.jobId ||
+          !["queued", "probing", "downloading", "processing", "ready", "error"].includes(status.state)) return;
+      clearTimeout(this._streamTimer);
+      this._streamTimer = null;
+      this._reconnectAttempts = 0;
+      this.handleStatus(status);
+    };
+    stream.onerror = () => {
+      if (this.eventSource === stream) this._recoverStream();
+    };
+  }
+
+  _recoverStream() {
+    this._closeEventStream();
+    if (this.disposed || this.failed || this._streamEnded || this._streamPausedClosed) return;
+    if (this._reconnectTimer) return;
+    if (this._reconnectAttempts === 3) {
+      this.fail("Connection lost. Check the backend and retry.");
+      return;
+    }
+    const delay = 500 * 2 ** this._reconnectAttempts++;
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      this._resumeProcessing();
+    }, delay);
+  }
+
+  _onPlaybackIntent(wantsPlay) {
     if (this.disposed) return;
-    this.eventSource = new EventSource(
-      `${settings.backendUrl}/events/${this.jobId}`,
-    );
-    this.eventSource.onmessage = (e) => {
-      let payload;
-      try {
-        payload = JSON.parse(e.data);
-      } catch (err) {
-        console.warn("[nomusic] bad SSE payload", err);
-        return;
-      }
-      this.handleStatus(payload);
-    };
-    this.eventSource.onerror = () => {
-      // A 204 (unknown job) or our own .close() on a terminal state puts
-      // readyState at CLOSED — there's no more stream to wait on. A
-      // transient drop instead sits in CONNECTING while EventSource retries,
-      // so we leave _streamEnded alone in that case.
-      if (
-        this.eventSource &&
-        this.eventSource.readyState === EventSource.CLOSED
-      ) {
-        this._streamEnded = true;
-      }
-    };
+    if (this.failed) { this.playback.hold(); return; }
+    if (wantsPlay) {
+      this._onUserPlay();
+      this._reconcileBufferState();
+    } else {
+      this.scheduler?.stopAll();
+      this._onUserPause();
+    }
   }
 
   /** User paused the video (not a buffer pause). Close the status stream so
@@ -270,15 +337,14 @@ export class Session {
    *  play. No-op during a buffer pause: we still need chunk-ready events to
    *  know when to resume, and a fully-processed job has no worker to idle. */
   _onUserPause() {
-    if (this.disposed || this._pausedByUs || this._streamEnded) return;
+    if (this.disposed || this._streamEnded) return;
     // A queued download pins the worker: keep the stream open on pause so the
     // track finishes processing and the file is delivered even though the user
     // stopped watching. The pill keeps showing "Preparing N%".
     if (this.button && this.button._pendingDownload) return;
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
-    }
+    this._closeEventStream();
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = null;
     this._streamPausedClosed = true;
     // Replace the frozen live label (e.g. "Removing music 41%") with a
     // "Paused" signal so it's clear we've stopped, not stalled.
@@ -292,7 +358,7 @@ export class Session {
     if (this.disposed || this._streamEnded) return;
     if (!this.eventSource) {
       this._streamPausedClosed = false;
-      this._resumeProcessing(); // respawn the worker + reopen the stream
+      if (!this._starting) this._resumeProcessing(); // Startup will open its own stream.
     }
   }
 
@@ -302,33 +368,72 @@ export class Session {
   _onUserPlay() {
     if (this.disposed || this._streamEnded || !this._streamPausedClosed) return;
     this._streamPausedClosed = false;
+    if (this._starting) return;
     this._resumeProcessing();
   }
 
   async _resumeProcessing() {
+    if (this.disposed || this.failed) return;
+    if (this._resuming) return this._resuming;
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = null;
+    const attempt = this._resumeJob();
+    this._resuming = attempt;
+    try {
+      await attempt;
+    } finally {
+      if (this._resuming === attempt) this._resuming = null;
+    }
+  }
+
+  _adoptJob(info) {
+    if (this.jobId && info.job_id !== this.jobId) {
+      this._requests.abort();
+      this._requests = new AbortController();
+      this._closeEventStream();
+      this.scheduler?.reset();
+      this.loader.dispose();
+      this.loader = this._createLoader();
+      this.failed = false;
+      this._streamEnded = false;
+    }
+    this.jobId = info.job_id;
+    this.totalChunks = info.total_chunks || this.totalChunks || 1;
+    this.duration = info.duration_seconds ?? this.duration;
+  }
+
+  async _resumeJob() {
+    const signal = this._requests.signal;
     let info;
     try {
       info = await this.requestJob();
     } catch (err) {
-      // Backend unreachable on resume; reopening the stream below will
-      // surface the failure (204/CLOSED) without crashing playback.
-      dlog("resume requestJob failed", err?.name || err);
+      if (!signal.aborted) this._recoverStream();
+      return;
     }
-    if (this.disposed) return;
-    // The cache key is derived from (url, model, stems), so a resume for the
-    // same video returns the same job_id. A DIFFERENT id means the backend
-    // handed us a new job (settings changed, or it had evicted the old one):
-    // adopt it and drop the dedup set so chunks refetch under the new id,
-    // instead of stalling on the dead job's /events stream and stale chunk URLs.
-    if (info && info.job_id && info.job_id !== this.jobId) {
-      if (this.eventSource) {
-        this.eventSource.close();
-        this.eventSource = null;
+    if (signal.aborted || this.disposed || this.failed) return;
+    // A user can pause again while /process is in flight. That latest choice
+    // still owns the stream unless a queued export needs processing to finish.
+    if (this._streamPausedClosed && !this.button._pendingDownload) return;
+    const previousJobId = this.jobId;
+    if (info?.job_id) this._adoptJob(info);
+    this._statusState = info?.state ?? this._statusState;
+    if (info?.state === "error") { this.fail(info.phase_label || "Processing failed"); return; }
+    // A same-job resume retains the geometry established at startup. A
+    // changed job can come from a backend with different chunk settings, so
+    // refresh the contract before reopening its stream.
+    if (info?.job_id && previousJobId && info.job_id !== previousJobId) {
+      const currentSignal = this._requests.signal;
+      try {
+        if (!await this._loadCapabilities(currentSignal)) return;
+      } catch (err) {
+        if (!currentSignal.aborted) {
+          this.fail("Backend capabilities unavailable. Retry when the helper is ready.");
+        }
+        return;
       }
-      this.jobId = info.job_id;
-      this.totalChunks = info.total_chunks || this.totalChunks;
-      this.fetchedIdx.clear();
     }
+    if (this._streamPausedClosed && !this.button._pendingDownload) return;
     if (!this.eventSource) this._openEventStream();
     // Re-point the worker at where the user actually is, in case it was
     // abandoned and respawned with a from-scratch chunk order.
@@ -339,93 +444,69 @@ export class Session {
    *  poll loop did per tick: repaint the label, fetch any newly-ready
    *  chunks, and tear down on a terminal state. */
   handleStatus(status) {
-    if (this.disposed) return;
+    if (this.disposed || this.failed) return;
     this.totalChunks = status.total_chunks || this.totalChunks;
-    // Always reflect the backend phase in the label, even while we're
-    // paused for buffering — the pulsing icon + paused video already
-    // convey "waiting", and the phase label is more useful content.
-    this.button.showStatus(status);
-
+    this._statusState = status.state;
     if (status.state === "error") {
-      this._streamEnded = true;
-      if (this.eventSource) this.eventSource.close();
-      this.dispose({ preserveButtonState: true });
+      this.fail(status.phase_label || "Processing failed");
       return;
     }
+    this.button.showStatus(status);
 
-    // Fetch any newly-ready chunk. With seek-driven reordering, ready
-    // chunks are no longer contiguous from 0, so we iterate the explicit
-    // ``ready_chunks`` set the backend sends. Each chunk knows its own
-    // play_start, so order doesn't matter. fetchedIdx dedups across the
-    // repeated snapshots SSE delivers.
-    const readyChunks = Array.isArray(status.ready_chunks)
-      ? status.ready_chunks
-      : [];
-    for (const i of readyChunks) {
-      if (!this.fetchedIdx.has(i)) {
-        this.fetchedIdx.add(i);
-        this.fetchAndQueueChunk(i);
-      }
-    }
+    this.loader.updateAvailable(Array.isArray(status.ready_chunks)
+      ? status.ready_chunks : []);
 
     if (status.state === "ready") {
       this._streamEnded = true;
-      if (this.eventSource) this.eventSource.close();
+      this._closeEventStream();
     }
   }
 
-  async fetchAndQueueChunk(idx) {
-    try {
-      // ``cache: "default"`` lets the browser honor the backend's
-      // Cache-Control header (max-age=86400 for 200, no-store for 425).
-      // ``force-cache`` is wrong here because it returns ANY cached
-      // response unconditionally — so a 425 from "chunk not ready yet"
-      // gets remembered forever and poisons every retry, even after the
-      // chunk lands on disk. That manifested as seek-backwards getting
-      // stuck on chunks the backend had finished long ago.
-      const resp = await fetch(
-        `${settings.backendUrl}/chunk/${this.jobId}/${idx}`,
-        { cache: "default" },
-      );
-      if (!resp.ok) {
-        // Drop the dedup mark so the next SSE snapshot that re-lists this
-        // chunk in ready_chunks re-attempts the fetch.
-        this.fetchedIdx.delete(idx);
-        return;
-      }
-      const buf = await resp.arrayBuffer();
-      // The session can be disposed mid-fetch (toggle off, SPA navigation,
-      // <video> emptied) — the scheduler is then null. Bail quietly rather
-      // than throwing on a dead session's audio graph.
-      if (this.disposed || !this.scheduler) return;
-      const decoded = await this.scheduler.decode(buf);
-      if (this.disposed || !this.scheduler) return;
-      const stride = this.chunkSeconds - this.chunkOverlapSeconds;
-      const entry = {
-        buffer: decoded,
-        playStart: idx * stride,
-      };
-      this.chunks.set(idx, entry);
-      dlog("chunk arrived", {
-        idx,
-        currentTime: this.video.currentTime,
-        currentChunk: this._chunkIdxForTime(this.video.currentTime),
-        pausedByUs: this._pausedByUs,
-        videoPaused: this.video.paused,
-      });
-      // If we paused because this chunk wasn't ready, resume now.
-      if (this._pausedByUs && this._isBuffered(this.video.currentTime)) {
-        this._resumeAfterBuffer();
-      }
-      if (!this.video.paused && !this.disposed) {
-        this.scheduler?.scheduleChunk(idx, entry);
-      }
-    } catch (err) {
-      console.warn(`[nomusic] chunk ${idx} fetch/decode failed`, err);
-      this.fetchedIdx.delete(idx);
+  _chunkArrived(idx, entry) {
+    if (this.disposed || this.failed) return;
+    if (this.playback.held && this._isBuffered(this.video.currentTime)) {
+      this._resumeAfterBuffer();
     }
+    if (!this.video.paused) this.scheduler.scheduleChunk(idx, entry);
   }
 
+  /** Failure stops processing/audio work, but selection still owns silence. */
+  fail(message) {
+    if (this.disposed || this.failed) return;
+    this.failed = true;
+    this.playback.hold();
+    this._stopProcessing();
+    this.button.setError(message);
+  }
+
+  async retry() {
+    if (this.disposed || !this.failed) return;
+    this.failed = false;
+    // A decode timeout cannot be cancelled. Retire the old loader so its
+    // charged slots cannot make Retry fail immediately; late decode results
+    // remain fenced by the disposed loader's generation/ownership checks.
+    this.loader.dispose();
+    this.loader = this._createLoader();
+    this._requests = new AbortController();
+    this._starting = this._resuming = null;
+    this._reconnectAttempts = 0;
+    this._streamEnded = this._streamPausedClosed = false;
+    this.jobId = null;
+    await this.start();
+  }
+
+  _stopProcessing() {
+    this._requests.abort();
+    this._closeEventStream();
+    for (const key of ["bufferTimer", "_prioritizeTimer", "_reconnectTimer"]) {
+      clearTimeout(this[key]);
+      this[key] = null;
+    }
+    this.scheduler?.dispose();
+    this.scheduler = null;
+    // Keep unabortable decodes fenced to this loader until they settle.
+    this.loader.reset();
+  }
 
   // -- buffer pause/resume -------------------------------------------------
 
@@ -435,51 +516,41 @@ export class Session {
   }
 
   _isBuffered(t) {
-    return this.chunks.has(this._chunkIdxForTime(t));
+    const lastIdx = this.totalChunks - 1;
+    const idx = Math.min(this._chunkIdxForTime(t), lastIdx);
+    const entry = this.chunks.get(idx);
+    if (!entry) return false;
+    if (idx !== lastIdx) return true;
+    const audioEnd = entry.playStart + entry.buffer.duration;
+    if (t < audioEnd) return true;
+    // Keep original audio suppressed while the native player crosses a tiny
+    // final tail. Larger/unknown gaps are not covered by a decoded buffer.
+    return this._streamEnded && Number.isFinite(this.video.duration) &&
+      t <= this.video.duration &&
+      this.video.duration - audioEnd <= MAX_END_TAIL_SECONDS;
   }
 
   _pauseForBuffer({ showBufferingLabel = true } = {}) {
-    if (this._pausedByUs || this.disposed) return;
-    this._pausedByUs = true;
-    // Initial pause at session start (showBufferingLabel:false) leaves the
-    // live phase label alone — the user wants to see Downloading /
-    // Removing music %. A mid-watch buffer pause (the default) overrides
-    // with "Buffering" since at that point the user has been watching
-    // happily and needs to know why playback stopped.
-    if (showBufferingLabel) this.button.setBuffering();
-    dlog("pauseForBuffer", {
-      currentTime: this.video.currentTime,
-      chunk: this._chunkIdxForTime(this.video.currentTime),
-      showBufferingLabel,
-    });
-    try {
-      this.video.pause();
-    } catch (err) {
-      dlog("buffer pause: video element gone", err?.name || err);
+    if (this.disposed) return;
+    const mayShowBuffering = this._statusState === "ready" || this._streamEnded;
+    if (this.playback.held) {
+      if (showBufferingLabel && mayShowBuffering && this.playback.wantsPlay) {
+        this.button.setBuffering();
+      }
+      return;
     }
+    if (showBufferingLabel && mayShowBuffering && this.playback.wantsPlay) {
+      this.button.setBuffering();
+    }
+    this.playback.hold();
   }
 
   _resumeAfterBuffer() {
-    if (!this._pausedByUs || this.disposed) return;
-    this._pausedByUs = false;
-    dlog("resumeAfterBuffer", {
-      currentTime: this.video.currentTime,
-      chunk: this._chunkIdxForTime(this.video.currentTime),
-    });
-    // While the SSE stream is live, the next status event overwrites the
-    // "Buffering" label naturally. Once the stream has ended (state was
-    // ready or error) we have to restore the active label ourselves.
+    if (!this.playback.held || this.disposed || this.video.ended) return;
     if (this._streamEnded && this.button.el.dataset.state === "working") {
       this.button.showStatus({ state: "ready" });
     }
-    try {
-      const p = this.video.play();
-      if (p && typeof p.catch === "function") {
-        p.catch((err) => dlog("video.play() rejected", err?.name || err));
-      }
-    } catch (err) {
-      dlog("resume: video element gone", err?.name || err);
-    }
+    this.playback.release();
   }
 
   /** After the user seeks, ask the backend to process the chunk at the
@@ -487,59 +558,50 @@ export class Session {
    *  scrub doesn't generate dozens of POSTs. No-op once the stream has
    *  ended because the worker is already done. */
   _sendPrioritizeHint() {
-    if (this.disposed || this._streamEnded || !this.jobId) return;
+    if (this.disposed || this.failed || this._streamEnded || !this.jobId) return;
     if (this._prioritizeTimer) clearTimeout(this._prioritizeTimer);
     this._prioritizeTimer = setTimeout(() => {
       this._prioritizeTimer = null;
-      if (this.disposed || this._streamEnded || !this.jobId) return;
-      const fromChunk = this._chunkIdxForTime(this.video.currentTime);
+      if (this.disposed || this.failed || this._streamEnded || !this.jobId) return;
+      const final = this.totalChunks - 1;
+      if (final < 0) return;
+      const fromChunk = Math.min(final, this._chunkIdxForTime(this.video.currentTime));
       dlog("prioritize POST", { fromChunk, currentTime: this.video.currentTime });
-      fetch(`${settings.backendUrl}/process/${this.jobId}/prioritize`, {
+      fetch(`${this.config.backendUrl}/process/${this.jobId}/prioritize`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ from_chunk: fromChunk }),
+        signal: this._requests.signal,
       })
         .then((r) => dlog("prioritize response", r.status))
         .catch((err) => dlog("prioritize POST failed", err));
     }, 250);
   }
 
-  /** Bidirectional buffer-state reconciliation. Called every
-   *  SYNC_CHECK_MS by the buffer monitor and synchronously from the
-   *  ``seeked`` handler for immediate response.
-   *
-   *  Three jobs:
-   *    1. Heal a stale ``_pausedByUs`` flag — if the user un-paused the
-   *       video via the host site's controls, our flag is now lying
-   *       about who owns the pause.
-   *    2. Resume when we paused for buffer and the current chunk has
-   *       since landed in ``this.chunks`` (covers the case where a seek
-   *       arrives into already-buffered territory while we still hold a
-   *       prior pause).
-   *    3. Pause when we're playing and the current chunk isn't buffered. */
+  /** Buffering controls a temporary hold; it never changes user intent. */
   _reconcileBufferState() {
-    if (this.disposed) return;
-    if (this._pausedByUs && !this.video.paused) {
-      // User overrode us. Don't keep claiming ownership of the pause.
-      dlog("reconcile: healing stale _pausedByUs (video resumed externally)");
-      this._pausedByUs = false;
-    }
-    const buffered = this._isBuffered(this.video.currentTime);
-    if (this._pausedByUs && buffered) {
-      dlog("reconcile: chunk arrived under our pause -> resume");
+    if (this.disposed || this.video.ended) return;
+    if (this.failed) { this.playback.hold(); return; }
+    if (!this.scheduler) return;
+    this.loader.reconcile();
+    if (this.failed) return;
+    const time = this.video.currentTime;
+    if (this._isBuffered(time)) {
       this._resumeAfterBuffer();
-      return;
+    } else {
+      const last = this.chunks.get(this.totalChunks - 1);
+      if (this._streamEnded && last && time >= last.playStart + last.buffer.duration) {
+        this.fail("Processed audio ended before the video. Retry or return to original.");
+      } else {
+        this._pauseForBuffer();
+      }
     }
-    if (this.video.paused || this._pausedByUs) return;
-    if (!buffered) this._pauseForBuffer();
   }
 
-  /** rAF-rate check: drives ``_reconcileBufferState`` every
-   *  SYNC_CHECK_MS so playback recovers from any state desync within
-   *  one tick. Cheap (one branch + a Map.has per tick). */
+  /** Maintain the chunk window and reconcile buffering every SYNC_CHECK_MS. */
   startBufferMonitor() {
     const tick = () => {
-      if (this.disposed) return;
+      if (this.disposed || this.failed) return;
       this.bufferTimer = setTimeout(tick, SYNC_CHECK_MS);
       this._reconcileBufferState();
     };
@@ -563,40 +625,47 @@ export class Session {
     }
   }
 
-  dispose({ preserveButtonState = false } = {}) {
+  /** Navigation can reuse a video without emitting emptied. Compare the
+   *  playing YouTube identity, not its miniplayer's surrounding page URL. */
+  checkSource() {
+    if (this.disposed || !this.sourceUrl || !this.mediaSource) return;
+    const playingRaw = resolveSourceUrl();
+    const playing = normalizeWatchUrl(playingRaw) || this._rawSourceIdentity(playingRaw);
+    const original = normalizeWatchUrl(this.sourceUrl) || this._rawSourceIdentity(this.sourceUrl);
+    const current = this.video.currentSrc || "";
+    if ((playing && original && playing !== original) ||
+        (this.video.src || "") !== this.mediaSource.src ||
+        (current && this.mediaSource.current && current !== this.mediaSource.current)) {
+      this.dispose({ restore: false });
+      return;
+    }
+    // First metadata can arrive after the initial request; remember it once
+    // without confusing resource initialization with a replacement.
+    if (!this.mediaSource.current && current) this.mediaSource.current = current;
+  }
+
+  _rawSourceIdentity(raw) {
+    if (!raw) return "";
+    try {
+      return new URL(raw, location.href).href;
+    } catch {
+      return String(raw);
+    }
+  }
+
+  dispose({ restore = true } = {}) {
     if (this.disposed) return;
     this.disposed = true;
+    this._stopProcessing();
+    this.loader.dispose();
     this.detachVideoListeners();
-    // Tears down the audio graph: stops sources, clears the sync monitor,
-    // closes the AudioContext, disposes the stretcher + caches.
-    this.scheduler?.dispose();
-    this.scheduler = null;
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
-    }
-    if (this.bufferTimer) clearTimeout(this.bufferTimer);
-    if (this._prioritizeTimer) clearTimeout(this._prioritizeTimer);
-    // If we paused for buffering, let the video resume now that we're
-    // letting go of it — otherwise it would stay paused with no audio
-    // override and the user would have to hit play themselves.
-    const resumeOnExit = this._pausedByUs;
-    this._pausedByUs = false;
+    // Source replacement and detached-video retirement must not restore the
+    // native track while the element is still playing. Pause under the
+    // playback-intent owner before releasing the volume pin.
+    if (!restore) this.playback.hold();
     this.muteController?.dispose();
     this.muteController = null;
-    if (resumeOnExit) {
-      try {
-        const p = this.video.play();
-        if (p && typeof p.catch === "function") p.catch(() => {});
-      } catch (err) {
-        dlog("dispose: resume video element gone", err?.name || err);
-      }
-    }
-    this.chunks.clear();
-    this.fetchedIdx.clear();
-    // Error paths set the button to "error" and rely on its own
-    // auto-revert timer for the visual transition. Calling button.dispose
-    // here would clobber that.
-    if (!preserveButtonState) this.button.dispose();
+    this.playback.dispose({ restore });
+    this.button.dispose();
   }
 }

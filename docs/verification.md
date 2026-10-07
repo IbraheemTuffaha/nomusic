@@ -55,6 +55,8 @@ backend/.venv/bin/python scripts/verify.py
 # Smaller checks during development
 backend/.venv/bin/python scripts/verify.py --suite unit
 backend/.venv/bin/python scripts/verify.py --suite smoke
+# Extended playback/recovery check (opt-in; allow up to 30 minutes)
+backend/.venv/bin/python scripts/verify.py --suite playback --timeout-seconds 1800
 # Use another loopback port if the normal helper is already running
 backend/.venv/bin/python scripts/verify.py --suite smoke --port 18723
 ```
@@ -113,8 +115,27 @@ validation**. Generated media cannot establish speech intelligibility,
 separation quality, sustained performance, long-session memory behavior,
 upstream YouTube acquisition, or Mac/GPU compatibility. The test page is served
 from loopback; it does not exercise a public website requesting Chrome local-network
-permission. Permission denial and recovery remain separate browser acceptance
-work, planned with playback recovery.
+permission. Chrome's actual permission dialog remains a separate browser acceptance
+check, even when a controlled test injects a request failure.
+
+## Extended playback check
+
+`--suite playback` uses the same installed CPU backend and unmodified extension,
+with a fresh cache/profile and a 180-second generated fixture. Audio synthesis
+writes bounded blocks; a static 2 fps video keeps fixture generation inexpensive.
+The backend verifies both media hashes and measured durations against the manifest
+before using its duration as source metadata. The default `all` suite and CI retain
+the 12-second smoke.
+
+The extended browser scenario exercises at least 75 video seconds across chunk
+boundaries, seeks and cache eviction, playback/volume intent, recovery from
+intentional request failures, and settings/source lifecycle changes. Processing,
+decoding and audio scheduling remain real; injected faults are recorded in the
+browser report. Measurements of retained decoded and stretched PCM describe the
+extension's audio buffers, not total JavaScript heap, browser-native decoder
+allocations, or a long-session memory guarantee. As with the smoke, signal is
+measured before muted browser output; neither listening quality nor live-source
+acquisition is established by this fixture.
 
 ## CI and manual acceptance
 

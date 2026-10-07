@@ -21,6 +21,7 @@ reuse. MP3/MP4 exports preserve sample-aware chunk concatenation and use FFmpeg.
 | `engines/` | Engine interface, PyTorch implementation and pinned model store |
 | `pipeline/` | Source download, chunk processing, cache and export assembly |
 | `extension/main.js`, `button.js`, `session.js` | Video discovery, controls and per-video networking |
+| `extension/chunk-loader.js` | Bounded chunk acquisition, retries and decoded-audio retention |
 | `audio-scheduler.js`, `mute-controller.js`, `stretch.js` within the extension | Audio scheduling, volume mirroring and time-stretch |
 | `settings.js`, `background.js`, `popup.js`, `page-script.js` within the extension | Saved settings, service worker, popup and page bridge |
 
@@ -29,6 +30,72 @@ draining active work. It has a bounded grace period and an immediate second-inte
 escape; this is still an in-process worker design. A startup interrupted during
 model download can resume from the shared model cache. App-owned abandoned staging
 files are cleaned without removing completed media or shared model-download partials.
+
+### Playback ownership and memory
+
+A session captures its source URL, backend, model and stems. Popup changes take
+effect on the next session. Resuming the same job keeps valid audio; adopting a
+different job aborts old requests and clears decoded, stretched and scheduled
+audio together. Late decode or stretch results cannot repopulate a replaced job.
+
+The chunk loader keeps server availability separate from pending requests and
+decoded buffers. It fetches at most three chunks concurrently, including their
+decode work. Network/body reads time out after 15 seconds. Failed chunks have
+four attempts with 0.5, 1 and 2 second backoffs; retries continue independently
+after the final SSE status. Browser decoding cannot be cancelled, so an obsolete
+decode still occupies its slot until it settles, and its result is discarded.
+A decode exceeding 15 seconds reports a terminal error if it is still needed
+or blocks acquisition; it does not silently free a slot for more work.
+
+Decoded audio stays within 20 seconds behind and 45 seconds ahead of the video
+clock, rounded to whole chunks. Distant seeks release the old window and refetch
+the new one. With the default 9.5-second stride this retains at most eight chunks:
+about 29 MiB of stereo float PCM at 48 kHz and ten seconds per chunk. Up to three
+pending decodes are additional temporary work. Encoded browser HTTP cache and
+backend disk cache are separate from this decoded window.
+
+The scheduler prepares/schedules chunk starts no more than 30 video seconds
+ahead, including direct arrivals. Stretched buffers are retained only for decoded
+chunks and the current playback rate. Their size scales inversely with that
+rate (half-speed audio has twice as many frames); changing rates releases the
+previous prepared rate. These are time-window limits, not a fixed browser heap
+limit: channel count, sample rate and backend chunk settings affect memory.
+
+Volume and playback intent have separate owners. The volume controller mirrors
+the latest slider/mute choice, including zero, while suppressing original audio.
+Disabling nomusic restores that latest choice. A buffering hold pauses the media
+without changing whether the user wants it to play. The page bridge observes
+explicit pause calls even when the video is already held; newly available audio
+therefore cannot resume a video the user deliberately paused.
+
+Selecting nomusic pauses and suppresses the original track before contacting
+the backend. A terminal setup, processing, chunk or stream error retains that
+suppression and shows persistent **Retry** and **Return to original** actions.
+Retry restarts processing in the same session without resetting volume or
+play/pause intent. Only an explicit return restores the original track.
+
+Playback checks the final decoded chunk's actual end, including any span beyond
+the usual stride. Once the job is ready, a finite native video end up to one
+second later may finish with original audio still suppressed. A larger or unknown
+uncovered tail reports a persistent playback error instead of buffering forever.
+This tolerance does not stretch audio or correct larger source-duration mismatches.
+
+The session owns SSE reconnection: errors in either connecting or closed state
+receive three retries with 0.5, 1 and 2 second delays. Each retry re-submits the
+job before opening its stream, allowing a restarted backend to resume cached
+work. A valid status for that job resets the retry budget. An initial stream
+snapshot has a 15-second deadline; processing requests have 30 seconds, and
+the required capabilities request has a five-second timeout. User pause cancels reconnect work
+unless a queued export still needs processing.
+
+Discovery reconciles mutation batches against the final DOM. Reparenting a
+connected player preserves its session; removing a video retires its button,
+menus, timers, requests and audio without resuming the detached element. Source
+replacement also stops the old session. YouTube navigation uses the playing
+video ID so opening the miniplayer's surrounding home page does not replace it.
+Layout changes and navigation trigger bounded discovery refreshes; there is no
+continuous full-page scan. Export requests and progress polling belong to their
+button and are cancelled on retry, disable or retirement.
 
 ## Backend settings
 
