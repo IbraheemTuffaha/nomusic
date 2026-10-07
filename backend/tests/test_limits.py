@@ -103,6 +103,28 @@ def test_leased_cache_namespace_survives_clear_until_release(tmp_path):
     assert cache.load_meta(key) is None
 
 
+def test_shared_job_reader_can_stream_during_writer_lifetime(tmp_path):
+    cache = JobCache(tmp_path / "cache")
+    key = "b" * 16
+    cache.save_meta(key, CacheMeta(
+        url="https://example.test/v", model="fake", keep_stems=["vocals"],
+        duration_seconds=1, chunk_seconds=1, chunk_overlap_seconds=0,
+        total_chunks=1,
+    ))
+    writer = cache.job_lease(key, shared=True)
+    try:
+        reader = cache.job_lease(key, shared=True)
+        try:
+            cache.clear_all()
+            assert cache.load_meta(key) is not None
+        finally:
+            reader.close()
+    finally:
+        writer.close()
+    cache.clear_all()
+    assert cache.load_meta(key) is None
+
+
 def test_storage_reservation_enforces_cache_budget(tmp_path):
     cache = JobCache(tmp_path / "cache", max_bytes=10, min_free_bytes=0)
     with cache.reserve(10):

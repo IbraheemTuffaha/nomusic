@@ -195,7 +195,10 @@ def chunk(job_id: str, chunk_idx: int, request: Request) -> FileResponse:
             detail="chunk not ready",
             headers={"Cache-Control": "no-store"},
         )
-    lease = cache.job_lease(job_id)
+    # Chunks are atomically published one at a time. A shared lease keeps the
+    # namespace alive without waiting for the processor's lifetime lease, so
+    # progressive playback can consume ready chunks during a long job.
+    lease = cache.job_lease(job_id, shared=True)
     try:
         if not path.exists():
             raise HTTPException(status_code=425, detail="chunk not ready")
@@ -240,7 +243,7 @@ def audio(job_id: str, request: Request, format: str = "opus") -> Response:
     # disk; computing them in two passes lets a gap (or a concurrent TTL
     # sweep / cache clear) advertise more bytes than _gen actually yields,
     # which clients read as a truncated/hung response.
-    lease = cache.job_lease(job_id)
+    lease = cache.job_lease(job_id, shared=True)
     chunk_files = snapshot_chunk_files(
         cache, job_id, meta.total_chunks, require_complete=True
     )
@@ -339,7 +342,7 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
     if not complete_manifest(meta):
         raise HTTPException(status_code=425, detail="full audio not ready")
 
-    lease = cache.job_lease(job_id)
+    lease = cache.job_lease(job_id, shared=True)
     chunk_files = snapshot_chunk_files(
         cache, job_id, meta.total_chunks, require_complete=True
     )

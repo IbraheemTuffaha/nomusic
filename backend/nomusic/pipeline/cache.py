@@ -60,7 +60,6 @@ class StorageLimitExceeded(RuntimeError):
 
 class CacheLease:
     """Advisory lease for one cache namespace."""
-
     def __init__(self, directory: Path, *, shared: bool = False) -> None:
         self.directory = directory
         self.shared = shared

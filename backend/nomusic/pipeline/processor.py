@@ -557,8 +557,11 @@ class Processor:
         if abort_check:
             abort_check()
         # Hold the content namespace from metadata publication through the
-        # final chunk/completion write. Eviction and /cache/clear skip this
-        # directory while the lease is held.
+        # final chunk/completion write. This is a shared lifetime lease: each
+        # chunk is published atomically, so readers may stream ready chunks
+        # while later chunks are still being processed. Eviction and
+        # /cache/clear try an exclusive lock and therefore skip this directory
+        # for the whole run.
         provisional_key = self.cache.key(
             url,
             model,
@@ -566,7 +569,7 @@ class Processor:
             chunk_seconds=self.chunk_seconds,
             chunk_overlap_seconds=self.chunk_overlap_seconds,
         )
-        job_lease = self.cache.job_lease(provisional_key)
+        job_lease = self.cache.job_lease(provisional_key, shared=True)
         resources.callback(job_lease.close)
         key, meta, info, plans, fetcher = self.prepare_job(
             url, model=model, keep_stems=keep_stems,
