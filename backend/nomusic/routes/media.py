@@ -21,6 +21,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
+from nomusic.config import SETTINGS
 from nomusic.pipeline import downloader
 from nomusic.pipeline.cache import CHUNK_MEDIA_TYPE
 from nomusic.pipeline.export import (
@@ -326,6 +327,7 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
                 cache.video_dir(meta.url, max_height),
                 max_height=max_height,
                 progress_hook=_dl_hook,
+                limits=downloader.limits_from_settings(SETTINGS),
             )
         except Exception as exc:
             # yt-dlp failures are the user's URL going stale / network

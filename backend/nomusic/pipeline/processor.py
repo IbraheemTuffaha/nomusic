@@ -39,10 +39,13 @@ from nomusic.engines.base import Engine
 from .cache import CacheMeta, JobCache
 from .downloader import (
     DownloadCancelled as _DownloadCancelled,
+    ResourceLimitExceeded,
+    ResourceLimits,
     SourceFetcher,
     VideoMetadata,
     download_source,
     slice_source,
+    validate_source_file,
 )
 
 # Opus only supports 8/12/16/24/48 kHz; demucs hands us 44.1 kHz. ffmpeg
@@ -385,6 +388,7 @@ class Processor:
         chunk_overlap_seconds: float,
         keep_source_after_complete: bool = False,
         progressive: bool = False,
+        limits: ResourceLimits | None = None,
     ) -> None:
         self.engine = engine
         self.cache = cache
@@ -392,6 +396,7 @@ class Processor:
         self.chunk_overlap_seconds = chunk_overlap_seconds
         self.keep_source_after_complete = keep_source_after_complete
         self.progressive = progressive
+        self.limits = limits
 
     # -- planning ------------------------------------------------------------
 
@@ -429,6 +434,12 @@ class Processor:
         # the cached meta. The URL is part of the cache key, so the cached
         # duration can't belong to a different video.
         if existing and existing.total_chunks > 0 and existing.duration_seconds > 0:
+            if self.limits is not None:
+                if existing.duration_seconds > self.limits.max_duration_seconds:
+                    raise RuntimeError(
+                        "cached metadata exceeds the current duration limit; "
+                        "clear the entry and retry"
+                    )
             plans = plan_chunks(
                 existing.duration_seconds,
                 self.chunk_seconds,
@@ -451,7 +462,12 @@ class Processor:
         # First run: extract metadata in a session we'll also download from, so
         # the JS-challenge extraction is paid once, not once here + again at
         # download time.
+        # Keep the constructor compatible with small local SourceFetcher
+        # doubles and older adapters; the production implementation exposes a
+        # mutable policy attribute for this setup boundary.
         fetcher = SourceFetcher(url, self.cache.source_dir(url))
+        if self.limits is not None and hasattr(fetcher, "limits"):
+            fetcher.limits = self.limits
         try:
             info = fetcher.extract()
             plans = plan_chunks(
@@ -601,7 +617,17 @@ class Processor:
                 if fetcher is not None:
                     full = fetcher.download(progress_hook=_sync_download_hook)
                 else:
-                    full = download_source(url, source_dir, progress_hook=_sync_download_hook)
+                    full = download_source(
+                        url, source_dir,
+                        progress_hook=_sync_download_hook,
+                        limits=self.limits,
+                    )
+                policy = (
+                    self.limits
+                    if fetcher is None or hasattr(fetcher, "limits")
+                    else None
+                )
+                validate_source_file(full, info.duration_seconds, policy)
             except _DownloadCancelled:
                 # Restore the caller's control exception (WorkerAbandoned for
                 # jobs), keeping cancellation distinct from processing failure.
@@ -689,7 +715,9 @@ class Processor:
         # at identical per-chunk output. Decode stays on one thread (so the
         # provider's skip-check is race-free) but we keep BATCH decodes queued so
         # a full batch is usually ready when the GPU frees up.
-        batch_size = max(1, SETTINGS.gpu_batch)
+        batch_cap = self.limits.max_inference_batch if self.limits else SETTINGS.gpu_batch
+        prefetch_cap = self.limits.max_prefetch_chunks if self.limits else batch_cap
+        batch_size = max(1, min(SETTINGS.gpu_batch, batch_cap, prefetch_cap))
         decode_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nm-decode")
         write_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nm-write")
         write_futures: list = []
@@ -848,8 +876,14 @@ class Processor:
             with tempfile.TemporaryDirectory(prefix="decode-", dir=self.cache.scratch.path) as tmp_str:
                 raw = Path(tmp_str) / f"raw_{plan.index:03d}.wav"
                 t0 = time.perf_counter()
-                slice_source(src, raw, start=plan.start, end=plan.end,
-                             pass_fds=(self.cache.scratch.fd,))
+                slice_kwargs = {
+                    "start": plan.start,
+                    "end": plan.end,
+                    "pass_fds": (self.cache.scratch.fd,),
+                }
+                if self.limits is not None:
+                    slice_kwargs["limits"] = self.limits
+                slice_source(src, raw, **slice_kwargs)
                 t_slice = time.perf_counter() - t0
                 t1 = time.perf_counter()
                 prepared = self.engine.prepare(raw, model=model)
@@ -1028,6 +1062,10 @@ class Processor:
         with tempfile.TemporaryDirectory(prefix="chunk-", dir=self.cache.scratch.path) as work:
             tmp_path = Path(work) / "chunk.part"
             _encode_opus(trimmed, sample_rate, tmp_path, pass_fds=(self.cache.scratch.fd,))
+            if self.limits is not None and tmp_path.stat().st_size > self.limits.max_chunk_bytes:
+                raise ResourceLimitExceeded(
+                    f"encoded chunk exceeds the {self.limits.max_chunk_bytes} byte limit"
+                )
             if publish_check:
                 publish_check()
             with self.cache.publication(key, cache_generation):

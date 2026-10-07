@@ -30,6 +30,7 @@ from typing import Any, Callable
 from nomusic.engines import get_engine
 from nomusic.pipeline.cache import JobCache
 from nomusic.pipeline.processor import Processor, RunHooks
+from nomusic.pipeline.downloader import ResourceLimits
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,15 @@ class WorkerSettings:
     chunk_overlap_seconds: float
     keep_source_after_complete: bool
     progressive_download: bool
+    max_duration_seconds: float
+    max_source_bytes: int
+    max_video_bytes: int
+    max_video_height: int
+    max_decode_bytes: int
+    max_chunk_bytes: int
+    max_inference_batch: int
+    max_prefetch_chunks: int
+    final_chunk_tolerance_seconds: float
 
 
 def settings_for_worker(settings: Any) -> WorkerSettings:
@@ -66,6 +76,17 @@ def settings_for_worker(settings: Any) -> WorkerSettings:
         chunk_overlap_seconds=settings.chunk_overlap_seconds,
         keep_source_after_complete=settings.keep_source_after_complete,
         progressive_download=settings.progressive_download,
+        max_duration_seconds=getattr(settings, "max_duration_seconds", 7200.0),
+        max_source_bytes=getattr(settings, "max_source_bytes", 512 * 1024 * 1024),
+        max_video_bytes=getattr(settings, "max_video_bytes", 2 * 1024 * 1024 * 1024),
+        max_video_height=getattr(settings, "max_video_height", 1080),
+        max_decode_bytes=getattr(settings, "max_decode_bytes", 64 * 1024 * 1024),
+        max_chunk_bytes=getattr(settings, "max_chunk_bytes", 16 * 1024 * 1024),
+        max_inference_batch=getattr(settings, "max_inference_batch", 2),
+        max_prefetch_chunks=getattr(settings, "max_prefetch_chunks", 2),
+        final_chunk_tolerance_seconds=getattr(
+            settings, "final_chunk_tolerance_seconds", 1.0
+        ),
     )
 
 
@@ -198,6 +219,17 @@ def _worker_main(settings: WorkerSettings, commands: Any, events: Any) -> None:
             chunk_overlap_seconds=settings.chunk_overlap_seconds,
             keep_source_after_complete=settings.keep_source_after_complete,
             progressive=settings.progressive_download,
+            limits=ResourceLimits(
+                max_duration_seconds=settings.max_duration_seconds,
+                max_source_bytes=settings.max_source_bytes,
+                max_video_bytes=settings.max_video_bytes,
+                max_video_height=settings.max_video_height,
+                max_decode_bytes=settings.max_decode_bytes,
+                max_chunk_bytes=settings.max_chunk_bytes,
+                max_inference_batch=settings.max_inference_batch,
+                max_prefetch_chunks=settings.max_prefetch_chunks,
+                final_chunk_tolerance_seconds=settings.final_chunk_tolerance_seconds,
+            ),
         )
         _send(events, {"type": "started", "pid": os.getpid()})
         while True:

@@ -19,6 +19,7 @@ from nomusic.diagnostics import check_working_storage
 from nomusic.engines.base import Engine
 from nomusic.jobs import JobRegistry
 from nomusic.pipeline.cache import JobCache
+from nomusic.pipeline.downloader import limits_from_settings
 from nomusic.pipeline.processor import Processor
 from nomusic.runtime import check_runtime
 from nomusic.worker import SupervisedModelWorker
@@ -61,6 +62,7 @@ class Services:
             chunk_overlap_seconds=settings.chunk_overlap_seconds,
             keep_source_after_complete=settings.keep_source_after_complete,
             progressive=settings.progressive_download,
+            limits=limits_from_settings(settings),
         )
         # Test and embedding callers often provide an in-process fake engine;
         # those remain on the direct path. The packaged engines are always

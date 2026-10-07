@@ -168,5 +168,35 @@ class Settings:
         default_factory=lambda: _env_bool("SUPERVISED_WORKER", True)
     )
 
+    # Source/output policy. These are deliberately finite local-use defaults;
+    # operators can tighten them for a smaller disk or memory budget.
+    max_duration_seconds: float = field(
+        default_factory=lambda: _env_float("MAX_DURATION_SECONDS", 7200.0)
+    )
+    max_source_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_SOURCE_BYTES", 512 * 1024 * 1024)
+    )
+    max_video_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_VIDEO_BYTES", 2 * 1024 * 1024 * 1024)
+    )
+    max_video_height: int = field(
+        default_factory=lambda: _env_int("MAX_VIDEO_HEIGHT", 1080)
+    )
+    max_decode_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_DECODE_BYTES", 64 * 1024 * 1024)
+    )
+    max_chunk_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_CHUNK_BYTES", 16 * 1024 * 1024)
+    )
+    max_inference_batch: int = field(
+        default_factory=lambda: _env_int("MAX_INFERENCE_BATCH", 2)
+    )
+    max_prefetch_chunks: int = field(
+        default_factory=lambda: _env_int("MAX_PREFETCH_CHUNKS", 2)
+    )
+    final_chunk_tolerance_seconds: float = field(
+        default_factory=lambda: _env_float("FINAL_CHUNK_TOLERANCE_SECONDS", 1.0)
+    )
+
 
 SETTINGS = Settings()
