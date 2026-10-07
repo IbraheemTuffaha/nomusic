@@ -102,6 +102,13 @@ class Services:
                 "nomusic-memory-gc",
                 lambda: self._repeat(self._collect_jobs, settings.memory_gc_interval_seconds),
             )
+        if settings.interest_sweep_interval_seconds > 0:
+            self._spawn(
+                "nomusic-interest-gc",
+                lambda: self._repeat(
+                    self._expire_interests, settings.interest_sweep_interval_seconds
+                ),
+            )
         self._spawn("nomusic-engine-warmup", self._warmup)
 
     def _spawn(self, name: str, target: Callable[[], None]) -> None:
@@ -132,6 +139,12 @@ class Services:
         dropped = self.registry.memory_gc()
         if dropped:
             log.info("Memory GC dropped %d stale in-memory job(s)", dropped)
+
+    def _expire_interests(self) -> None:
+        assert self.registry is not None
+        expired = self.registry.expire_interests()
+        if expired:
+            log.info("Interest GC expired %d abandoned client lease(s)", expired)
 
     def _warmup(self) -> None:
         engine = self.engine

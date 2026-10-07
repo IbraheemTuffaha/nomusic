@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator
 from typing import Optional
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -100,6 +100,9 @@ class ProcessRequest(BaseModel):
     url: str = Field(..., min_length=1)
     model: Optional[str] = None
     keep_stems: Optional[list[str]] = None
+    # Optional during the compatibility window for older local extensions.
+    # New clients use it to acquire a processing lease atomically with submit.
+    client_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
 
     @field_validator("url")
     @classmethod
@@ -137,9 +140,34 @@ class ProcessRequest(BaseModel):
             raise ValueError("keep_stems must not be empty")
         return v
 
+    @field_validator("client_id")
+    @classmethod
+    def _validate_client_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        value = v.strip()
+        if not value:
+            raise ValueError("client_id must not be empty")
+        return value
+
 
 class PrioritizeRequest(BaseModel):
     from_chunk: int = Field(..., ge=0)
+
+
+class InterestRequest(BaseModel):
+    client_id: str = Field(..., min_length=1, max_length=128)
+    # The registry clamps this to its configured bound. Keeping a finite API
+    # bound also prevents a malformed client from asking for an enormous TTL.
+    lease_seconds: Optional[float] = Field(default=None, gt=0, le=3600)
+
+    @field_validator("client_id")
+    @classmethod
+    def _strip_client_id(cls, v: str) -> str:
+        value = v.strip()
+        if not value:
+            raise ValueError("client_id must not be empty")
+        return value
 
 
 @router.post("/process")
@@ -159,7 +187,9 @@ def process(req: ProcessRequest, request: Request) -> JsonDict:
         model = caps.default_model
     keep_stems = list(req.keep_stems or SETTINGS.default_keep_stems)
     try:
-        status = registry.submit(req.url, model=model, keep_stems=keep_stems)
+        status = registry.submit(
+            req.url, model=model, keep_stems=keep_stems, client_id=req.client_id
+        )
     except JobQueueFull as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except RegistryClosed as exc:
@@ -167,7 +197,55 @@ def process(req: ProcessRequest, request: Request) -> JsonDict:
     except Exception as exc:
         log.exception("submit failed")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return status.to_dict()
+    result = status.to_dict()
+    if req.client_id:
+        # This flag lets a new extension enable heartbeats without breaking a
+        # server from before M3-T5: old responses simply omit it.
+        result["interest"] = {
+            "supported": True,
+            "lease_seconds": registry.client_lease_seconds,
+            "heartbeat_seconds": min(
+                SETTINGS.client_heartbeat_seconds,
+                max(1.0, registry.client_lease_seconds / 2),
+            ),
+        }
+    return result
+
+
+@router.post("/process/{job_id}/interest")
+def acquire_interest(
+    job_id: str, req: InterestRequest, request: Request
+) -> dict[str, object]:
+    """Acquire or renew one client's bounded processing lease.
+
+    The route is the heartbeat. It is independent of whether the caller also
+    has an SSE stream or is reading ``/status``.
+    """
+    registry = request.app.state.registry
+    try:
+        lease = registry.acquire_interest(job_id, req.client_id, req.lease_seconds)
+    except RegistryClosed as exc:
+        raise HTTPException(status_code=503, detail="server shutting down") from exc
+    if lease is None:
+        raise HTTPException(status_code=404, detail="unknown job_id")
+    return lease
+
+
+@router.delete("/process/{job_id}/interest")
+def release_interest(
+    job_id: str,
+    request: Request,
+    client_id: str = Query(..., min_length=1, max_length=128),
+) -> dict[str, bool]:
+    """Release only this client's interest; other tabs keep the job alive."""
+    registry = request.app.state.registry
+    try:
+        released = registry.release_interest(job_id, client_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not released:
+        raise HTTPException(status_code=404, detail="unknown interest")
+    return {"released": True}
 
 
 @router.post("/process/{job_id}/prioritize")

@@ -180,6 +180,8 @@ class JobRegistry:
         *, is_stopping: Callable[[], bool] | None = None,
         worker: SupervisedModelWorker | None = None,
         max_queued_jobs: int | None = None,
+        client_lease_seconds: float | None = None,
+        sse_queue_size: int | None = None,
     ) -> None:
         self.processor = processor
         self.cache = cache
@@ -189,6 +191,17 @@ class JobRegistry:
         )
         if self.max_queued_jobs < 0:
             raise ValueError("max_queued_jobs must be non-negative")
+        self.client_lease_seconds = (
+            SETTINGS.client_lease_seconds
+            if client_lease_seconds is None else client_lease_seconds
+        )
+        if self.client_lease_seconds <= 0:
+            raise ValueError("client_lease_seconds must be positive")
+        self.sse_queue_size = (
+            SETTINGS.sse_queue_size if sse_queue_size is None else sse_queue_size
+        )
+        if self.sse_queue_size <= 0:
+            raise ValueError("sse_queue_size must be positive")
         self._jobs: dict[str, JobStatus] = {}
         self._executions: dict[str, _Execution] = {}
         self._next_generation = 0
@@ -217,6 +230,11 @@ class JobRegistry:
         # back to it safely.
         self._subscribers: dict[str, list[asyncio.Queue]] = {}
         self._last_disconnect_at: dict[str, float] = {}
+        # Client interest is deliberately separate from SSE transport. A tab
+        # may pause, reconnect, or switch to status reads while its bounded
+        # lease keeps the worker alive. Values use monotonic deadlines so a
+        # wall-clock adjustment cannot retain work indefinitely.
+        self._interests: dict[str, dict[str, float]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         # Keys whose worker should stop at its next chunk boundary. Set either
         # by the idle-abandon decision (atomically, under _lock, so a racing
@@ -280,6 +298,7 @@ class JobRegistry:
             self._pending_priority.clear()
             self._subscribers.clear()
             self._last_disconnect_at.clear()
+            self._interests.clear()
             self._abandoning.clear()
             self._loop = None
 
@@ -288,7 +307,7 @@ class JobRegistry:
 
         Clearing ``_last_disconnect_at`` here means a returning viewer resets
         the idle clock the instant their stream opens."""
-        q: asyncio.Queue = asyncio.Queue()
+        q: asyncio.Queue = asyncio.Queue(maxsize=self.sse_queue_size)
         with self._lock:
             if self.stopping:
                 raise RegistryClosed("job registry is shutting down")
@@ -307,8 +326,83 @@ class JobRegistry:
                 return
             if q in subs:
                 subs.remove(q)
-            if not subs and key in self._jobs:
+            if not subs and key in self._jobs and not self._has_live_interest_locked(key):
                 self._last_disconnect_at[key] = time.time()
+
+    # -- explicit client interest ------------------------------------------
+
+    @staticmethod
+    def _validate_client_id(client_id: str) -> str:
+        value = str(client_id).strip()
+        if not value or len(value) > 128:
+            raise ValueError("client_id must contain 1-128 characters")
+        return value
+
+    def _purge_expired_interests_locked(self, key: str, *, now: float | None = None) -> int:
+        """Remove expired leases for one key; caller holds ``_lock``."""
+        leases = self._interests.get(key)
+        if not leases:
+            return 0
+        now = time.monotonic() if now is None else now
+        expired = [client for client, deadline in leases.items() if deadline <= now]
+        for client in expired:
+            leases.pop(client, None)
+        if not leases:
+            self._interests.pop(key, None)
+            if key in self._jobs and not self._subscribers.get(key):
+                self._last_disconnect_at.setdefault(key, time.time())
+        return len(expired)
+
+    def _has_live_interest_locked(self, key: str) -> bool:
+        self._purge_expired_interests_locked(key)
+        return bool(self._interests.get(key))
+
+    def acquire_interest(
+        self, key: str, client_id: str, lease_seconds: float | None = None
+    ) -> dict[str, object] | None:
+        """Acquire or renew one client's bounded interest in a live/ready job."""
+        client_id = self._validate_client_id(client_id)
+        requested = self.client_lease_seconds if lease_seconds is None else float(lease_seconds)
+        if requested <= 0:
+            raise ValueError("lease_seconds must be positive")
+        ttl = min(requested, self.client_lease_seconds)
+        with self._lock:
+            if self.stopping or key not in self._jobs:
+                return None
+            self._purge_expired_interests_locked(key)
+            self._interests.setdefault(key, {})[client_id] = time.monotonic() + ttl
+            # A newly renewed client supersedes the old no-subscriber clock.
+            self._last_disconnect_at.pop(key, None)
+        return {
+            "leased": True,
+            "client_id": client_id,
+            "lease_seconds": ttl,
+            "heartbeat_seconds": min(
+                SETTINGS.client_heartbeat_seconds, max(1.0, ttl / 2)
+            ),
+        }
+
+    def release_interest(self, key: str, client_id: str) -> bool:
+        """Release only ``client_id``; other clients' leases remain intact."""
+        client_id = self._validate_client_id(client_id)
+        with self._lock:
+            leases = self._interests.get(key)
+            if not leases or client_id not in leases:
+                return False
+            leases.pop(client_id, None)
+            if not leases:
+                self._interests.pop(key, None)
+                if key in self._jobs and not self._subscribers.get(key):
+                    self._last_disconnect_at[key] = time.time()
+            return True
+
+    def expire_interests(self) -> int:
+        """Expire abandoned client leases and start idle clocks where needed."""
+        with self._lock:
+            return sum(
+                self._purge_expired_interests_locked(key)
+                for key in tuple(self._interests)
+            )
 
     # -- public --------------------------------------------------------------
 
@@ -318,7 +412,10 @@ class JobRegistry:
         *,
         model: str,
         keep_stems: list[str],
+        client_id: str | None = None,
     ) -> JobStatus:
+        if client_id is not None:
+            client_id = self._validate_client_id(client_id)
         with self._lock:
             if self.stopping:
                 raise RegistryClosed("job registry is shutting down")
@@ -350,6 +447,11 @@ class JobRegistry:
                 # /process landing during the unwind respawns a fresh worker
                 # instead of adopting one that's about to vanish.)
                 self._last_disconnect_at[key] = time.time()
+                if client_id is not None:
+                    self._interests.setdefault(key, {})[client_id] = (
+                        time.monotonic() + self.client_lease_seconds
+                    )
+                    self._last_disconnect_at.pop(key, None)
                 return existing
 
             live_jobs = sum(
@@ -365,6 +467,7 @@ class JobRegistry:
             # stale abandon mark so the fresh worker isn't killed on its first
             # chunk boundary.
             self._abandoning.discard(key)
+            self._interests.pop(key, None)
 
             cache_generation = None
             if existing_meta is not None:
@@ -377,6 +480,10 @@ class JobRegistry:
                 cache_generation = claim_generation(key)
             status = self._build_submit_status(key, existing_meta)
             self._jobs[key] = status
+            if client_id is not None:
+                self._interests[key] = {
+                    client_id: time.monotonic() + self.client_lease_seconds
+                }
             self._next_generation += 1
             execution = _Execution(key, self._next_generation, status, cache_generation)
             self._executions[key] = execution
@@ -503,6 +610,7 @@ class JobRegistry:
                         self._executions.pop(key, None)
                     self._subscribers.pop(key, None)
                     self._last_disconnect_at.pop(key, None)
+                    self._interests.pop(key, None)
                     dropped += 1
         return dropped
 
@@ -543,6 +651,7 @@ class JobRegistry:
             self._jobs.clear()
             self._subscribers.clear()
             self._last_disconnect_at.clear()
+            self._interests.clear()
         if self.worker is not None:
             for key in keys:
                 self.worker.cancel(key)
@@ -550,7 +659,7 @@ class JobRegistry:
         if pending and loop is not None and not loop.is_closed():
             for q, snapshot in pending:
                 try:
-                    loop.call_soon_threadsafe(q.put_nowait, snapshot)
+                    loop.call_soon_threadsafe(self._enqueue_snapshot, q, snapshot)
                 except RuntimeError:
                     break
 
@@ -874,6 +983,8 @@ class JobRegistry:
                 raise WorkerAbandoned
             if idle_timeout <= 0:
                 return
+            if self._has_live_interest_locked(key):
+                return
             if self._subscribers.get(key):
                 return
             # No subscriber: count from the last disconnect, or from job
@@ -991,6 +1102,19 @@ class JobRegistry:
         if snapshot is not None and loop is not None and not loop.is_closed():
             for q in subs:
                 try:
-                    loop.call_soon_threadsafe(q.put_nowait, snapshot)
+                    loop.call_soon_threadsafe(self._enqueue_snapshot, q, snapshot)
                 except RuntimeError:
                     break
+
+    @staticmethod
+    def _enqueue_snapshot(q: asyncio.Queue, snapshot: dict) -> None:
+        """Keep only the newest bounded snapshot for a slow SSE consumer."""
+        while True:
+            try:
+                q.put_nowait(snapshot)
+                return
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    return

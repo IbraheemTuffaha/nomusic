@@ -22,6 +22,7 @@ os.environ.setdefault(
 os.environ.setdefault("NOMUSIC_CACHE_TTL_DAYS", "0")
 os.environ.setdefault("NOMUSIC_CACHE_SWEEP_INTERVAL_SECONDS", "0")
 os.environ.setdefault("NOMUSIC_MEMORY_GC_INTERVAL_SECONDS", "0")
+os.environ.setdefault("NOMUSIC_INTEREST_SWEEP_INTERVAL_SECONDS", "0")
 os.environ.setdefault("NOMUSIC_IDLE_TIMEOUT_SECONDS", "0")
 
 
