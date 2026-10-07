@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from nomusic.config import SETTINGS
 from nomusic.engines.base import DEMUCS_STEMS
-from nomusic.jobs import RegistryClosed
+from nomusic.jobs import JobQueueFull, RegistryClosed
 
 from . import JsonDict
 
@@ -160,6 +160,8 @@ def process(req: ProcessRequest, request: Request) -> JsonDict:
     keep_stems = list(req.keep_stems or SETTINGS.default_keep_stems)
     try:
         status = registry.submit(req.url, model=model, keep_stems=keep_stems)
+    except JobQueueFull as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     except RegistryClosed as exc:
         raise HTTPException(status_code=503, detail="server shutting down") from exc
     except Exception as exc:

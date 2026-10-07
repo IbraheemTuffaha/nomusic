@@ -25,6 +25,11 @@ from typing import Callable, Optional
 from nomusic.config import SETTINGS
 from nomusic.pipeline.cache import CacheMeta, JobCache
 from nomusic.pipeline.processor import Processor, RunHooks
+from nomusic.worker import (
+    SupervisedModelWorker,
+    WorkerAbandoned as SupervisedWorkerAbandoned,
+    WorkerCrashed,
+)
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +44,10 @@ class WorkerAbandoned(Exception):
 
 class RegistryClosed(RuntimeError):
     """The service is stopping and cannot accept new work."""
+
+
+class JobQueueFull(RuntimeError):
+    """The bounded execution queue cannot admit another job."""
 
 
 class JobState(str, Enum):
@@ -168,9 +177,17 @@ class JobRegistry:
     def __init__(
         self, processor: Processor, cache: JobCache,
         *, is_stopping: Callable[[], bool] | None = None,
+        worker: SupervisedModelWorker | None = None,
+        max_queued_jobs: int | None = None,
     ) -> None:
         self.processor = processor
         self.cache = cache
+        self.worker = worker
+        self.max_queued_jobs = (
+            SETTINGS.max_queued_jobs if max_queued_jobs is None else max_queued_jobs
+        )
+        if self.max_queued_jobs < 0:
+            raise ValueError("max_queued_jobs must be non-negative")
         self._jobs: dict[str, JobStatus] = {}
         self._executions: dict[str, _Execution] = {}
         self._next_generation = 0
@@ -334,6 +351,15 @@ class JobRegistry:
                 self._last_disconnect_at[key] = time.time()
                 return existing
 
+            live_jobs = sum(
+                status.state in _LIVE_JOB_STATES
+                for status in self._jobs.values()
+            )
+            if live_jobs >= 1 + self.max_queued_jobs:
+                raise JobQueueFull(
+                    f"execution queue is full ({self.max_queued_jobs} queued job(s))"
+                )
+
             # New job, or one superseding an abandoning predecessor: clear any
             # stale abandon mark so the fresh worker isn't killed on its first
             # chunk boundary.
@@ -496,6 +522,7 @@ class JobRegistry:
         # the request thread, not the event loop.
         pending: list[tuple[asyncio.Queue, dict]] = []
         with self._lock:
+            keys = tuple(self._jobs)
             for key, status in self._jobs.items():
                 revoke_generation = getattr(self.cache, "revoke_generation", None)
                 if revoke_generation:
@@ -515,6 +542,9 @@ class JobRegistry:
             self._jobs.clear()
             self._subscribers.clear()
             self._last_disconnect_at.clear()
+        if self.worker is not None:
+            for key in keys:
+                self.worker.cancel(key)
         loop = self._loop
         if pending and loop is not None and not loop.is_closed():
             for q, snapshot in pending:
@@ -545,31 +575,47 @@ class JobRegistry:
                     # concurrent job honestly reports "Queued" instead of
                     # falsely showing "Inspecting video" while really blocked.
                     self._enter_phase(key, JobState.PROBING, progress=None, execution=execution)
-                    self.processor.run(
-                        url,
-                        model=model,
-                        keep_stems=keep_stems,
-                        hooks=RunHooks(
-                            on_probed=lambda info, plans, meta: self._on_probed(
-                                key, info, plans, meta, execution=execution
-                            ),
-                            on_progress=lambda meta, phase: self._on_separation_progress(
-                                key, meta, phase, execution=execution
-                            ),
-                            on_download_progress=lambda p: self._on_download_progress(
-                                key, p, execution=execution
-                            ),
-                            next_chunk_provider=self._make_chunk_provider(key, execution),
+                    hooks = RunHooks(
+                        on_probed=lambda info, plans, meta: self._on_probed(
+                            key, info, plans, meta, execution=execution
+                        ),
+                        on_progress=lambda meta, phase: self._on_separation_progress(
+                            key, meta, phase, execution=execution
+                        ),
+                        on_download_progress=lambda p: self._on_download_progress(
+                            key, p, execution=execution
+                        ),
+                        next_chunk_provider=self._make_chunk_provider(key, execution),
+                        abort_check=lambda: self._raise_if_abandoned(
+                            key, SETTINGS.idle_timeout_seconds, execution
+                        ),
+                        on_wait_for_download=lambda frac: self._on_wait_for_download(
+                            key, frac, execution=execution
+                        ),
+                        publish_check=lambda: self._assert_publishable(execution),
+                        cache_generation=execution.cache_generation,
+                    )
+                    if self.worker is not None:
+                        self.worker.run(
+                            key,
+                            url,
+                            model=model,
+                            keep_stems=keep_stems,
+                            hooks=hooks,
                             abort_check=lambda: self._raise_if_abandoned(
                                 key, SETTINGS.idle_timeout_seconds, execution
                             ),
-                            on_wait_for_download=lambda frac: self._on_wait_for_download(
-                                key, frac, execution=execution
-                            ),
                             publish_check=lambda: self._assert_publishable(execution),
                             cache_generation=execution.cache_generation,
-                        ),
-                    )
+                        )
+                    else:
+                        self.processor.run(
+                            url,
+                            model=model,
+                            keep_stems=keep_stems,
+                            hooks=hooks,
+                        )
+                    self._assert_publishable(execution)
                 meta = self.cache.load_meta(key)
                 chunks_ready = len(meta.chunks_ready) if meta else 0
                 ready_chunks = sorted(meta.chunks_ready) if meta else []
@@ -584,7 +630,7 @@ class JobRegistry:
                     execution=execution,
                 )
                 log.info("Job %s ready", key)
-            except WorkerAbandoned:
+            except (WorkerAbandoned, SupervisedWorkerAbandoned):
                 # Listed before the generic handler so an idle-abandon isn't
                 # mistaken for a failure. The GPU lock has already released via
                 # the with-block unwind; just flag it for finally to clean up.
@@ -870,6 +916,8 @@ class JobRegistry:
                     "prioritize: stashed (control not yet built) key=%s from_chunk=%d",
                     key, from_chunk,
                 )
+                if self.worker is not None:
+                    self.worker.prioritize(key, from_chunk)
                 return True
         before_size = len(control.pending)
         before_head = list(control.pending)[:5]
@@ -879,6 +927,8 @@ class JobRegistry:
             "prioritize: key=%s from_chunk=%d pending=%d head_before=%s head_after=%s",
             key, from_chunk, before_size, before_head, after_head,
         )
+        if self.worker is not None:
+            self.worker.prioritize(key, from_chunk)
         return True
 
     # -- internals -----------------------------------------------------------

@@ -21,6 +21,7 @@ from nomusic.jobs import JobRegistry
 from nomusic.pipeline.cache import JobCache
 from nomusic.pipeline.processor import Processor
 from nomusic.runtime import check_runtime
+from nomusic.worker import SupervisedModelWorker
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ class Services:
         self.engine: Engine | None = None
         self.cache: JobCache | None = None
         self.registry: JobRegistry | None = None
+        self.worker: SupervisedModelWorker | None = None
         self._stop = threading.Event()
         self.shutdown_requested = False
         self._threads: list[threading.Thread] = []
@@ -60,9 +62,24 @@ class Services:
             keep_source_after_complete=settings.keep_source_after_complete,
             progressive=settings.progressive_download,
         )
+        # Test and embedding callers often provide an in-process fake engine;
+        # those remain on the direct path. The packaged engines are always
+        # isolated behind the spawned supervisor so torch/MPS/CUDA state never
+        # lives in the HTTP process.
+        if settings.supervised_worker and self.engine.__class__.__module__.startswith(
+            "nomusic.engines."
+        ):
+            self.worker = SupervisedModelWorker(
+                settings,
+                execution_timeout_seconds=settings.execution_timeout_seconds,
+                cancel_grace_seconds=settings.worker_cancel_grace_seconds,
+            )
+            self.worker.start()
         self.registry = JobRegistry(
             processor=processor, cache=self.cache,
             is_stopping=lambda: self.shutdown_requested,
+            worker=self.worker,
+            max_queued_jobs=settings.max_queued_jobs,
         )
         self.registry.attach_loop(loop)
 
@@ -113,10 +130,11 @@ class Services:
         engine = self.engine
         if self.stopping or engine is None:
             return
+        model_check = self.worker.warmup if self.worker is not None else engine.warmup
         for name, action in (
             ("runtime", check_runtime),
             ("storage", lambda: check_working_storage(self.settings)),
-            ("model", engine.warmup),
+            ("model", model_check),
         ):
             if self.stopping:
                 return
@@ -167,6 +185,8 @@ class Services:
         self.begin_shutdown()
         if self.registry is not None:
             self.registry.shutdown()
+        if self.worker is not None:
+            self.worker.shutdown()
         for thread in self._threads:
             if thread.name == "nomusic-engine-warmup" and not self.wait_for_warmup:
                 if thread.is_alive():
@@ -177,6 +197,7 @@ class Services:
         if self.cache is not None:
             self.cache.close()
         self.registry = None
+        self.worker = None
         self.cache = None
         self.engine = None
         log.info("Service shutdown complete")

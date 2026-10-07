@@ -144,5 +144,29 @@ class Settings:
         default_factory=lambda: _env_bool("PROGRESSIVE", True)
     )
 
+    # The model process accepts one execution at a time.  Registry admission
+    # keeps this many additional jobs queued so a burst cannot create an
+    # unbounded set of native downloads or waiting threads.
+    max_queued_jobs: int = field(
+        default_factory=lambda: _env_int("MAX_QUEUED_JOBS", 2)
+    )
+    # A native inference/download run is allowed this long from admission to
+    # terminal publication.  The supervisor uses a monotonic deadline and
+    # terminates a child that ignores cooperative cancellation.
+    execution_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("EXECUTION_TIMEOUT_SECONDS", 1800.0)
+    )
+    worker_cancel_grace_seconds: float = field(
+        default_factory=lambda: _env_float("WORKER_CANCEL_GRACE_SECONDS", 5.0)
+    )
+    worker_warmup_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("WORKER_WARMUP_TIMEOUT_SECONDS", 300.0)
+    )
+    # The supervised process is the production path.  Keeping an explicit
+    # switch makes emergency local rollback possible without changing routes.
+    supervised_worker: bool = field(
+        default_factory=lambda: _env_bool("SUPERVISED_WORKER", True)
+    )
+
 
 SETTINGS = Settings()
