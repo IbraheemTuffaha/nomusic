@@ -324,7 +324,7 @@ class JobRegistry:
 
             t = threading.Thread(
                 target=self._run,
-                args=(key, url, model, keep_stems),
+                args=(key, url, model, keep_stems, status),
                 name=f"nomusic-job-{key[:6]}",
                 daemon=True,
             )
@@ -487,46 +487,40 @@ class JobRegistry:
         url: str,
         model: str,
         keep_stems: list[str],
+        owner: JobStatus,
     ) -> None:
-        # Capture our own identity so the finally cleanup only retracts state
-        # we still own. A submit() racing our abandon-unwind may have already
-        # replaced _jobs[key]/_threads[key] with a fresh worker; we must not
-        # clobber that one's bookkeeping.
-        my_thread = threading.current_thread()
-        with self._lock:
-            my_status = self._jobs.get(key)
         abandoned = False
         try:
             try:
                 with self._gpu_lock:
                     # Queued work must not begin probing/downloading after a
                     # shutdown signal received while it waited for the lock.
-                    self._raise_if_abandoned(key, SETTINGS.idle_timeout_seconds)
+                    self._raise_if_abandoned(key, SETTINGS.idle_timeout_seconds, owner)
                     # Stay in QUEUED while waiting for the GPU lock. Only flip
                     # to PROBING once we actually own it, so a second
                     # concurrent job honestly reports "Queued" instead of
                     # falsely showing "Inspecting video" while really blocked.
-                    self._enter_phase(key, JobState.PROBING, progress=None)
+                    self._enter_phase(key, JobState.PROBING, progress=None, owner=owner)
                     self.processor.run(
                         url,
                         model=model,
                         keep_stems=keep_stems,
                         hooks=RunHooks(
                             on_probed=lambda info, plans, meta: self._on_probed(
-                                key, info, plans, meta
+                                key, info, plans, meta, owner=owner
                             ),
                             on_progress=lambda meta, phase: self._on_separation_progress(
-                                key, meta, phase
+                                key, meta, phase, owner=owner
                             ),
                             on_download_progress=lambda p: self._on_download_progress(
-                                key, p
+                                key, p, owner=owner
                             ),
-                            next_chunk_provider=self._make_chunk_provider(key),
+                            next_chunk_provider=self._make_chunk_provider(key, owner),
                             abort_check=lambda: self._raise_if_abandoned(
-                                key, SETTINGS.idle_timeout_seconds
+                                key, SETTINGS.idle_timeout_seconds, owner
                             ),
                             on_wait_for_download=lambda frac: self._on_wait_for_download(
-                                key, frac
+                                key, frac, owner=owner
                             ),
                         ),
                     )
@@ -541,6 +535,7 @@ class JobRegistry:
                     chunks_ready=chunks_ready,
                     ready_chunks=ready_chunks,
                     total_chunks=total,
+                    owner=owner,
                 )
                 log.info("Job %s ready", key)
             except WorkerAbandoned:
@@ -562,35 +557,36 @@ class JobRegistry:
                     JobState.ERROR,
                     progress=1.0,
                     error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}",
+                    owner=owner,
                 )
         finally:
-            # The control + any orphaned priority hint are only meaningful
-            # while a worker is consuming chunks; drop them unconditionally.
-            with self._lock:
-                self._controls.pop(key, None)
-                self._pending_priority.pop(key, None)
-                # Only retract the shared bookkeeping if we're still the
-                # registered worker for this key. If a submit() raced our
-                # unwind and installed a fresh worker, _threads[key] now points
-                # at that thread, not us — leave its _threads/_subscribers/
-                # _jobs entries alone. Dropping our own handle marks the job as
-                # having no live worker, which is what ``memory_gc`` keys off.
-                if self._threads.get(key) is my_thread:
-                    self._threads.pop(key, None)
-                    self._subscribers.pop(key, None)
-                    self._last_disconnect_at.pop(key, None)
-                    self._abandoning.discard(key)
-                    # The terminal _update(READY/ERROR) above already enqueued
-                    # its snapshot to every open stream, so dropping
-                    # _subscribers here loses nothing; each stream still drains
-                    # and closes itself. A stream that opens after this sees the
-                    # terminal state from disk and short-circuits.
-                    if abandoned and self._jobs.get(key) is my_status:
-                        # Drop the JobStatus so a later /process spawns a fresh
-                        # worker (resuming from disk-cached chunks) rather than
-                        # finding a stale entry. Completed/errored jobs are kept
-                        # for /status until memory_gc reclaims them.
-                        self._jobs.pop(key, None)
+            self._cleanup_worker(key, owner, abandoned)
+
+    def _cleanup_worker(self, key: str, owner: JobStatus, abandoned: bool) -> None:
+        """Release state only when this worker still owns the job generation."""
+        with self._lock:
+            if self._jobs.get(key) is not owner:
+                return
+            self._controls.pop(key, None)
+            self._pending_priority.pop(key, None)
+            # Only retract the shared bookkeeping if we're still the registered
+            # worker for this key. A replacement may have been admitted while
+            # this generation was unwinding; its state must remain untouched.
+            if self._threads.get(key) is threading.current_thread():
+                self._threads.pop(key, None)
+                self._subscribers.pop(key, None)
+                self._last_disconnect_at.pop(key, None)
+                self._abandoning.discard(key)
+                # The terminal _update(READY/ERROR) above already enqueued its
+                # snapshot to every open stream, so dropping subscribers here
+                # loses nothing. A stream that opens after this sees the
+                # terminal state from disk and short-circuits.
+                if abandoned:
+                    # Drop the JobStatus so a later /process spawns a fresh
+                    # worker (resuming from disk-cached chunks) rather than
+                    # finding a stale entry. Completed/errored jobs are kept
+                    # for /status until memory_gc reclaims them.
+                    self._jobs.pop(key, None)
 
     def _enter_phase(
         self,
@@ -598,10 +594,12 @@ class JobRegistry:
         state: JobState,
         *,
         progress: float | None,
+        owner: JobStatus | None = None,
         **extra,
     ) -> None:
         self._update(
             key,
+            owner=owner,
             state=state,
             phase=state.value,
             phase_progress=progress,
@@ -615,12 +613,15 @@ class JobRegistry:
         info,
         plans,
         meta: CacheMeta,
+        *,
+        owner: JobStatus | None = None,
     ) -> None:
         # Probe done. Surface metadata so the popup / button can show real
         # duration + title; phase stays at PROBING until the first download
         # tick flips it to DOWNLOADING.
         self._update(
             key,
+            owner=owner,
             title=info.title,
             duration_seconds=info.duration_seconds,
             total_chunks=meta.total_chunks,
@@ -630,24 +631,40 @@ class JobRegistry:
         # Now that we know total_chunks, build the per-job control. If a
         # /prioritize call beat us here, apply the stashed hint now.
         with self._lock:
-            if key not in self._controls:
-                self._controls[key] = _JobControl(
+            if owner is not None and self._jobs.get(key) is not owner:
+                return
+            control = self._controls.get(key)
+            if control is None:
+                control = _JobControl(
                     total_chunks=meta.total_chunks,
                     done=set(meta.chunks_ready),
                 )
+                self._controls[key] = control
             hint = self._pending_priority.pop(key, None)
         if hint is not None:
-            self._controls[key].prioritize(hint)
+            control.prioritize(hint)
 
-    def _set_downloading(self, key: str, fraction: float | None) -> None:
+    def _set_downloading(
+        self,
+        key: str,
+        fraction: float | None,
+        *,
+        owner: JobStatus | None = None,
+    ) -> None:
         """Flip the job to the DOWNLOADING ("Fetching") phase at ``fraction``.
         Shared by the two download-progress callbacks, which differ only in
         whether they suppress this update once separation is underway."""
-        self._update(key, state=JobState.DOWNLOADING, phase="downloading",
+        self._update(key, owner=owner, state=JobState.DOWNLOADING, phase="downloading",
                      phase_label=_PHASE_LABELS["downloading"],
                      phase_progress=fraction)
 
-    def _on_download_progress(self, key: str, fraction: float | None) -> None:
+    def _on_download_progress(
+        self,
+        key: str,
+        fraction: float | None,
+        *,
+        owner: JobStatus | None = None,
+    ) -> None:
         # In progressive mode the download runs concurrently with separation,
         # so download ticks ("Fetching", download %) and separation ticks
         # ("Removing", chunk %) interleave. Once separation has started, keep
@@ -656,28 +673,38 @@ class JobRegistry:
         # different scales. The download still proceeds in the background.
         with self._lock:
             status = self._jobs.get(key)
+            if owner is not None and status is not owner:
+                return
             if status is not None and status.state in (
                 JobState.PROCESSING,
                 JobState.READY,
                 JobState.ERROR,
             ):
                 return
-        self._set_downloading(key, fraction)
+        self._set_downloading(key, fraction, owner=owner)
 
-    def _on_wait_for_download(self, key: str, fraction: float | None) -> None:
+    def _on_wait_for_download(
+        self,
+        key: str,
+        fraction: float | None,
+        *,
+        owner: JobStatus | None = None,
+    ) -> None:
         # Separation is blocked waiting for the download to reach this chunk —
         # the user seeked past the downloaded point, or the download is slower
         # than separation. This is the one case where flipping back to
         # "Fetching" is right: playback is genuinely gated on the download, not
         # on separation. Unlike _on_download_progress this isn't suppressed
         # during PROCESSING, because here the download IS the bottleneck.
-        self._set_downloading(key, fraction)
+        self._set_downloading(key, fraction, owner=owner)
 
     def _on_separation_progress(
         self,
         key: str,
         meta: CacheMeta,
         phase: str,
+        *,
+        owner: JobStatus | None = None,
     ) -> None:
         done = len(meta.chunks_ready)
         total = max(1, meta.total_chunks)
@@ -688,6 +715,7 @@ class JobRegistry:
         progress = min(1.0, (done + per_chunk) / total)
         self._update(
             key,
+            owner=owner,
             state=JobState.PROCESSING,
             phase="processing",
             phase_label=_PHASE_LABELS["processing"],
@@ -699,7 +727,9 @@ class JobRegistry:
 
     # -- prioritization ------------------------------------------------------
 
-    def _make_chunk_provider(self, key: str) -> Callable[[], Optional[int]]:
+    def _make_chunk_provider(
+        self, key: str, owner: JobStatus | None = None
+    ) -> Callable[[], Optional[int]]:
         """Build the callable that ``Processor.run`` calls between chunks.
 
         Returns the next chunk index, ``None`` when the queue is exhausted, or
@@ -711,8 +741,10 @@ class JobRegistry:
         idle_timeout = SETTINGS.idle_timeout_seconds
 
         def provider() -> Optional[int]:
-            self._raise_if_abandoned(key, idle_timeout)
+            self._raise_if_abandoned(key, idle_timeout, owner)
             with self._lock:
+                if owner is not None and self._jobs.get(key) is not owner:
+                    raise WorkerAbandoned
                 control = self._controls.get(key)
             if control is None:
                 return None
@@ -720,7 +752,12 @@ class JobRegistry:
 
         return provider
 
-    def _raise_if_abandoned(self, key: str, idle_timeout: float) -> None:
+    def _raise_if_abandoned(
+        self,
+        key: str,
+        idle_timeout: float,
+        owner: JobStatus | None = None,
+    ) -> None:
         """Raise ``WorkerAbandoned`` if the job has been flagged (idle decision
         on a prior call, or a cache clear) or has now gone idle. The whole
         check + flag-set happens under the lock so it can't interleave with a
@@ -728,6 +765,8 @@ class JobRegistry:
         provider and the progressive-download abort hook so a pause that lands
         mid-download still releases the GPU promptly."""
         with self._lock:
+            if owner is not None and self._jobs.get(key) is not owner:
+                raise WorkerAbandoned
             if self.stopping or key in self._abandoning:
                 raise WorkerAbandoned
             if idle_timeout <= 0:
@@ -781,7 +820,7 @@ class JobRegistry:
 
     # -- internals -----------------------------------------------------------
 
-    def _update(self, key: str, **fields) -> None:
+    def _update(self, key: str, *, owner: JobStatus | None = None, **fields) -> None:
         snapshot: dict | None = None
         subs: list[asyncio.Queue] = []
         with self._lock:
@@ -789,6 +828,8 @@ class JobRegistry:
                 return
             status = self._jobs.get(key)
             if status is None:
+                return
+            if owner is not None and status is not owner:
                 return
             for name, value in fields.items():
                 setattr(status, name, value)

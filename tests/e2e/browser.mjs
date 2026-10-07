@@ -448,7 +448,15 @@ try {
   // Keep HTTP errors and failures of every other request fatal.
   const expectedStreamClose = (item) => item.path === eventPath
     && item.failed?.errorText === "net::ERR_ABORTED";
-  const intentionalAbort = (item) => item.expectedAbort && item.failed;
+  const intentionalAbort = (item) => {
+    if (!item.expectedAbort || !item.failed) return false;
+    // EventSource.close() and the deliberate SSE route abort are the only
+    // failures this scenario owns. Keep unrelated transport failures fatal,
+    // even when they happen while a session is replacing its window.
+    return item.failed.errorText === "net::ERR_ABORTED" ||
+      (item.expectedAbort === "browser SSE interruption" &&
+        item.failed.errorText === "net::ERR_FAILED");
+  };
   const injectedHttpFault = (item) => item.expectedHttp?.status === item.status;
   assert.deepEqual(report.network.filter((item) =>
     (item.status >= 400 && !injectedHttpFault(item)) ||

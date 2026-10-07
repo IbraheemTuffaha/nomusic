@@ -183,6 +183,21 @@ for (const changed of ["src", "currentSrc"]) {
   });
 }
 
+test("non-YouTube source identity does not collapse same-v URLs", () => {
+  const s = makeSession();
+  s.sourceUrl = "https://video.example/clip?v=OLD";
+  s.video.src = s.video.currentSrc = "blob:player";
+  s.mediaSource = { src: "blob:player", current: "blob:player" };
+  const previousLocation = globalThis.location;
+  globalThis.location = { href: "https://other.example/clip?v=NEW" };
+  try {
+    withBridge("", () => s.checkSource());
+  } finally {
+    globalThis.location = previousLocation;
+  }
+  assert.equal(s.disposed, true);
+});
+
 test("emptied during a buffering hold releases work without restarting old media", async () => {
   const s = makeSession(false);
   s.playback.hold();
@@ -238,9 +253,19 @@ test("an already-held wanted video gets the Buffering label", (t) => {
   const s = makeSession(false);
   t.after(() => s.dispose({ restore: false }));
   const buffering = t.mock.method(s.button, "setBuffering");
+  s._statusState = "ready";
   s.playback.hold();
   s._pauseForBuffer();
   assert.equal(buffering.mock.callCount(), 1);
+});
+
+test("buffering does not replace processing progress", (t) => {
+  const s = makeSession(false);
+  t.after(() => s.dispose({ restore: false }));
+  const buffering = t.mock.method(s.button, "setBuffering");
+  s._statusState = "processing";
+  s._pauseForBuffer();
+  assert.equal(buffering.mock.callCount(), 0);
 });
 
 test("_isBuffered reflects whether the covering chunk is decoded", () => {
@@ -281,6 +306,19 @@ test("the final decoded chunk can cover time beyond one nominal stride", (t) => 
   s.chunks.set(1, { buffer: { duration: 10.5 }, playStart: 9.5 });
   assert.equal(s._isBuffered(19.75), true);
   assert.equal(s._isBuffered(20), false);
+});
+
+test("a bounded native duration tail stays muted after the last chunk", (t) => {
+  const s = makeSession(false);
+  t.after(() => s.dispose({ restore: false }));
+  s.totalChunks = 2;
+  s._streamEnded = true;
+  s.video.duration = 26;
+  s.video.currentTime = 25;
+  s.chunks.set(1, { buffer: { duration: 9.5 }, playStart: 9.5 });
+
+  assert.equal(s._isBuffered(s.video.currentTime), true);
+  assert.equal(s.failed, false);
 });
 
 test("a codec tail does not resume a user-paused video or a job still processing", async (t) => {
@@ -325,7 +363,7 @@ test("already ended video is not held, relabeled or restarted by a monitor or ar
   assert.equal(s.failed, false);
 });
 
-for (const videoEnd of [20.01, 30, Infinity, NaN]) {
+for (const videoEnd of [30, 35, Infinity, NaN]) {
   test(`uncovered final audio with native duration ${videoEnd} fails instead of waiting forever`, (t) => {
     const s = makeSession(false);
     t.after(() => s.dispose({ restore: false }));
@@ -417,6 +455,21 @@ test("_resumeProcessing adopts a changed job_id and refetches chunks", async () 
   assert.equal(scheduler.stretchCache.size, 0);
   assert.equal(stopped, 1);
   assert.equal(scheduler.activeSources.size, 0);
+});
+
+test("_resumeProcessing surfaces changed-job capability failures", async (t) => {
+  const s = makeSession();
+  s.jobId = "OLD";
+  s.requestJob = async () => ({ job_id: "NEW", total_chunks: 1 });
+  const error = t.mock.method(s.button, "setError", () => {});
+  s._loadCapabilities = async () => {
+    throw new Error("capabilities unavailable");
+  };
+
+  await s._resumeProcessing();
+
+  assert.equal(s.failed, true);
+  assert.equal(error.mock.callCount(), 1);
 });
 
 test("_resumeProcessing keeps the same job_id when the url is unchanged", async () => {
@@ -707,6 +760,10 @@ test("normalizeWatchUrl returns null for non-watch / empty inputs", () => {
   assert.equal(normalizeWatchUrl("https://www.youtube.com/feed/history"), null);
   assert.equal(normalizeWatchUrl(""), null);
   assert.equal(normalizeWatchUrl(null), null);
+});
+
+test("normalizeWatchUrl ignores non-YouTube v query parameters", () => {
+  assert.equal(normalizeWatchUrl("https://video.example/watch?v=ABC123"), null);
 });
 
 test("resolveSourceUrl uses the bridge's playing-video URL (miniplayer case)", () => {

@@ -50,12 +50,12 @@ or blocks acquisition; it does not silently free a slot for more work.
 Decoded audio stays within 20 seconds behind and 45 seconds ahead of the video
 clock, rounded to whole chunks. Distant seeks release the old window and refetch
 the new one. With the default 9.5-second stride this retains at most eight chunks:
-about 33 MiB of stereo float PCM at 48 kHz and ten seconds per chunk. Up to three
+about 29 MiB of stereo float PCM at 48 kHz and ten seconds per chunk. Up to three
 pending decodes are additional temporary work. Encoded browser HTTP cache and
 backend disk cache are separate from this decoded window.
 
-The scheduler prepares/schedules audio no more than 30 video seconds ahead,
-including direct arrivals. Stretched buffers are retained only for decoded
+The scheduler prepares/schedules chunk starts no more than 30 video seconds
+ahead, including direct arrivals. Stretched buffers are retained only for decoded
 chunks and the current playback rate. Their size scales inversely with that
 rate (half-speed audio has twice as many frames); changing rates releases the
 previous prepared rate. These are time-window limits, not a fixed browser heap
@@ -85,7 +85,7 @@ receive three retries with 0.5, 1 and 2 second delays. Each retry re-submits the
 job before opening its stream, allowing a restarted backend to resume cached
 work. A valid status for that job resets the retry budget. An initial stream
 snapshot has a 15-second deadline; processing requests have 30 seconds, and
-optional capabilities requests have five. User pause cancels reconnect work
+the required capabilities request has a five-second timeout. User pause cancels reconnect work
 unless a queued export still needs processing.
 
 Discovery reconciles mutation batches against the final DOM. Reparenting a

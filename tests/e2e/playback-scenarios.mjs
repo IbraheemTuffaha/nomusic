@@ -92,7 +92,7 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
   until, sleep, note, report, options, ready, boundary, expectAborts, expectHttp }) {
   assert.ok(ready.duration_seconds >= 175, "Playback suite needs the 180-second fixture");
   const evidence = report.playback = {
-    limits: { retainedChunks: 8, activeRequests: 3, pcmBytes: 128 * 1024 * 1024, sourceAheadSeconds: 30 },
+    limits: { retainedChunks: 8, activeRequests: 3, pcmBytes: 64 * 1024 * 1024, sourceAheadSeconds: 30 },
     injectedFaults: [], checks: [],
   };
   const read = () => isolated("__nomusicPlayback.read()");
@@ -252,7 +252,7 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
         sampleRates: state.sampleRates, stretchKeys: state.stretchKeys });
     }
     assert.ok(chunkRequests.includes(0), "Seeking backward refetched previously evicted chunk 0");
-    assert.ok((await audioState()).maxSourceAhead <= 30.1, "Direct arrivals respect the 30-second scheduling horizon");
+    assert.ok((await audioState()).maxSourceAhead <= 30.1, "Direct arrivals respect the 30-second chunk-start horizon");
 
     // Settings update the next session only; the current artifact keeps its
     // original backend even during a seek which needs fresh network traffic.
@@ -412,7 +412,7 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
     assert.equal(observation.peaks.liveSessions, 1);
     evidence.observation = observation;
     evidence.maxSourceAheadSeconds = (await audioState()).maxSourceAhead;
-    assert.ok(evidence.maxSourceAheadSeconds <= 30.1, "Every source start obeys scheduler lookahead");
+    assert.ok(evidence.maxSourceAheadSeconds <= 30.1, "Every source start obeys the 30-second chunk-start horizon");
     evidence.chunkRequests = chunkRequests;
     evidence.passed = true;
   } finally {

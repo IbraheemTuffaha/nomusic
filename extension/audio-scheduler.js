@@ -117,8 +117,8 @@ export class AudioScheduler {
         ? this._getStride()
         : origDuration;
     const chunkEnd = chunkStart + exclusiveSpan;
-    // Direct arrivals, reschedules and stretch completions share one window,
-    // checked before allocating a stretched buffer or source.
+    // Direct arrivals, reschedules and stretch completions share one chunk-start
+    // window, checked before allocating a stretched buffer or source.
     const time = this.video.currentTime;
     if (chunkStart > time + 30 || chunkEnd <= time) return;
 

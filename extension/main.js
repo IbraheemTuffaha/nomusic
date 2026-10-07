@@ -113,7 +113,14 @@ function scheduleRefresh() {
 function init() {
   scan(document);
   const observer = new MutationObserver((mutations) => {
+    let needsReanchor = false;
     for (const m of mutations) {
+      for (const node of m.removedNodes) {
+        if (node.nodeType === 1 &&
+            (node.tagName === "VIDEO" || node.querySelector?.("video"))) {
+          needsReanchor = true;
+        }
+      }
       for (const node of m.addedNodes) {
         if (node.nodeType === 1) {
           if (node.tagName === "VIDEO") attachToVideo(node);
@@ -121,9 +128,12 @@ function init() {
         }
       }
     }
-    // Reconcile the final batch state: reparenting a connected miniplayer
-    // keeps its session; actual removal retires every owned resource.
-    reanchorButtons();
+    // Reconcile only batches that can have changed an existing video's host.
+    // Reanchoring reads layout for every live video, so doing it for every
+    // YouTube subtree insertion would force synchronous layout on hot pages.
+    // Reparenting a connected miniplayer includes a removal; fullscreen,
+    // resize and navigation handlers cover the other layout changes.
+    if (needsReanchor) reanchorButtons();
   });
   observer.observe(document.documentElement, {
     childList: true,

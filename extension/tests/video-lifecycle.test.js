@@ -69,7 +69,8 @@ test("discovery preserves reparenting and completely retires disconnected videos
   // Existing players are hidden rather than retired just because layout is
   // temporarily too small. Reappearing uses the same control/session.
   video.getBoundingClientRect = () => ({ width: 0, height: 0 });
-  mutations([{ addedNodes: [], removedNodes: [] }]);
+  otherHost.appendChild(video);
+  mutations([{ addedNodes: [video], removedNodes: [video] }]);
   assert.equal(button.el.style.display, "none");
   assert.equal(disposed.length, 0);
   video.getBoundingClientRect = () => ({ width: 640, height: 360 });

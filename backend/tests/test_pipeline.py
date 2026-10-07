@@ -739,7 +739,11 @@ def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):
     registry._abandoning.add("k1")
 
     # Don't run the real worker; just let submit register a thread.
-    monkeypatch.setattr(registry, "_run", lambda key, url, model, keep_stems: None)
+    monkeypatch.setattr(
+        registry,
+        "_run",
+        lambda key, url, model, keep_stems, owner: None,
+    )
 
     status = registry.submit("fake://video", model="fake", keep_stems=["vocals"])
     # Submit refused to adopt the dying job: it created a fresh QUEUED status,

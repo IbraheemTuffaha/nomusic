@@ -7,19 +7,25 @@ import { AudioScheduler } from "./audio-scheduler.js";
 import { ChunkLoader } from "./chunk-loader.js";
 import { PlaybackIntent } from "./playback-intent.js";
 
-// A short container/codec tail may outlast decoded audio at the native EOF.
-// Native containers can report a small duration tail beyond the processed
-// artifact. Keep the host muted through that bounded tail instead of entering
-// a permanent buffering state; larger mismatches still fail visibly.
-const MAX_END_TAIL_SECONDS = 1;
+// The source metadata can round down by almost one processing chunk while the
+// native player reports the container's full duration. Keep the host muted
+// through that bounded tail instead of failing after the last processed chunk;
+// larger mismatches still fail visibly.
+const MAX_END_TAIL_SECONDS = 10;
 
 /** Clean a raw URL down to https://www.youtube.com/watch?v=ID, or null if it
  *  isn't a watch URL — so the caller can fall back to the page URL. Stripping
  *  the time/playlist params keeps the same video to one backend cache key. */
 export function normalizeWatchUrl(raw) {
-  if (!raw || !/[?&]v=/.test(raw)) return null;
+  if (!raw) return null;
   try {
-    const id = new URL(raw, location.href).searchParams.get("v");
+    const url = new URL(raw, location.href);
+    const host = url.hostname.toLowerCase();
+    const isYouTube = host === "youtu.be" || host === "youtube.com" ||
+      host.endsWith(".youtube.com");
+    if (!isYouTube) return null;
+    const id = url.searchParams.get("v") ||
+      (host === "youtu.be" ? url.pathname.slice(1) : null);
     return id ? `https://www.youtube.com/watch?v=${id}` : null;
   } catch {
     return null;
@@ -102,6 +108,7 @@ export class Session {
     // server closed it). Tells _resumeAfterBuffer that no future status
     // event will repaint the label, so it has to restore "nomusic on".
     this._streamEnded = false;
+    this._statusState = null;
     // Debounce timer for the /prioritize POST on seek so scrubbing a
     // timeline doesn't fire one request per intermediate frame.
     this._prioritizeTimer = null;
@@ -184,6 +191,7 @@ export class Session {
     const info = await this.requestJob();
     if (signal.aborted || this.disposed) return;
     this._adoptJob(info);
+    this._statusState = info.state;
     if (info.state === "error") { this.fail(info.phase_label || "Processing failed"); return; }
     if (this._streamPausedClosed && !this.button._pendingDownload) this.button.setPaused();
     else this.button.showStatus(info);
@@ -409,15 +417,19 @@ export class Session {
     if (this._streamPausedClosed && !this.button._pendingDownload) return;
     const previousJobId = this.jobId;
     if (info?.job_id) this._adoptJob(info);
+    this._statusState = info?.state ?? this._statusState;
     if (info?.state === "error") { this.fail(info.phase_label || "Processing failed"); return; }
     // A same-job resume retains the geometry established at startup. A
     // changed job can come from a backend with different chunk settings, so
     // refresh the contract before reopening its stream.
     if (info?.job_id && previousJobId && info.job_id !== previousJobId) {
+      const currentSignal = this._requests.signal;
       try {
-        if (!await this._loadCapabilities(this._requests.signal)) return;
+        if (!await this._loadCapabilities(currentSignal)) return;
       } catch (err) {
-        if (!signal.aborted) this.fail("Backend capabilities unavailable. Retry when the helper is ready.");
+        if (!currentSignal.aborted) {
+          this.fail("Backend capabilities unavailable. Retry when the helper is ready.");
+        }
         return;
       }
     }
@@ -434,6 +446,7 @@ export class Session {
   handleStatus(status) {
     if (this.disposed || this.failed) return;
     this.totalChunks = status.total_chunks || this.totalChunks;
+    this._statusState = status.state;
     if (status.state === "error") {
       this.fail(status.phase_label || "Processing failed");
       return;
@@ -519,11 +532,16 @@ export class Session {
 
   _pauseForBuffer({ showBufferingLabel = true } = {}) {
     if (this.disposed) return;
+    const mayShowBuffering = this._statusState === "ready" || this._streamEnded;
     if (this.playback.held) {
-      if (showBufferingLabel && this.playback.wantsPlay) this.button.setBuffering();
+      if (showBufferingLabel && mayShowBuffering && this.playback.wantsPlay) {
+        this.button.setBuffering();
+      }
       return;
     }
-    if (showBufferingLabel && this.playback.wantsPlay) this.button.setBuffering();
+    if (showBufferingLabel && mayShowBuffering && this.playback.wantsPlay) {
+      this.button.setBuffering();
+    }
     this.playback.hold();
   }
 
@@ -611,8 +629,9 @@ export class Session {
    *  playing YouTube identity, not its miniplayer's surrounding page URL. */
   checkSource() {
     if (this.disposed || !this.sourceUrl || !this.mediaSource) return;
-    const playing = normalizeWatchUrl(resolveSourceUrl());
-    const original = normalizeWatchUrl(this.sourceUrl);
+    const playingRaw = resolveSourceUrl();
+    const playing = normalizeWatchUrl(playingRaw) || this._rawSourceIdentity(playingRaw);
+    const original = normalizeWatchUrl(this.sourceUrl) || this._rawSourceIdentity(this.sourceUrl);
     const current = this.video.currentSrc || "";
     if ((playing && original && playing !== original) ||
         (this.video.src || "") !== this.mediaSource.src ||
@@ -623,6 +642,15 @@ export class Session {
     // First metadata can arrive after the initial request; remember it once
     // without confusing resource initialization with a replacement.
     if (!this.mediaSource.current && current) this.mediaSource.current = current;
+  }
+
+  _rawSourceIdentity(raw) {
+    if (!raw) return "";
+    try {
+      return new URL(raw, location.href).href;
+    } catch {
+      return String(raw);
+    }
   }
 
   dispose({ restore = true } = {}) {
