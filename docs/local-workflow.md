@@ -21,7 +21,9 @@ check YouTube availability or perform inference on each request. The extension's
 
 ## Playback and settings
 
-Click nomusic on the video and wait for processed playback. Try pause/resume and
+Click nomusic on the video and wait for processed playback. The extension keeps
+one bounded client lease alive separately from the status stream. Try pause/resume
+and
 a backward/forward seek, allowing processing to catch up. CPU processing may be
 slower than playback. The toolbar popup saves settings automatically:
 
@@ -39,6 +41,12 @@ music on your own recordings.
 recovery panel offers **Retry** (which preserves the current volume and
 play/pause intent) and **Return to original** (which explicitly restores the
 native track).
+
+Pausing normally closes the SSE stream and stops the heartbeat, but retains the
+job for up to the configured client lease (30 seconds by default). Playing again
+re-acquires the same job and resumes from its valid cached chunks. Disabling or
+closing the session sends a client-scoped release; another tab or extension
+session holding a lease keeps the worker running.
 
 ## Exports and cache
 

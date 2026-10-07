@@ -80,7 +80,16 @@ second later may finish with original audio still suppressed. A larger or unknow
 uncovered tail reports a persistent playback error instead of buffering forever.
 This tolerance does not stretch audio or correct larger source-duration mismatches.
 
-The session owns SSE reconnection: errors in either connecting or closed state
+The session owns a bounded processing lease as well as SSE reconnection. The
+lease is renewed independently of status transport, so switching between SSE
+and `/status` does not abandon work. An ordinary pause stops the heartbeat and
+retains the job for at most the 30-second lease; resuming re-submits the same
+cache key and reuses completed chunks. Disabling nomusic releases only that
+session's lease. If another tab has a lease, its work continues. Servers from
+before the interest protocol are supported temporarily through the existing
+SSE subscriber idle clock.
+
+SSE errors in either connecting or closed state
 receive three retries with 0.5, 1 and 2 second delays. Each retry re-submits the
 job before opening its stream, allowing a restarted backend to resume cached
 work. A valid status for that job resets the retry budget. An initial stream
@@ -115,8 +124,12 @@ not resource or authorization guarantees for a public service.
 | `NOMUSIC_CHUNK_SECONDS` | `10` | Processing chunk duration |
 | `NOMUSIC_CHUNK_OVERLAP_SECONDS` | `0.5` | Separator context overlap |
 | `NOMUSIC_GPU_BATCH` | `2` | Maximum chunks per inference batch; retry with `1` after a GPU out-of-memory error |
-| `NOMUSIC_IDLE_TIMEOUT_SECONDS` | `10` | Abandon work after the last status subscriber leaves; `0` disables |
+| `NOMUSIC_IDLE_TIMEOUT_SECONDS` | `10` | Abandon work after the last client lease and status subscriber leave; `0` disables |
 | `NOMUSIC_SSE_KEEPALIVE_SECONDS` | `15` | Interval between SSE keep-alive comments |
+| `NOMUSIC_CLIENT_LEASE_SECONDS` | `30` | Maximum processing-interest lease; pause retention ends when it expires |
+| `NOMUSIC_CLIENT_HEARTBEAT_SECONDS` | `10` | Extension heartbeat interval while a session is active |
+| `NOMUSIC_INTEREST_SWEEP_INTERVAL_SECONDS` | `5` | Expire abandoned client leases; `0` disables the maintenance pass |
+| `NOMUSIC_SSE_QUEUE_SIZE` | `64` | Maximum pending status snapshots per SSE subscriber; older snapshots coalesce |
 | `NOMUSIC_MEMORY_GC_INTERVAL_SECONDS` | `3600` | Reclaim in-memory entries whose disk cache disappeared; `0` disables |
 | `NOMUSIC_PROGRESSIVE` | `true` | Process decodable early audio while its download continues |
 | `NOMUSIC_DOWNLOAD_RATELIMIT` | Unset | Test download cap in bytes/sec, with optional `K`/`M` suffix |
@@ -150,8 +163,10 @@ The local API has no user authentication. Interactive schemas are available at
 | GET | `/healthz` | `{ok: true}`: API reachability |
 | GET | `/readyz` | Startup readiness; 200 when ready, otherwise 503 |
 | GET | `/capabilities` | Engine/device/models/stems, defaults and cache configuration |
-| POST | `/process` | `{url, model?, keep_stems?}` → `JobStatus` |
+| POST | `/process` | `{url, model?, keep_stems?, client_id?}` → `JobStatus`; a client id also acquires a bounded interest lease |
 | POST | `/process/{job_id}/prioritize` | `{from_chunk}` → `{applied}`; prioritize pending chunks around a seek |
+| POST | `/process/{job_id}/interest` | `{client_id, lease_seconds?}` → lease; acquire or heartbeat one client's interest |
+| DELETE | `/process/{job_id}/interest?client_id=...` | Release only that client's interest; another client's lease is unaffected |
 | GET | `/status/{job_id}` | `JobStatus`; 404 for unknown job |
 | GET | `/events/{job_id}` | SSE `JobStatus` updates; 204 for unknown job; planned shutdown closes without a fabricated error |
 | GET | `/chunk/{job_id}/{idx}` | OGG/Opus chunk; 425 while unavailable |

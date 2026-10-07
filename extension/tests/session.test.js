@@ -537,6 +537,7 @@ test("active requests retain their backend, model and copied stems after setting
   ]);
   assert.deepEqual(JSON.parse(requests[0].options.body), {
     url: "https://source.example/video",
+    client_id: s.clientId,
     model: "old-model",
     keep_stems: ["vocals"],
   });
