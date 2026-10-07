@@ -129,6 +129,9 @@ not resource or authorization guarantees for a public service.
 | `NOMUSIC_MAX_INFERENCE_BATCH` | `2` | Bound model working-set batch size even when `NOMUSIC_GPU_BATCH` is higher |
 | `NOMUSIC_MAX_PREFETCH_CHUNKS` | `2` | Bound decoded chunks waiting for model execution |
 | `NOMUSIC_FINAL_CHUNK_TOLERANCE_SECONDS` | `1` | Allow only this measured source-duration remainder when validating a download |
+| `NOMUSIC_MAX_CACHE_BYTES` | `4 GiB` | Shared completed-media budget; leased namespaces are retained until release |
+| `NOMUSIC_MIN_FREE_BYTES` | `256 MiB` | Minimum filesystem free space required for a new reservation |
+| `NOMUSIC_MAX_EXPORT_BYTES` | `2 GiB` | Reservation held while MP3/MP4 preparation and serving are active |
 | `NOMUSIC_JS_RUNTIME` | Auto-detected | Explicit Node.js 22+ or Deno 2.3+ executable |
 | `NOMUSIC_SHUTDOWN_GRACE_SECONDS` | `60` | Positive finite shutdown deadline for active work; second Ctrl+C exits immediately |
 | `NOMUSIC_DEBUG` | `false` | Enable debug logging |

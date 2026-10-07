@@ -53,7 +53,12 @@ duration; resolution also depends on the source's available formats.
 
 Completed work is cached for reuse, with seven-day default retention. Finish
 playback and exports before clearing it: open the popup, click **Clear**, then
-**Confirm**. Model weights and files already saved to Downloads are preserved.
+**Confirm**. Active processing and downloads hold leases, so a clear skips those
+namespaces until their current writer/reader releases them. The helper keeps a
+4 GiB processed-media budget and requires 256 MiB of free space for a new
+export reservation; tighten these with the `NOMUSIC_MAX_*` settings when disk
+space is smaller. Model weights and files already saved to Downloads are
+preserved.
 
 ## Stop and restart
 

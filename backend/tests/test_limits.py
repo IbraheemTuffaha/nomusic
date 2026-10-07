@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from nomusic.pipeline import downloader
-from nomusic.pipeline.cache import CacheMeta, JobCache
+from nomusic.pipeline.cache import CacheMeta, JobCache, StorageLimitExceeded
 from nomusic.pipeline.downloader import ResourceLimitExceeded, ResourceLimits, VideoMetadata
 from nomusic.pipeline.processor import Processor
 
@@ -84,3 +84,27 @@ def test_video_height_policy_rejects_2160_request():
             limits=ResourceLimits(max_video_height=720),
         )
 
+
+def test_leased_cache_namespace_survives_clear_until_release(tmp_path):
+    cache = JobCache(tmp_path / "cache")
+    key = "a" * 16
+    cache.save_meta(key, CacheMeta(
+        url="https://example.test/v", model="fake", keep_stems=["vocals"],
+        duration_seconds=1, chunk_seconds=1, chunk_overlap_seconds=0,
+        total_chunks=1,
+    ))
+    lease = cache.job_lease(key)
+    try:
+        cache.clear_all()
+        assert cache.load_meta(key) is not None
+    finally:
+        lease.close()
+    cache.clear_all()
+    assert cache.load_meta(key) is None
+
+
+def test_storage_reservation_enforces_cache_budget(tmp_path):
+    cache = JobCache(tmp_path / "cache", max_bytes=10, min_free_bytes=0)
+    with cache.reserve(10):
+        with pytest.raises(StorageLimitExceeded, match="cache budget"):
+            cache.reserve(1)
