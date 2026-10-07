@@ -12,6 +12,9 @@ lifespan. Jobs run in threads with serialized processing; Demucs/PyTorch selects
 MPS, CUDA or CPU. The current engine is named `mlx`, with `demucs` as an alias;
 it is not an MLX implementation. Cache metadata and completed chunks permit
 reuse. MP3/MP4 exports preserve sample-aware chunk concatenation and use FFmpeg.
+Published chunks use shared namespace leases, so playback can fetch them while a
+long job is still producing later chunks; clear and eviction retain the namespace
+until all readers and the processor release it.
 
 | Location | Responsibility |
 | --- | --- |
