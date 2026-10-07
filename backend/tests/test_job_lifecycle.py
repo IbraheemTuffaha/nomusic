@@ -6,7 +6,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from nomusic.jobs import JobRegistry, JobState, JobStatus, RegistryClosed, _JobControl
+from nomusic.jobs import (
+    JobRegistry,
+    JobState,
+    JobStatus,
+    RegistryClosed,
+    _Execution,
+    _JobControl,
+)
 
 
 @pytest.mark.parametrize("hint, expected", [(-10, 0), (2, 2), (99, 4)])
@@ -57,18 +64,108 @@ def test_replaced_worker_cannot_publish_or_cleanup_new_generation():
     registry = JobRegistry(_GatedProcessor(), _Cache())
     old = JobStatus("same", state=JobState.PROCESSING)
     new = JobStatus("same", state=JobState.PROCESSING)
+    old_run = _Execution("same", 1, old)
+    new_run = _Execution("same", 2, new)
     control = _JobControl(total_chunks=3, done=set())
     with registry._lock:
         registry._jobs["same"] = new
+        registry._executions["same"] = new_run
         registry._controls["same"] = control
         registry._pending_priority["same"] = 2
 
-    registry._update("same", owner=old, title="stale")
-    registry._cleanup_worker("same", old, abandoned=True)
+    registry._update("same", execution=old_run, title="stale")
+    registry._cleanup_worker("same", old_run, abandoned=True)
 
     assert new.title == ""
     assert registry._controls["same"] is control
     assert registry._pending_priority["same"] == 2
+
+
+def test_stale_probe_cannot_publish_metadata_into_replacement(tmp_path, monkeypatch):
+    """Cache clear/resubmit must not let the old probe win the new generation."""
+    from dataclasses import replace
+
+    from nomusic.config import SETTINGS
+    import nomusic.jobs as jobs_module
+    from nomusic.pipeline import processor as pipeline
+    from nomusic.pipeline.cache import JobCache
+    from nomusic.pipeline.downloader import DownloadCancelled, VideoMetadata
+
+    old_extract_started = threading.Event()
+    release_old_extract = threading.Event()
+    new_download_started = threading.Event()
+    release_new_download = threading.Event()
+
+    class ControlledFetcher:
+        count = 0
+
+        def __init__(self, url, out_dir):
+            type(self).count += 1
+            self.number = type(self).count
+
+        def extract(self):
+            if self.number == 1:
+                old_extract_started.set()
+                assert release_old_extract.wait(5)
+                return VideoMetadata("old", "OLD", 10, "fixture", "https://example.test/race")
+            return VideoMetadata("new", "NEW", 30, "fixture", "https://example.test/race")
+
+        def download(self, progress_hook=None):
+            new_download_started.set()
+            assert release_new_download.wait(5)
+            raise DownloadCancelled("test cancellation")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pipeline, "SourceFetcher", ControlledFetcher)
+    monkeypatch.setattr(
+        jobs_module,
+        "SETTINGS",
+        replace(SETTINGS, idle_timeout_seconds=0),
+    )
+    cache = JobCache(tmp_path / "cache")
+    registry = JobRegistry(
+        pipeline.Processor(
+            engine=None,
+            cache=cache,
+            chunk_seconds=10,
+            chunk_overlap_seconds=0,
+        ),
+        cache,
+    )
+
+    try:
+        first = registry.submit(
+            "https://example.test/race", model="fake", keep_stems=["vocals"]
+        )
+        assert old_extract_started.wait(5)
+
+        registry.abandon_all()
+        cache.clear_all()
+        replacement = registry.submit(
+            "https://example.test/race", model="fake", keep_stems=["vocals"]
+        )
+        release_old_extract.set()
+
+        assert new_download_started.wait(5)
+        metadata = cache.load_meta(replacement.job_id)
+        assert metadata is not None
+        assert metadata.title == "NEW"
+        assert metadata.duration_seconds == 30
+        assert metadata.total_chunks == 3
+        assert replacement is not first
+        assert registry._executions[replacement.job_id].generation == 2
+
+        registry.abandon_all()
+        release_new_download.set()
+        for worker in tuple(registry._worker_threads):
+            worker.join(5)
+    finally:
+        release_old_extract.set()
+        release_new_download.set()
+        registry.shutdown()
+        cache.close()
 
 
 @pytest.mark.parametrize("supersede", [False, True], ids=["queued", "superseded"])

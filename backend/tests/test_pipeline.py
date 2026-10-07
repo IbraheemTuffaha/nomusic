@@ -18,13 +18,19 @@ import pytest
 import soundfile as sf
 
 from nomusic.engines.base import Engine, EngineCapabilities, SeparationResult
-from nomusic.pipeline.cache import JobCache
+from nomusic.pipeline.cache import CacheMeta, JobCache
 from nomusic.pipeline.export import (
     mp3_transcode_cmd,
     mux_video_cmd,
     snapshot_chunk_files,
 )
-from nomusic.pipeline.processor import Processor, RunHooks, plan_chunks
+from nomusic.pipeline.processor import (
+    ChunkPlan,
+    Processor,
+    RunHooks,
+    _ChunkWork,
+    plan_chunks,
+)
 
 
 def test_plan_chunks_covers_full_duration():
@@ -72,6 +78,47 @@ def test_plan_chunks_rejects_overlap_eq_chunk():
     except ValueError:
         return
     raise AssertionError("expected ValueError for overlap == chunk")
+
+
+def test_publish_check_fences_chunk_before_cache_publication(tmp_path, monkeypatch):
+    cache = JobCache(tmp_path / "cache")
+    key = "a" * 16
+    cache.save_meta(
+        key,
+        CacheMeta(
+            url="https://example.test/video",
+            model="fake",
+            keep_stems=["vocals"],
+            duration_seconds=1,
+            chunk_seconds=1,
+            chunk_overlap_seconds=0,
+            total_chunks=1,
+        ),
+    )
+    proc = Processor(None, cache, chunk_seconds=1, chunk_overlap_seconds=0)
+    audio = np.zeros((441, 2), dtype=np.float32)
+    result = SeparationResult(
+        stems={name: audio for name in ("vocals", "drums", "bass", "other")},
+        sample_rate=44100,
+        duration_seconds=0.01,
+    )
+    work = _ChunkWork(
+        plan=ChunkPlan(0, 0, 0.01, 0, 0.01),
+        prepared=None,
+        t_slice=0,
+        t_decode=0,
+        result=result,
+    )
+    writes = []
+    monkeypatch.setattr(proc, "_write_chunk", lambda *args, **kwargs: writes.append(True))
+
+    def stale():
+        raise RuntimeError("stale generation")
+
+    with pytest.raises(RuntimeError, match="stale generation"):
+        proc._finish_chunk(work, key, ["vocals"], None, stale)
+    assert writes == []
+    assert cache.load_meta(key).chunks_ready == []
 
 
 def test_mix_stems_gain_is_uniform_when_peak_would_clip():
@@ -742,7 +789,7 @@ def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):
     monkeypatch.setattr(
         registry,
         "_run",
-        lambda key, url, model, keep_stems, owner: None,
+        lambda execution, url, model, keep_stems: None,
     )
 
     status = registry.submit("fake://video", model="fake", keep_stems=["vocals"])

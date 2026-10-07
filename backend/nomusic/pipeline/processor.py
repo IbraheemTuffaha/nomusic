@@ -98,6 +98,10 @@ class RunHooks:
       when ``None`` the processor uses a FIFO over remaining chunks.
     * ``abort_check`` — raises to abort; polled during long waits (the
       progressive-download gate has no chunk boundary to abort at otherwise).
+    * ``publish_check`` — raises when this execution no longer owns the cache
+      generation. It is checked immediately before metadata, chunk and
+      completion publication so a replaced worker cannot repopulate a successor
+      cache after cancellation.
     * ``on_wait_for_download`` — fired while a chunk blocks on the progressive
       download, with the current download fraction.
     """
@@ -107,6 +111,7 @@ class RunHooks:
     on_download_progress: DownloadProgressCb | None = None
     next_chunk_provider: NextChunkProvider | None = None
     abort_check: Callable[[], None] | None = None
+    publish_check: Callable[[], None] | None = None
     on_wait_for_download: Callable[[float | None], None] | None = None
 
 
@@ -395,6 +400,7 @@ class Processor:
         *,
         model: str,
         keep_stems: list[str],
+        publish_check: Callable[[], None] | None = None,
     ) -> tuple[str, CacheMeta, VideoMetadata, list[ChunkPlan], Optional[SourceFetcher]]:
         """Probe the video, build/refresh the cache meta, and plan the chunks.
 
@@ -434,6 +440,8 @@ class Processor:
                     extractor=existing.extractor,
                     webpage_url=url,
                 )
+                if publish_check:
+                    publish_check()
                 self.cache.save_meta(key, existing)
                 return key, existing, info, plans, None
 
@@ -466,6 +474,8 @@ class Processor:
                     title=info.title,
                     extractor=info.extractor,
                 )
+            if publish_check:
+                publish_check()
             self.cache.save_meta(key, meta)
             return key, meta, info, plans, fetcher
         except BaseException:
@@ -513,12 +523,14 @@ class Processor:
         on_download_progress = hooks.on_download_progress
         next_chunk_provider = hooks.next_chunk_provider
         abort_check = hooks.abort_check
+        publish_check = hooks.publish_check
         on_wait_for_download = hooks.on_wait_for_download
 
         if abort_check:
             abort_check()
         key, meta, info, plans, fetcher = self.prepare_job(
-            url, model=model, keep_stems=keep_stems
+            url, model=model, keep_stems=keep_stems,
+            publish_check=publish_check,
         )
         if fetcher is not None:
             # Covers preparation hooks, cache hits and executor setup failures.
@@ -528,6 +540,8 @@ class Processor:
             on_probed(info, plans, meta)
         if abort_check:
             abort_check()
+        if publish_check:
+            publish_check()
 
         if meta.complete:
             log.info("Cache hit for %s (%d chunks)", url, meta.total_chunks)
@@ -551,6 +565,8 @@ class Processor:
             except Exception:  # never let a UI hook break the pipeline
                 log.debug("download progress hook raised", exc_info=True)
 
+        if publish_check:
+            publish_check()
         source_dir = self.cache.source_dir(url)
         dl: _ProgressiveSource | None = None
         if self.progressive:
@@ -733,7 +749,12 @@ class Processor:
                     # Hand mix+write+record to the consumer; overlaps the next GPU.
                     write_futures.append(
                         write_pool.submit(
-                            self._finish_chunk, work, key, keep_stems, on_progress
+                            self._finish_chunk,
+                            work,
+                            key,
+                            keep_stems,
+                            on_progress,
+                            publish_check,
                         )
                     )
                 # Bound the write backlog and surface any consumer error early.
@@ -764,11 +785,15 @@ class Processor:
             self.cache.chunk_path(key, p.index).exists() for p in plans
         )
         if all_present:
+            if publish_check:
+                publish_check()
             self.cache.mark_complete(key)
             if not self.keep_source_after_complete:
                 # Source has served its purpose. Re-watches read straight from
                 # the chunk Opus files; only a stems/model change would need
                 # it back, and that re-downloads transparently.
+                if publish_check:
+                    publish_check()
                 self.cache.drop_source(url)
 
         return key
@@ -860,6 +885,7 @@ class Processor:
         key: str,
         keep_stems: list[str],
         on_progress: ProgressCb | None,
+        publish_check: Callable[[], None] | None = None,
     ) -> None:
         """Consumer stage: mix the kept stems, encode + write the chunk, record
         it, and emit progress. Runs on the single write thread, so it's the only
@@ -867,9 +893,16 @@ class Processor:
         plan = work.plan
         t2 = time.perf_counter()
         mixed = self._mix_stems(work.result.stems, keep_stems)
-        self._write_chunk(mixed, work.result.sample_rate, key, plan)
+        if publish_check:
+            publish_check()
+        self._write_chunk(
+            mixed, work.result.sample_rate, key, plan,
+            publish_check=publish_check,
+        )
         t_mix_write = time.perf_counter() - t2
 
+        if publish_check:
+            publish_check()
         self.cache.record_chunk(key, plan.index)
         if on_progress:
             refreshed = self.cache.load_meta(key)
@@ -946,6 +979,8 @@ class Processor:
         sample_rate: int,
         key: str,
         plan: ChunkPlan,
+        *,
+        publish_check: Callable[[], None] | None = None,
     ) -> None:
         """Write ``chunk_NNN.opus`` covering exactly ``[play_start, play_end]``.
 
@@ -984,6 +1019,8 @@ class Processor:
         with tempfile.TemporaryDirectory(prefix="chunk-", dir=self.cache.scratch.path) as work:
             tmp_path = Path(work) / "chunk.part"
             _encode_opus(trimmed, sample_rate, tmp_path, pass_fds=(self.cache.scratch.fd,))
+            if publish_check:
+                publish_check()
             tmp_path.replace(out)
 
 
