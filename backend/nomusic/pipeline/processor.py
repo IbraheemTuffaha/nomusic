@@ -112,6 +112,7 @@ class RunHooks:
     next_chunk_provider: NextChunkProvider | None = None
     abort_check: Callable[[], None] | None = None
     publish_check: Callable[[], None] | None = None
+    cache_generation: str | None = None
     on_wait_for_download: Callable[[float | None], None] | None = None
 
 
@@ -401,6 +402,7 @@ class Processor:
         model: str,
         keep_stems: list[str],
         publish_check: Callable[[], None] | None = None,
+        cache_generation: str | None = None,
     ) -> tuple[str, CacheMeta, VideoMetadata, list[ChunkPlan], Optional[SourceFetcher]]:
         """Probe the video, build/refresh the cache meta, and plan the chunks.
 
@@ -442,7 +444,8 @@ class Processor:
                 )
                 if publish_check:
                     publish_check()
-                self.cache.save_meta(key, existing)
+                with self.cache.publication(key, cache_generation):
+                    self.cache.save_meta(key, existing)
                 return key, existing, info, plans, None
 
         # First run: extract metadata in a session we'll also download from, so
@@ -476,7 +479,8 @@ class Processor:
                 )
             if publish_check:
                 publish_check()
-            self.cache.save_meta(key, meta)
+            with self.cache.publication(key, cache_generation):
+                self.cache.save_meta(key, meta)
             return key, meta, info, plans, fetcher
         except BaseException:
             fetcher.close()
@@ -524,6 +528,7 @@ class Processor:
         next_chunk_provider = hooks.next_chunk_provider
         abort_check = hooks.abort_check
         publish_check = hooks.publish_check
+        cache_generation = hooks.cache_generation
         on_wait_for_download = hooks.on_wait_for_download
 
         if abort_check:
@@ -531,6 +536,7 @@ class Processor:
         key, meta, info, plans, fetcher = self.prepare_job(
             url, model=model, keep_stems=keep_stems,
             publish_check=publish_check,
+            cache_generation=cache_generation,
         )
         if fetcher is not None:
             # Covers preparation hooks, cache hits and executor setup failures.
@@ -755,6 +761,7 @@ class Processor:
                             keep_stems,
                             on_progress,
                             publish_check,
+                            cache_generation,
                         )
                     )
                 # Bound the write backlog and surface any consumer error early.
@@ -787,14 +794,16 @@ class Processor:
         if all_present:
             if publish_check:
                 publish_check()
-            self.cache.mark_complete(key)
+            with self.cache.publication(key, cache_generation):
+                self.cache.mark_complete(key)
             if not self.keep_source_after_complete:
                 # Source has served its purpose. Re-watches read straight from
                 # the chunk Opus files; only a stems/model change would need
                 # it back, and that re-downloads transparently.
                 if publish_check:
                     publish_check()
-                self.cache.drop_source(url)
+                with self.cache.publication(key, cache_generation):
+                    self.cache.drop_source(url)
 
         return key
 
@@ -886,6 +895,7 @@ class Processor:
         keep_stems: list[str],
         on_progress: ProgressCb | None,
         publish_check: Callable[[], None] | None = None,
+        cache_generation: str | None = None,
     ) -> None:
         """Consumer stage: mix the kept stems, encode + write the chunk, record
         it, and emit progress. Runs on the single write thread, so it's the only
@@ -898,12 +908,10 @@ class Processor:
         self._write_chunk(
             mixed, work.result.sample_rate, key, plan,
             publish_check=publish_check,
+            cache_generation=cache_generation,
         )
         t_mix_write = time.perf_counter() - t2
 
-        if publish_check:
-            publish_check()
-        self.cache.record_chunk(key, plan.index)
         if on_progress:
             refreshed = self.cache.load_meta(key)
             if refreshed:
@@ -981,6 +989,7 @@ class Processor:
         plan: ChunkPlan,
         *,
         publish_check: Callable[[], None] | None = None,
+        cache_generation: str | None = None,
     ) -> None:
         """Write ``chunk_NNN.opus`` covering exactly ``[play_start, play_end]``.
 
@@ -1021,7 +1030,9 @@ class Processor:
             _encode_opus(trimmed, sample_rate, tmp_path, pass_fds=(self.cache.scratch.fd,))
             if publish_check:
                 publish_check()
-            tmp_path.replace(out)
+            with self.cache.publication(key, cache_generation):
+                tmp_path.replace(out)
+                self.cache.record_chunk(key, plan.index)
 
 
 

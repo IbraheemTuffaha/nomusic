@@ -119,6 +119,7 @@ class _Execution:
     key: str
     generation: int
     status: JobStatus
+    cache_generation: str | None = None
 
 
 class _JobControl:
@@ -315,8 +316,10 @@ class JobRegistry:
             chunk_seconds=self.processor.chunk_seconds,
             chunk_overlap_seconds=self.processor.chunk_overlap_seconds,
         )
+        # Keep the slow disk read outside the registry lock so shutdown and
+        # other submissions remain responsive. A leased re-read below closes
+        # the clear/submit race for an entry that was present at this point.
         existing_meta = self.cache.load_meta(key)
-
         with self._lock:
             if self.stopping:
                 raise RegistryClosed("job registry is shutting down")
@@ -336,10 +339,19 @@ class JobRegistry:
             # chunk boundary.
             self._abandoning.discard(key)
 
+            cache_generation = None
+            if existing_meta is not None:
+                lease_factory = getattr(self.cache, "job_lease", None)
+                if lease_factory is not None:
+                    with lease_factory(key, shared=True):
+                        existing_meta = self.cache.load_meta(key)
+            claim_generation = getattr(self.cache, "claim_generation", None)
+            if claim_generation:
+                cache_generation = claim_generation(key)
             status = self._build_submit_status(key, existing_meta)
             self._jobs[key] = status
             self._next_generation += 1
-            execution = _Execution(key, self._next_generation, status)
+            execution = _Execution(key, self._next_generation, status, cache_generation)
             self._executions[key] = execution
             if status.state == JobState.READY:
                 return status
@@ -485,6 +497,9 @@ class JobRegistry:
         pending: list[tuple[asyncio.Queue, dict]] = []
         with self._lock:
             for key, status in self._jobs.items():
+                revoke_generation = getattr(self.cache, "revoke_generation", None)
+                if revoke_generation:
+                    revoke_generation(key)
                 self._abandoning.add(key)
                 subs = self._subscribers.get(key)
                 if not subs:
@@ -552,6 +567,7 @@ class JobRegistry:
                                 key, frac, execution=execution
                             ),
                             publish_check=lambda: self._assert_publishable(execution),
+                            cache_generation=execution.cache_generation,
                         ),
                     )
                 meta = self.cache.load_meta(key)

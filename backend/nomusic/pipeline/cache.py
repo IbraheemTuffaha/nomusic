@@ -19,6 +19,7 @@ streams chunks together on demand.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -26,12 +27,18 @@ import os
 import shutil
 import tempfile
 import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from nomusic.pipeline.scratch import ScratchWorkspace
 
 log = logging.getLogger(__name__)
+
+
+class PublicationRevoked(RuntimeError):
+    """A replaced execution has lost permission to publish cached content."""
 
 # Bump when the on-disk chunk encoding, sample rate, or directory layout
 # changes. Old entries become invisible to the new code and the TTL sweep
@@ -69,6 +76,48 @@ class JobCache:
 
     def close(self) -> None:
         self.scratch.close()
+
+    @contextmanager
+    def _generation_file(self, key: str):
+        """Hold a stable lock while changing or checking publication ownership."""
+        path = self.dir_for(key) / ".generation"
+        while True:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                if os.fstat(fd).st_ino == path.stat().st_ino:
+                    break
+            except FileNotFoundError:
+                pass
+            os.close(fd)
+            path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            yield fd
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def claim_generation(self, key: str) -> str:
+        token = uuid.uuid4().hex
+        with self._generation_file(key) as fd:
+            os.ftruncate(fd, 0)
+            os.write(fd, token.encode())
+        return token
+
+    def revoke_generation(self, key: str) -> None:
+        with self._generation_file(key) as fd:
+            os.ftruncate(fd, 0)
+
+    @contextmanager
+    def publication(self, key: str, token: str | None):
+        """Keep the ownership check and the content commit in one critical section."""
+        if token is None:
+            yield
+            return
+        with self._generation_file(key) as fd:
+            if os.read(fd, 128).decode() != token:
+                raise PublicationRevoked("execution publication ownership was replaced")
+            yield
 
     # -- key helpers ---------------------------------------------------------
 
