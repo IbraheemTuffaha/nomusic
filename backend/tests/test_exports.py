@@ -110,6 +110,18 @@ def test_registry_bounds_active_builds_and_cancels_waiter(tmp_path):
     registry.shutdown()
 
 
+def test_registry_fails_when_source_wait_expires(tmp_path):
+    cache = JobCache(tmp_path / "cache")
+    registry = ExportRegistry(
+        cache, FakeJobs(JobState.PROCESSING), _builder, max_jobs=1,
+        ttl_seconds=60, wait_timeout_seconds=0.05,
+    )
+    status = registry.submit("job", "mp3")
+    failed = _wait(registry, status.export_id, ExportState.FAILED)
+    assert "did not become ready" in failed.error
+    registry.shutdown()
+
+
 def test_registry_expires_ready_artifact(tmp_path):
     cache = JobCache(tmp_path / "cache")
     jobs = FakeJobs()
