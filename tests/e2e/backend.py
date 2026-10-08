@@ -56,7 +56,7 @@ def install_adapter(fixture: Path, duration: float, record) -> None:
             record("source_rejected")
             raise ValueError("The controlled smoke backend only accepts its exact generated fixture URL")
 
-    def metadata(url: str):
+    def metadata(url: str, *, limits=None):
         check_url(url)
         record("fixture_metadata")
         return downloader.VideoMetadata(
@@ -85,11 +85,11 @@ def install_adapter(fixture: Path, duration: float, record) -> None:
             check_url(self.url)
             return copy_fixture(self.out_dir, "source.mp4", progress_hook)
 
-    def audio(url, out_dir, *, progress_hook=None):
+    def audio(url, out_dir, *, progress_hook=None, limits=None):
         check_url(url)
         return copy_fixture(out_dir, "source.mp4", progress_hook)
 
-    def video(url, out_dir, *, max_height=None, progress_hook=None):
+    def video(url, out_dir, *, max_height=None, progress_hook=None, limits=None):
         check_url(url)
         if max_height is not None and max_height < 360:
             raise ValueError("The generated fixture supports 360p or higher export requests")
