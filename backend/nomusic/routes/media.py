@@ -24,6 +24,7 @@ from starlette.background import BackgroundTask
 from nomusic.config import SETTINGS
 from nomusic.pipeline import downloader
 from nomusic.pipeline.cache import CHUNK_MEDIA_TYPE, StorageLimitExceeded
+from nomusic.pipeline.downloader import ResourceLimitExceeded
 from nomusic.pipeline.export import (
     MP4_COPYABLE_VCODECS,
     mp3_transcode_cmd,
@@ -47,6 +48,13 @@ _STREAM_BLOCK_BYTES = 65536
 # hanging the worker. (ffprobe's shorter timeout lives with the probe helpers in
 # pipeline/export.py.)
 _FFMPEG_TIMEOUT_SECONDS = 3600.0
+
+
+def _export_reservation(chunk_files, *, cap: int, extra_bytes: int = 0) -> int:
+    """Reserve a bounded estimate instead of the maximum for every export."""
+    source_bytes = sum(size for _, size in chunk_files)
+    estimate = max(1, source_bytes * 2 + max(0, extra_bytes))
+    return min(cap, estimate)
 
 
 def _run_ffmpeg(cmd: list[str], *, pass_fds: tuple[int, ...] = ()) -> None:
@@ -252,7 +260,9 @@ def audio(job_id: str, request: Request, format: str = "opus") -> Response:
         # single up-front transcode (rather than a streaming pipe) keeps
         # this simple and is fine for a local single-user backend.
         try:
-            reservation = cache.reserve(SETTINGS.max_export_bytes)
+            reservation = cache.reserve(
+                _export_reservation(chunk_files, cap=SETTINGS.max_export_bytes)
+            )
         except StorageLimitExceeded as exc:
             lease.close()
             raise HTTPException(status_code=507, detail=str(exc)) from exc
@@ -362,9 +372,10 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
                 progress_hook=_dl_hook,
                 limits=downloader.limits_from_settings(SETTINGS),
             )
-        except StorageLimitExceeded as exc:
+        except (StorageLimitExceeded, ResourceLimitExceeded) as exc:
             log.warning("video download rejected by local resource policy for %s: %s", job_id, exc)
-            raise HTTPException(status_code=507, detail=str(exc)) from exc
+            status_code = 507 if isinstance(exc, StorageLimitExceeded) else 413
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
         except Exception as exc:
             # yt-dlp failures are the user's URL going stale / network
             # issues, not a server bug — surface them as a 502.
@@ -373,7 +384,13 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
 
         # --- Phase 2: mux the stripped audio over the video ---
         try:
-            reservation = cache.reserve(SETTINGS.max_export_bytes)
+            reservation = cache.reserve(
+                _export_reservation(
+                    chunk_files,
+                    cap=SETTINGS.max_export_bytes,
+                    extra_bytes=video_path.stat().st_size,
+                )
+            )
         except StorageLimitExceeded as exc:
             raise HTTPException(status_code=507, detail=str(exc)) from exc
         progress.set(progress_key, "encoding", 0.0)

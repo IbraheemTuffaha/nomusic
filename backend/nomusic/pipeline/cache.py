@@ -196,21 +196,37 @@ class JobCache:
         return CacheLease(self.video_dir(url, max_height))
 
     @staticmethod
-    def _is_locked(directory: Path) -> bool:
+    def _try_exclusive_lock(directory: Path) -> int | None:
         lease = directory / ".lease"
         try:
             fd = os.open(lease, os.O_RDWR | os.O_NOFOLLOW)
         except OSError:
-            return False
+            return None
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                return True
+                os.close(fd)
+                return None
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @staticmethod
+    def _release_exclusive_lock(fd: int) -> None:
+        try:
             fcntl.flock(fd, fcntl.LOCK_UN)
-            return False
         finally:
             os.close(fd)
+
+    @classmethod
+    def _is_locked(cls, directory: Path) -> bool:
+        fd = cls._try_exclusive_lock(directory)
+        if fd is None:
+            return True
+        cls._release_exclusive_lock(fd)
+        return False
 
     def reserve(self, amount: int) -> CacheReservation:
         amount = max(0, int(amount))
@@ -453,14 +469,24 @@ class JobCache:
                 continue  # active staging is lease-owned, not completed cache
             if child.name in ("sources", "videos") and child.is_dir():
                 for entry in list(child.iterdir()):
-                    if not entry.is_dir() or self._is_locked(entry):
+                    if not entry.is_dir():
                         continue
-                    freed += _dir_bytes(entry)
-                    shutil.rmtree(entry, ignore_errors=True)
+                    fd = self._try_exclusive_lock(entry)
+                    if fd is None:
+                        continue
+                    try:
+                        freed += _dir_bytes(entry)
+                        shutil.rmtree(entry, ignore_errors=True)
+                    finally:
+                        self._release_exclusive_lock(fd)
                 continue
-            if child.is_dir() and self._is_locked(child):
-                log.info("clear skipped leased cache namespace %s", child)
-                continue
+            if child.is_dir():
+                fd = self._try_exclusive_lock(child)
+                if fd is None:
+                    log.info("clear skipped leased cache namespace %s", child)
+                    continue
+            else:
+                fd = None
             try:
                 freed += _dir_bytes(child) if child.is_dir() else child.stat().st_size
             except OSError as err:
@@ -476,6 +502,9 @@ class JobCache:
                 # One stubborn entry shouldn't abort the whole clear; report it
                 # and continue so the rest of the cache is still reclaimed.
                 log.warning("clear_all: couldn't remove %s: %s", child, err)
+            finally:
+                if fd is not None:
+                    self._release_exclusive_lock(fd)
         return freed
 
     def sweep_older_than(self, ttl_seconds: float) -> tuple[int, int]:
@@ -497,24 +526,32 @@ class JobCache:
         for child in list(self.root.iterdir()):
             if not child.is_dir() or child.name in _RESERVED_DIRS:
                 continue
-            if self._is_locked(child):
+            fd = self._try_exclusive_lock(child)
+            if fd is None:
                 continue
-            if _dir_newest_mtime(child) < now - ttl_seconds:
-                freed += _dir_bytes(child)
-                shutil.rmtree(child, ignore_errors=True)
-                removed += 1
+            try:
+                if _dir_newest_mtime(child) < now - ttl_seconds:
+                    freed += _dir_bytes(child)
+                    shutil.rmtree(child, ignore_errors=True)
+                    removed += 1
+            finally:
+                self._release_exclusive_lock(fd)
 
         # Sources + videos: ~/.cache/nomusic/{sources,videos}/<url_hash>. Both
         # are url-keyed caches swept per-entry (a single old dir doesn't drag
         # the whole tree down with it).
         for tree in ("sources", "videos"):
             for child in self._tree_entries(tree):
-                if self._is_locked(child):
+                fd = self._try_exclusive_lock(child)
+                if fd is None:
                     continue
-                if _dir_newest_mtime(child) < now - ttl_seconds:
-                    freed += _dir_bytes(child)
-                    shutil.rmtree(child, ignore_errors=True)
-                    removed += 1
+                try:
+                    if _dir_newest_mtime(child) < now - ttl_seconds:
+                        freed += _dir_bytes(child)
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed += 1
+                finally:
+                    self._release_exclusive_lock(fd)
 
         if removed:
             log.info(
