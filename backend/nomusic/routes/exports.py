@@ -9,7 +9,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from nomusic.exports import ExportQueueFull, ExportRegistryClosed, ExportState
+from nomusic.exports import (
+    ExportDownloadsFull,
+    ExportQueueFull,
+    ExportRegistryClosed,
+    ExportState,
+)
 
 from . import JsonDict
 
@@ -77,13 +82,12 @@ def download_export(export_id: str, request: Request) -> Response:
     artifact = directory / status.filename
     if not artifact.is_file() or artifact.stat().st_size <= 0:
         raise HTTPException(status_code=410, detail="export artifact is unavailable")
-    lease = cache.export_lease(export_id, shared=True)
     try:
-        if not artifact.is_file():
-            raise HTTPException(status_code=410, detail="export artifact is unavailable")
-    except BaseException:
-        lease.close()
-        raise
+        lease = registry.open_download(export_id)
+    except ExportDownloadsFull as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    if lease is None:
+        raise HTTPException(status_code=410, detail="export artifact is unavailable")
     return FileResponse(
         str(artifact),
         media_type=status.media_type,

@@ -12,6 +12,7 @@ from dataclasses import replace
 
 from nomusic.exports import (
     ExportArtifact,
+    ExportDownloadsFull,
     ExportQueueFull,
     ExportRegistry,
     ExportState,
@@ -128,6 +129,55 @@ def test_registry_expires_ready_artifact(tmp_path):
     assert registry.get(status.export_id).state is ExportState.EXPIRED
     assert not list(cache.export_dir(status.export_id).glob("built.*"))
     registry.shutdown()
+
+
+def test_download_reader_slots_are_bounded(tmp_path):
+    cache = JobCache(tmp_path / "cache")
+    registry = ExportRegistry(
+        cache, FakeJobs(), _builder, max_jobs=1, max_downloads=1,
+        ttl_seconds=60, wait_timeout_seconds=2,
+    )
+    status = registry.submit("job", "opus")
+    _wait(registry, status.export_id)
+    first = registry.open_download(status.export_id)
+    with pytest.raises(ExportDownloadsFull):
+        registry.open_download(status.export_id)
+    first.close()
+    second = registry.open_download(status.export_id)
+    assert second is not None
+    second.close()
+    registry.shutdown()
+
+
+def test_artifact_size_limit_fails_before_publication(tmp_path):
+    cache = JobCache(tmp_path / "cache")
+
+    def oversized(spec, directory, progress, cancel):
+        path = directory / "too-large"
+        path.write_bytes(b"123456")
+        return ExportArtifact(path, path.name, "application/octet-stream")
+
+    registry = ExportRegistry(
+        cache, FakeJobs(), oversized, max_jobs=1, max_artifact_bytes=5,
+        ttl_seconds=60, wait_timeout_seconds=2,
+    )
+    status = registry.submit("job", "opus")
+    failed = _wait(registry, status.export_id, ExportState.FAILED)
+    assert "exceeds" in failed.error
+    registry.shutdown()
+
+
+def test_source_cache_sweep_does_not_expire_export_ttl(tmp_path):
+    cache = JobCache(tmp_path / "cache")
+    directory = cache.export_dir("a" * 32)
+    artifact = directory / "ready.opus"
+    artifact.write_bytes(b"artifact")
+    old = time.time() - 1000
+    artifact.touch()
+    import os
+    os.utime(artifact, (old, old))
+    assert cache.sweep_older_than(1) == (0, 0)
+    assert artifact.exists()
 
 
 def test_http_export_api_serves_prepared_opus(client):

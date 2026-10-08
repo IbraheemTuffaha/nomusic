@@ -238,6 +238,9 @@ class Settings:
     export_wait_timeout_seconds: float = field(
         default_factory=lambda: _env_float("EXPORT_WAIT_TIMEOUT_SECONDS", 7200.0)
     )
+    max_export_downloads: int = field(
+        default_factory=lambda: _env_int("MAX_EXPORT_DOWNLOADS", 4)
+    )
 
 
 SETTINGS = Settings()

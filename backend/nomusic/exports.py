@@ -42,6 +42,10 @@ class ExportQueueFull(RuntimeError):
     """The bounded export worker pool cannot admit another build."""
 
 
+class ExportDownloadsFull(RuntimeError):
+    """All bounded artifact-reader slots are currently occupied."""
+
+
 class ExportRegistryClosed(RuntimeError):
     """The service is stopping and cannot accept another export."""
 
@@ -111,6 +115,24 @@ class ExportStatus:
         }
 
 
+class ExportDownload:
+    """A shared artifact lease and one reader slot, released after response."""
+
+    def __init__(self, slots: threading.BoundedSemaphore, lease) -> None:
+        self._slots = slots
+        self._lease = lease
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._lease.close()
+        finally:
+            self._slots.release()
+
+
 ProgressCallback = Callable[[str, float | None], None]
 ExportBuilder = Callable[[ExportSpec, Path, ProgressCallback, threading.Event], ExportArtifact]
 
@@ -132,6 +154,8 @@ class ExportRegistry:
         max_jobs: int = 2,
         ttl_seconds: float = 86400.0,
         wait_timeout_seconds: float = 7200.0,
+        max_artifact_bytes: int | None = None,
+        max_downloads: int = 4,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if max_jobs <= 0:
@@ -140,12 +164,18 @@ class ExportRegistry:
             raise ValueError("ttl_seconds must be positive")
         if wait_timeout_seconds <= 0:
             raise ValueError("wait_timeout_seconds must be positive")
+        if max_artifact_bytes is not None and max_artifact_bytes <= 0:
+            raise ValueError("max_artifact_bytes must be positive")
+        if max_downloads <= 0:
+            raise ValueError("max_downloads must be positive")
         self.cache = cache
         self.jobs = jobs
         self.builder = builder
         self.max_jobs = int(max_jobs)
         self.ttl_seconds = float(ttl_seconds)
         self.wait_timeout_seconds = float(wait_timeout_seconds)
+        self.max_artifact_bytes = max_artifact_bytes
+        self.max_downloads = int(max_downloads)
         self._clock = clock
         self._lock = threading.RLock()
         self._statuses: dict[str, ExportStatus] = {}
@@ -153,6 +183,7 @@ class ExportRegistry:
         self._threads: dict[str, threading.Thread] = {}
         self._cancel: dict[str, threading.Event] = {}
         self._closed = False
+        self._download_slots = threading.BoundedSemaphore(self.max_downloads)
         self._load_manifests()
 
     # -- persistence -----------------------------------------------------
@@ -335,6 +366,33 @@ class ExportRegistry:
             status = self._statuses.get(export_id)
             return replace(status) if status is not None else None
 
+    def open_download(self, export_id: str) -> ExportDownload | None:
+        """Take a bounded reader slot and shared lease for a ready artifact."""
+        with self._lock:
+            status = self._statuses.get(export_id)
+            if status is None or status.state is not ExportState.READY:
+                return None
+            filename = status.filename
+        if not filename or Path(filename).name != filename:
+            return None
+        if not self._download_slots.acquire(blocking=False):
+            raise ExportDownloadsFull("too many export downloads in progress")
+        try:
+            lease = self.cache.export_lease(export_id, shared=True)
+            artifact = self.cache.export_dir(export_id) / filename
+            with self._lock:
+                current = self._statuses.get(export_id)
+                if current is None or current.state is not ExportState.READY:
+                    lease.close()
+                    return None
+            if not artifact.is_file() or artifact.stat().st_size <= 0:
+                lease.close()
+                return None
+            return ExportDownload(self._download_slots, lease)
+        except BaseException:
+            self._download_slots.release()
+            raise
+
     def cancel(self, export_id: str) -> ExportStatus | None:
         with self._lock:
             status = self._statuses.get(export_id)
@@ -501,6 +559,10 @@ class ExportRegistry:
         size = path.stat().st_size
         if size <= 0:
             raise ExportBuildError("export builder produced an empty file")
+        if self.max_artifact_bytes is not None and size > self.max_artifact_bytes:
+            raise ExportBuildError(
+                f"export artifact exceeds the {self.max_artifact_bytes}-byte limit"
+            )
         filename = Path(artifact.filename).name
         if not filename or filename in (".", ".."):
             raise ExportBuildError("export builder returned an invalid filename")
@@ -538,7 +600,8 @@ class ExportRegistry:
 
 
 __all__ = [
-    "ExportArtifact", "ExportBuildError", "ExportBuilder", "ExportQueueFull",
+    "ExportArtifact", "ExportBuildError", "ExportBuilder", "ExportDownloadsFull",
+    "ExportDownload", "ExportQueueFull",
     "ExportRegistry", "ExportRegistryClosed", "ExportSpec", "ExportState",
     "ExportStatus",
 ]

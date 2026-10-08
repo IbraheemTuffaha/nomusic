@@ -558,14 +558,12 @@ class JobCache:
             finally:
                 self._release_exclusive_lock(fd)
 
-        # Sources, videos, and prepared exports: ~/.cache/nomusic/{sources,videos,exports}/<id>.
-        # All are entry-keyed caches swept independently so one old artifact
-        # does not drag the whole tree down with it.
-        #
         # Sources + videos: ~/.cache/nomusic/{sources,videos}/<url_hash>. Both
         # are url-keyed caches swept per-entry (a single old dir doesn't drag
-        # the whole tree down with it).
-        for tree in ("sources", "videos", "exports"):
+        # the whole tree down with it). Prepared exports have their own TTL
+        # and are swept by ExportRegistry.cleanup, so source TTL changes cannot
+        # expire a download the user explicitly requested.
+        for tree in ("sources", "videos"):
             for child in self._tree_entries(tree):
                 fd = self._try_exclusive_lock(child)
                 if fd is None:

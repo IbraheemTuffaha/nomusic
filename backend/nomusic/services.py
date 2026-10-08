@@ -104,6 +104,8 @@ class Services:
             max_jobs=settings.max_export_jobs,
             ttl_seconds=settings.export_ttl_seconds,
             wait_timeout_seconds=settings.export_wait_timeout_seconds,
+            max_artifact_bytes=settings.max_export_bytes,
+            max_downloads=settings.max_export_downloads,
         )
 
         if settings.cache_ttl_days > 0 and settings.cache_sweep_interval_seconds > 0:
