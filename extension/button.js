@@ -1,6 +1,5 @@
 // Button: the floating pill UI per <video> — status display, menu, MP4
 // download. Creates/disposes a Session on toggle. Split out of content.js.
-import { dlog } from "./settings.js";
 import { Session } from "./session.js";
 
 // Strip characters that are illegal in filenames across Windows/macOS/Linux
@@ -374,12 +373,17 @@ export class Button {
     this.el.remove();
   }
 
-  _cancelDownload() {
+  _cancelDownload({ cancelExport = true } = {}) {
     const download = this._download;
     this._download = null;
     if (download) {
       clearTimeout(download.pollTimer);
+      download.pollResolve?.();
       download.controller.abort();
+      if (cancelExport && download.exportId && !download.nativeStarted && !download.cancelSent) {
+        download.cancelSent = true;
+        fetch(download.cancelUrl, { method: "DELETE", cache: "no-store" }).catch(() => {});
+      }
     }
     this._downloading = false;
     this._pendingDownload = null;
@@ -495,89 +499,102 @@ export class Button {
     this.session.ensureLiveForDownload();
   }
 
-  /** Fetch the finished export from the backend and save it to disk. We fetch
-   *  the bytes and save via a blob: URL because a direct cross-origin
-   *  <a download> to the backend would have its filename ignored. */
+  /** Prepare an export, then hand its ready URL to the background worker.
+   * The downloads API owns the response body, so the content script never
+   * buffers a complete MP3/MP4 in a Blob or keeps it in page memory. */
   async _startDownload(format, height = 0) {
     const jobId = this.session?.jobId;
     if (this._retired || !jobId || this.session.disposed || this.session.failed) return;
     const backendUrl = this.session.config.backendUrl;
     if (this._downloading) return; // ignore double-clicks mid-download
     this._downloading = true;
-    const download = { controller: new AbortController(), pollTimer: null };
+    const base = backendUrl.replace(/\/+$/, "");
+    const download = {
+      controller: new AbortController(),
+      pollTimer: null,
+      pollResolve: null,
+      exportId: null,
+      cancelUrl: null,
+      cancelSent: false,
+      nativeStarted: false,
+    };
     this._download = download;
     const { signal } = download.controller;
     const current = () => this._download === download && !signal.aborted;
 
-    const ext = format === "mp4" ? "mp4" : "mp3";
-    const q = height ? `?max_height=${height}` : "";
-    const url =
-      format === "mp4"
-        ? `${backendUrl}/video/${jobId}${q}`
-        : `${backendUrl}/audio/${jobId}?format=mp3`;
-
     // Busy feedback — freeze the pill while preparing.
     this._clearErrorRevert();
     this.el.dataset.state = "working";
-    this.label.textContent = format === "mp4" ? "Preparing…" : "Saving…";
+    this.label.textContent = "Preparing…";
     this.pct.textContent = "";
     this.fill.style.width = "0%";
 
-    // MP4 prep can take a while (download + mux/re-encode); poll the backend
-    // so the pill shows real "Fetching N%" / "Encoding N%" progress.
-    if (format === "mp4") {
-      const progUrl = `${backendUrl}/video/${jobId}/progress${q}`;
-      const poll = async () => {
-        if (!current()) return;
-        try {
-          const r = await fetch(progUrl, { cache: "no-store", signal });
-          if (!current()) return;
-          if (r.ok) {
-            const progress = await r.json();
-            if (!current()) return;
-            this._showExportProgress(progress);
-          }
-        } catch (err) {
-          if (current()) dlog("export progress poll failed (transient)", err?.name || err);
+    try {
+      const submit = await fetch(`${base}/exports`, {
+        method: "POST",
+        cache: "no-store",
+        signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          job_id: jobId,
+          format,
+          ...(format === "mp4" && height ? { max_height: height } : {}),
+        }),
+      });
+      if (!current()) return;
+      const submitted = await submit.json();
+      if (!submit.ok) throw new Error(submitted?.detail || `HTTP ${submit.status}`);
+      download.exportId = submitted.export_id;
+      download.cancelUrl = `${base}/exports/${encodeURIComponent(download.exportId)}`;
+      let status = submitted;
+      while (current() && status.state !== "ready") {
+        if (["failed", "expired", "cancelled"].includes(status.state)) {
+          throw new Error(status.error || `export ${status.state}`);
         }
-        if (current()) {
+        this._showExportProgress({
+          phase: status.phase,
+          percent: typeof status.progress === "number" ? status.progress * 100 : 0,
+        });
+        await new Promise((resolve) => {
+          download.pollResolve = resolve;
           download.pollTimer = setTimeout(() => {
             download.pollTimer = null;
-            poll();
+            download.pollResolve = null;
+            resolve();
           }, 600);
-        }
-      };
-      poll();
-    }
-
-    try {
-      // no-store: never reuse a cached response. Older backends served raw
-      // Opus at the ?format=mp3 URL with a 24h cache header, which the
-      // browser would otherwise keep handing back instead of the real MP3.
-      const resp = await fetch(url, { cache: "no-store", signal });
-      if (!current()) return;
-      if (!resp.ok) {
-        throw new Error(
-          resp.status === 425 ? "not ready" : `HTTP ${resp.status}`,
+        });
+        if (!current()) return;
+        const statusResponse = await fetch(
+          `${base}/exports/${encodeURIComponent(download.exportId)}`,
+          { cache: "no-store", signal },
         );
+        if (!statusResponse.ok) throw new Error(`HTTP ${statusResponse.status}`);
+        status = await statusResponse.json();
       }
-      const blob = await resp.blob();
       if (!current()) return;
-      const objUrl = URL.createObjectURL(blob);
-      // Invalidate the operation before saving: a pending progress body must
-      // never repaint the pill after the completed download restores it.
-      this._cancelDownload();
-      const revokeTimer = setTimeout(() => {
-        if (this._downloadUrls.delete(objUrl)) URL.revokeObjectURL(objUrl);
-      }, 10000);
-      this._downloadUrls.set(objUrl, revokeTimer);
-      const a = document.createElement("a");
-      a.href = objUrl;
-      a.download = `${sanitizeFilename(this.title) || "nomusic"}.${ext}`;
-      a.rel = "noopener";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      const filename = sanitizeFilename(status.filename)
+        || `${sanitizeFilename(this.title) || "nomusic"}.${format}`;
+      const message = await new Promise((resolve, reject) => {
+        try {
+          chrome.runtime.sendMessage(
+            {
+              type: "download-export",
+              url: `${base}/exports/${encodeURIComponent(download.exportId)}/download`,
+              filename,
+            },
+            (response) => {
+              const error = chrome.runtime.lastError;
+              if (error) reject(new Error(error.message || String(error)));
+              else resolve(response);
+            },
+          );
+        } catch (error) {
+          reject(error);
+        }
+      });
+      if (!message?.ok) throw new Error(message?.error || "browser download failed");
+      download.nativeStarted = true;
+      this._cancelDownload({ cancelExport: false });
       this._restoreAfterDownload();
     } catch (err) {
       if (current()) {
@@ -592,8 +609,12 @@ export class Button {
   /** Render a polled export-progress snapshot onto the pill. */
   _showExportProgress(p) {
     if (!this._downloading || !p || this.session?.failed) return;
-    if (p.phase === "idle" || p.phase === "done") return;
-    const label = p.phase === "downloading" ? "Fetching" : "Encoding";
+    if (p.phase === "idle" || p.phase === "done" || p.phase === "ready") return;
+    const label = p.phase === "downloading"
+      ? "Fetching"
+      : p.phase === "queued"
+        ? "Preparing"
+        : "Encoding";
     const pct = Math.max(0, Math.min(100, Math.round(p.percent || 0)));
     this.el.dataset.state = "working";
     this.label.textContent = label;

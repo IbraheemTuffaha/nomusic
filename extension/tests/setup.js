@@ -11,8 +11,13 @@ globalThis.chrome ??= {
   },
   runtime: {
     getURL: (p) => p,
+    sendMessage: (_message, callback) => callback?.({ ok: true, downloadId: 1 }),
+    lastError: null,
     onInstalled: { addListener: noop },
     onMessage: { addListener: noop },
+  },
+  downloads: {
+    download: (_options, callback) => callback?.(1),
   },
 };
 

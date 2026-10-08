@@ -13,6 +13,13 @@ async function loadBackground({ stored }) {
     runtime: {
       onInstalled: { addListener: (cb) => (captured.onInstalled = cb) },
       onMessage: { addListener: (cb) => (captured.onMessage = cb) },
+      lastError: null,
+    },
+    downloads: {
+      download: (options, callback) => {
+        captured.downloadOptions = options;
+        callback(42);
+      },
     },
     storage: {
       sync: {
@@ -26,6 +33,28 @@ async function loadBackground({ stored }) {
   await import(`../background.js?load=${++loadCounter}`);
   return { captured, getWritten: () => written };
 }
+
+test("download-export delegates the response body to chrome downloads", async () => {
+  const { captured } = await loadBackground({ stored: {} });
+  let response;
+  const keepOpen = captured.onMessage(
+    {
+      type: "download-export",
+      url: "http://127.0.0.1:8723/exports/id/download",
+      filename: "sample.mp3",
+    },
+    {},
+    (value) => { response = value; },
+  );
+  assert.equal(keepOpen, true);
+  assert.deepEqual(captured.downloadOptions, {
+    url: "http://127.0.0.1:8723/exports/id/download",
+    filename: "sample.mp3",
+    conflictAction: "uniquify",
+    saveAs: false,
+  });
+  assert.deepEqual(response, { ok: true, downloadId: 42 });
+});
 
 test("onInstalled seeds only the missing storage defaults", async () => {
   const { captured, getWritten } = await loadBackground({

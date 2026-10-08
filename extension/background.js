@@ -39,5 +39,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     })();
     return true; // keep the message channel open for the async response
   }
+  if (msg?.type === "download-export") {
+    const url = typeof msg.url === "string" ? msg.url : "";
+    const filename = typeof msg.filename === "string" ? msg.filename : "";
+    if (!url || !filename) {
+      sendResponse({ ok: false, error: "download URL and filename are required" });
+      return false;
+    }
+    chrome.downloads.download(
+      { url, filename, conflictAction: "uniquify", saveAs: false },
+      (downloadId) => {
+        const error = chrome.runtime.lastError;
+        if (error) {
+          sendResponse({ ok: false, error: error.message || String(error) });
+        } else {
+          sendResponse({ ok: true, downloadId });
+        }
+      },
+    );
+    return true;
+  }
   return false;
 });
