@@ -27,6 +27,7 @@ from nomusic.pipeline.cache import CHUNK_MEDIA_TYPE, StorageLimitExceeded
 from nomusic.pipeline.downloader import ResourceLimitExceeded
 from nomusic.pipeline.export import (
     MP4_COPYABLE_VCODECS,
+    complete_manifest,
     mp3_transcode_cmd,
     mux_video_cmd,
     snapshot_chunk_files,
@@ -231,7 +232,7 @@ def audio(job_id: str, request: Request, format: str = "opus") -> Response:
     meta = cache.load_meta(job_id)
     if meta is None:
         raise HTTPException(status_code=404, detail="unknown job_id")
-    if not meta.complete:
+    if not complete_manifest(meta):
         raise HTTPException(status_code=425, detail="full audio not ready")
 
     # Snapshot the contiguous run of chunk files ONCE. The advertised
@@ -335,7 +336,7 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
     meta = cache.load_meta(job_id)
     if meta is None:
         raise HTTPException(status_code=404, detail="unknown job_id")
-    if not meta.complete:
+    if not complete_manifest(meta):
         raise HTTPException(status_code=425, detail="full audio not ready")
 
     lease = cache.job_lease(job_id)

@@ -43,6 +43,16 @@ _FFPROBE_TIMEOUT_SECONDS = 60.0
 MP4_COPYABLE_VCODECS = frozenset({"h264", "hevc"})
 
 
+def complete_manifest(meta) -> bool:
+    """Return true only for a complete, gap-free, in-range chunk manifest."""
+    try:
+        total = int(meta.total_chunks)
+        ready = sorted(int(index) for index in meta.chunks_ready)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return bool(meta.complete and total > 0 and ready == list(range(total)))
+
+
 def video_codec(path: Path) -> str:
     """Return the first video stream's codec name via ffprobe ("" on failure)."""
     try:

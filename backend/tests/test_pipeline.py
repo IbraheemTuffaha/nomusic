@@ -21,6 +21,7 @@ from nomusic.engines.base import Engine, EngineCapabilities, SeparationResult
 from nomusic.pipeline.cache import CacheMeta, JobCache
 from nomusic.pipeline.downloader import ResourceLimitExceeded, ResourceLimits
 from nomusic.pipeline.export import (
+    complete_manifest,
     mp3_transcode_cmd,
     mux_video_cmd,
     snapshot_chunk_files,
@@ -578,6 +579,21 @@ def test_snapshot_chunk_files_returns_contiguous_prefix(tmp_path):
     ]
     # Sizes are captured in the same pass and match what's on disk.
     assert [size for _, size in files] == [len(b"chunk0"), len(b"chunk1"), len(b"chunk2")]
+
+
+@pytest.mark.parametrize("ready, complete, expected", [
+    ([0, 1, 2], True, True),
+    ([0, 2], True, False),
+    ([0, 1, 4], True, False),
+    ([0, 1, 2], False, False),
+])
+def test_complete_manifest_requires_every_chunk(ready, complete, expected):
+    meta = CacheMeta(
+        url="fixture://video", model="fake", keep_stems=["vocals"],
+        duration_seconds=3, chunk_seconds=1, chunk_overlap_seconds=0,
+        total_chunks=3, chunks_ready=ready, complete=complete,
+    )
+    assert complete_manifest(meta) is expected
 
 
 def _make_opus_chunk(wav: Path, out: Path) -> None:
