@@ -143,6 +143,10 @@ def main() -> None:
             "NOMUSIC_CACHE_DIR": str(cache),
             "NOMUSIC_ENGINE": "demucs",
             "NOMUSIC_DEVICE": "cpu",
+            # The fixture adapter is installed in this process. The production
+            # supervisor intentionally runs acquisition in a spawned child, so
+            # keep this controlled smoke path on the in-process test seam.
+            "NOMUSIC_SUPERVISED_WORKER": "0",
             "NOMUSIC_RELOAD": "0",
             "NOMUSIC_CACHE_TTL_DAYS": "0",
             "NOMUSIC_CACHE_SWEEP_INTERVAL_SECONDS": "0",
