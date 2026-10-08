@@ -10,6 +10,9 @@ import json
 import math
 import shutil
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,7 @@ from nomusic.engines.base import Engine, EngineCapabilities, SeparationResult
 from nomusic.pipeline.cache import CacheMeta, JobCache
 from nomusic.pipeline.downloader import ResourceLimitExceeded, ResourceLimits
 from nomusic.pipeline.export import (
+    _run_export_ffmpeg,
     complete_manifest,
     mp3_transcode_cmd,
     mux_video_cmd,
@@ -34,6 +38,28 @@ from nomusic.pipeline.processor import (
     _ChunkWork,
     plan_chunks,
 )
+
+
+def test_export_ffmpeg_cancellation_terminates_process():
+    cancel = threading.Event()
+    errors = []
+
+    def run():
+        try:
+            _run_export_ffmpeg([sys.executable, "-c", "import time; time.sleep(30)"], cancel)
+        except RuntimeError as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=run)
+    started = time.monotonic()
+    worker.start()
+    time.sleep(0.1)
+    cancel.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert [str(error) for error in errors] == ["cancelled"]
+    assert time.monotonic() - started < 5
 
 
 def test_plan_chunks_covers_full_duration():
@@ -710,9 +736,8 @@ def test_mux_video_replaces_audio_with_stripped_track(tmp_path):
         check=True, capture_output=True,
     )
 
-    # The export worker stages this as ``*.mp4.part`` before renaming it.
-    # Keep the temporary suffix here so the command remains covered by the
-    # regression test that motivated the explicit MP4 muxer.
+    # Export workers write to a .mp4.part path before atomically publishing it;
+    # the explicit muxer format keeps ffmpeg independent of that temp suffix.
     out = tmp_path / "out.mp4.part"
     subprocess.run(mux_video_cmd(video, chunk_files, out), check=True, capture_output=True)
 

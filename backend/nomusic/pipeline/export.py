@@ -30,7 +30,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -239,17 +241,65 @@ def _export_reservation(
     return min(cap, estimate)
 
 
-def _run_export_ffmpeg(cmd: list[str]) -> None:
+def _run_export_ffmpeg(cmd: list[str], cancel_event=None) -> None:
+    """Run ffmpeg while allowing a cancelled export to stop promptly."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    def stop(force: bool = False) -> None:
+        if proc.poll() is not None:
+            return
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            try:
+                (proc.kill if force else proc.terminate)()
+            except ProcessLookupError:
+                pass
+
+    deadline = time.monotonic() + _FFMPEG_TIMEOUT_SECONDS
+    drained = False
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECONDS
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS:.0f}s"
-        ) from exc
+        while proc.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                stop()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    stop(force=True)
+                    proc.wait(timeout=2)
+                proc.communicate()
+                drained = True
+                raise RuntimeError("cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop(force=True)
+                proc.wait(timeout=2)
+                proc.communicate()
+                drained = True
+                raise RuntimeError(
+                    f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS:.0f}s"
+                )
+            try:
+                proc.wait(timeout=min(0.2, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+        _, stderr = proc.communicate()
+        drained = True
+    except BaseException:
+        if proc.poll() is None:
+            stop(force=True)
+            proc.wait(timeout=2)
+        if not drained:
+            proc.communicate()
+        raise
     if proc.returncode:
-        detail = proc.stderr.decode("utf-8", "replace").strip() or "(no stderr)"
+        detail = stderr.decode("utf-8", "replace").strip() or "(no stderr)"
         raise RuntimeError(f"ffmpeg failed: {detail[-2000:]}")
 
 
@@ -293,8 +343,11 @@ def build_export(cache, settings, spec, destination: Path, on_progress, cancel_e
             extension, media_type = "opus", "audio/ogg"
             final = destination / _safe_filename(meta.title, extension)
             part = final.with_suffix(final.suffix + ".part")
+            reservation = cache.reserve(
+                _export_reservation(chunk_files, cap=settings.max_export_bytes)
+            )
             on_progress("encoding", 0.0)
-            _run_export_ffmpeg(opus_transcode_cmd(chunk_files, part))
+            _run_export_ffmpeg(opus_transcode_cmd(chunk_files, part), cancel_event)
             if cancel_event.is_set():
                 raise ExportBuildError("cancelled")
             os.replace(part, final)
@@ -309,7 +362,7 @@ def build_export(cache, settings, spec, destination: Path, on_progress, cancel_e
                 _export_reservation(chunk_files, cap=settings.max_export_bytes)
             )
             on_progress("encoding", 0.0)
-            _run_export_ffmpeg(mp3_transcode_cmd(chunk_files, part))
+            _run_export_ffmpeg(mp3_transcode_cmd(chunk_files, part), cancel_event)
             if cancel_event.is_set():
                 raise ExportBuildError("cancelled")
             os.replace(part, final)
@@ -349,13 +402,15 @@ def build_export(cache, settings, spec, destination: Path, on_progress, cancel_e
         reencode = video_codec(video_path) not in MP4_COPYABLE_VCODECS
         try:
             _run_export_ffmpeg(
-                mux_video_cmd(video_path, chunk_files, part, reencode_video=reencode)
+                mux_video_cmd(video_path, chunk_files, part, reencode_video=reencode),
+                cancel_event,
             )
         except RuntimeError:
-            if reencode:
+            if reencode or cancel_event.is_set():
                 raise
             _run_export_ffmpeg(
-                mux_video_cmd(video_path, chunk_files, part, reencode_video=True)
+                mux_video_cmd(video_path, chunk_files, part, reencode_video=True),
+                cancel_event,
             )
         if cancel_event.is_set():
             raise ExportBuildError("cancelled")

@@ -52,9 +52,12 @@ session holding a lease keeps the worker running.
 ## Exports and cache
 
 The download chevron beside nomusic offers **MP3 — audio only** and **Video
-(MP4)** at several resolutions. You can request either before processing
-finishes; keep the tab open until the download completes. Pausing playback
-does not cancel export preparation. MP4 may require another source download.
+(MP4)** at several resolutions. The extension submits a durable export job,
+shows its preparation progress, and hands the ready artifact to the browser's
+native downloads service; it never buffers the whole file in the page. You can
+request either before processing finishes; keep the tab open until the
+download completes. Pausing playback does not cancel export preparation. MP4
+may require another source download.
 The local policy accepts finite sources up to two hours and 512 MiB of source
 audio. Video exports are capped at 1080p and 2 GiB; a larger selected format
 fails before a download starts. Check saved files have their full expected
@@ -74,8 +77,9 @@ preserved.
 Pause playback and finish exports, then press **Control+C** in the helper's
 terminal. If work is active, it reports a shutdown wait of up to 60 seconds.
 A second **Control+C** forces immediate exit. Startup model loading by itself
-does not cause a long wait. Completed media/model caches survive shutdown;
-unfinished exports may need to be requested again after a forced exit.
+does not cause a long wait. Completed media/model caches and ready export
+artifacts survive a normal restart; an interrupted queued/building export is
+reconciled and can simply be requested again after startup.
 
 Start the helper again, check readiness, and toggle nomusic off/on for the
 video. Reopen the popup or reload the page if needed. The extension retries a

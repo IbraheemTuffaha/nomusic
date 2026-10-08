@@ -564,7 +564,7 @@ class ExportRegistry:
                 f"export artifact exceeds the {self.max_artifact_bytes}-byte limit"
             )
         filename = Path(artifact.filename).name
-        if not filename or filename in (".", ".."):
+        if not filename or filename in (".", "..") or filename != path.name:
             raise ExportBuildError("export builder returned an invalid filename")
         now = self._clock()
         with self._lock:
@@ -576,7 +576,7 @@ class ExportRegistry:
             status.progress = 1.0
             status.filename = filename
             status.media_type = artifact.media_type
-            status.size_bytes = artifact.size_bytes or size
+            status.size_bytes = size
             status.error = ""
             status.updated_at = now
             status.expires_at = now + self.ttl_seconds
