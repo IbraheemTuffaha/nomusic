@@ -8,10 +8,13 @@ decoded audio against the video's clock. A page bridge suppresses original
 audio; the scheduler handles drift and pitch-preserving speed changes.
 
 FastAPI owns an engine, cache, job registry and maintenance work per application
-lifespan. Jobs run in threads with serialized processing; Demucs/PyTorch selects
-MPS, CUDA or CPU. The current engine is named `mlx`, with `demucs` as an alias;
-it is not an MLX implementation. Cache metadata and completed chunks permit
-reuse. MP3/MP4 exports preserve sample-aware chunk concatenation and use FFmpeg.
+lifespan. By default, one supervised child process owns model loading and native
+inference; the registry thread remains the authority for job state, leases and
+publication. `NOMUSIC_SUPERVISED_WORKER=0` keeps the direct in-process path as a
+temporary rollback. Demucs/PyTorch selects MPS, CUDA or CPU. The current engine
+is named `mlx`, with `demucs` as an alias; it is not an MLX implementation.
+Cache metadata and completed chunks permit reuse. MP3/MP4 exports preserve
+sample-aware chunk concatenation and use FFmpeg.
 Published chunks use shared namespace leases, so playback can fetch them while a
 long job is still producing later chunks; clear and eviction retain the namespace
 until all readers and the processor release it.
@@ -30,9 +33,11 @@ until all readers and the processor release it.
 
 Ordinary shutdown stops new admission and quietly closes progress streams before
 draining active work. It has a bounded grace period and an immediate second-interrupt
-escape; this is still an in-process worker design. A startup interrupted during
-model download can resume from the shared model cache. App-owned abandoned staging
-files are cleaned without removing completed media or shared model-download partials.
+escape; forced exit terminates the supervised worker before the process exits, and
+the child watches its parent so a crashed server cannot leave native work behind.
+A startup interrupted during model download can resume from the shared model cache.
+App-owned abandoned staging files are cleaned without removing completed media or
+shared model-download partials.
 
 ### Playback ownership and memory
 
@@ -86,8 +91,9 @@ This tolerance does not stretch audio or correct larger source-duration mismatch
 The session owns a bounded processing lease as well as SSE reconnection. The
 lease is renewed independently of status transport, so switching between SSE
 and `/status` does not abandon work. An ordinary pause stops the heartbeat and
-retains the job for at most the 30-second lease; resuming re-submits the same
-cache key and reuses completed chunks. Disabling nomusic releases only that
+retains the job for the client lease plus the idle timeout (30 seconds and 10
+seconds by default); resuming re-submits the same cache key and reuses completed
+chunks. Disabling nomusic releases only that
 session's lease. If another tab has a lease, its work continues. Servers from
 before the interest protocol are supported temporarily through the existing
 SSE subscriber idle clock.
@@ -128,6 +134,11 @@ not resource or authorization guarantees for a public service.
 | `NOMUSIC_CHUNK_OVERLAP_SECONDS` | `0.5` | Separator context overlap |
 | `NOMUSIC_GPU_BATCH` | `2` | Maximum chunks per inference batch; retry with `1` after a GPU out-of-memory error |
 | `NOMUSIC_IDLE_TIMEOUT_SECONDS` | `10` | Abandon work after the last client lease and status subscriber leave; `0` disables |
+| `NOMUSIC_SUPERVISED_WORKER` | `true` | Run model inference in a restartable child process; set `false` only for rollback/debugging |
+| `NOMUSIC_MAX_QUEUED_JOBS` | `1` | Maximum queued jobs behind the active execution |
+| `NOMUSIC_EXECUTION_TIMEOUT_SECONDS` | `1800` | Maximum wall time for one supervised execution before a clear error |
+| `NOMUSIC_WORKER_CANCEL_GRACE_SECONDS` | `5` | Cooperative cancellation grace before a stuck child is replaced |
+| `NOMUSIC_WORKER_WARMUP_TIMEOUT_SECONDS` | `300` | Startup model-warmup deadline for the supervised child |
 | `NOMUSIC_SSE_KEEPALIVE_SECONDS` | `15` | Interval between SSE keep-alive comments |
 | `NOMUSIC_CLIENT_LEASE_SECONDS` | `30` | Maximum processing-interest lease; pause retention ends when it expires |
 | `NOMUSIC_CLIENT_HEARTBEAT_SECONDS` | `10` | Extension heartbeat interval while a session is active |
@@ -166,7 +177,7 @@ The local API has no user authentication. Interactive schemas are available at
 | GET | `/healthz` | `{ok: true}`: API reachability |
 | GET | `/readyz` | Startup readiness; 200 when ready, otherwise 503 |
 | GET | `/capabilities` | Engine/device/models/stems, defaults and cache configuration |
-| POST | `/process` | `{url, model?, keep_stems?, client_id?}` → `JobStatus`; a client id also acquires a bounded interest lease |
+| POST | `/process` | `{url, model?, keep_stems?, client_id?}` → `JobStatus`; a client id also acquires a bounded interest lease; `429` means the bounded queue is full |
 | POST | `/process/{job_id}/prioritize` | `{from_chunk}` → `{applied}`; prioritize pending chunks around a seek |
 | POST | `/process/{job_id}/interest` | `{client_id, lease_seconds?}` → lease; acquire or heartbeat one client's interest |
 | DELETE | `/process/{job_id}/interest?client_id=...` | Release only that client's interest; another client's lease is unaffected |
@@ -174,7 +185,7 @@ The local API has no user authentication. Interactive schemas are available at
 | GET | `/events/{job_id}` | SSE `JobStatus` updates; 204 for unknown job; planned shutdown closes without a fabricated error |
 | GET | `/chunk/{job_id}/{idx}` | OGG/Opus chunk; 425 while unavailable |
 | GET | `/audio/{job_id}` | Full OGG/Opus; `?format=mp3` transcodes; 425 before completion |
-| GET | `/video/{job_id}` | Original video with processed audio in MP4; `?max_height=N` requests a height limit; 425 before completion |
+| GET | `/video/{job_id}` | Original video with processed audio in MP4; `?max_height=N` requests a height limit; 425 before completion, 413/507 when policy or storage rejects it |
 | GET | `/video/{job_id}/progress` | `{phase, percent}` for preparation; pass the same `max_height` as the export |
 | GET | `/cache` | Cache path and storage statistics |
 | POST | `/cache/clear` | Remove processed media → `{deleted_bytes}` |

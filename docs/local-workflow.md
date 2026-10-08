@@ -43,7 +43,8 @@ play/pause intent) and **Return to original** (which explicitly restores the
 native track).
 
 Pausing normally closes the SSE stream and stops the heartbeat, but retains the
-job for up to the configured client lease (30 seconds by default). Playing again
+job for the configured client lease plus the idle timeout (30 + 10 seconds by
+default). Playing again
 re-acquires the same job and resumes from its valid cached chunks. Disabling or
 closing the session sends a client-scoped release; another tab or extension
 session holding a lease keeps the worker running.
