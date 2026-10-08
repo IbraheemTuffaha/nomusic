@@ -557,6 +557,7 @@ export class Session {
 
     if (status.state === "ready") {
       this._streamEnded = true;
+      this._stopInterestHeartbeat();
       this._closeEventStream();
     }
   }

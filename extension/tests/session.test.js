@@ -682,6 +682,18 @@ test("a failed final chunk retries after ready closes the status stream", async 
   assert.equal(s.chunks.get(0).buffer, audio);
 });
 
+test("ready stops the client interest heartbeat with the status stream", (t) => {
+  const s = makeSession();
+  t.after(() => s.dispose());
+  s._adoptJob({ job_id: "JOB", total_chunks: 1 });
+  s._configureInterest({
+    interest: { supported: true, lease_seconds: 30, heartbeat_seconds: 10 },
+  });
+  assert.notEqual(s._interestHeartbeatTimer, null);
+  s.handleStatus({ state: "ready", total_chunks: 1, ready_chunks: [0] });
+  assert.equal(s._interestHeartbeatTimer, null);
+});
+
 test("terminal chunk failure pauses while retaining original-audio suppression", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
   const s = makeSession();
