@@ -60,7 +60,8 @@ def _builder(spec, directory, progress, cancel):
     path = directory / f"built.{spec.format}"
     path.write_bytes(b"prepared")
     progress("encoding", 1.0)
-    return ExportArtifact(path, path.name, "application/octet-stream")
+    media = {"opus": "audio/ogg", "mp3": "audio/mpeg", "mp4": "video/mp4"}[spec.format]
+    return ExportArtifact(path, path.name, media)
 
 
 def _wait(registry, export_id, expected=ExportState.READY):
@@ -157,6 +158,9 @@ def test_http_export_api_serves_prepared_opus(client):
     )
     cache.chunk_path(job_id, 0).write_bytes(b"one")
     cache.chunk_path(job_id, 1).write_bytes(b"two")
+    # Keep this route test independent of the local ffmpeg encoder matrix; the
+    # format-specific pipeline tests cover real Ogg/Opus/MP3/MP4 output.
+    client.app.state.exports.builder = _builder
 
     response = client.post("/exports", json={"job_id": job_id, "format": "opus"})
     assert response.status_code in (200, 202)
@@ -170,5 +174,5 @@ def test_http_export_api_serves_prepared_opus(client):
     assert status["state"] == "ready"
     downloaded = client.get(f"/exports/{export_id}/download")
     assert downloaded.status_code == 200
-    assert downloaded.content == b"onetwo"
+    assert downloaded.content == b"prepared"
     assert downloaded.headers["content-type"].startswith("audio/ogg")

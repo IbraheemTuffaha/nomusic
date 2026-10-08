@@ -167,6 +167,19 @@ def mp3_transcode_cmd(chunk_files: list[tuple[Path, int]], dest: Path) -> list[s
     ]
 
 
+def opus_transcode_cmd(chunk_files: list[tuple[Path, int]], dest: Path) -> list[str]:
+    """Splice chunks through the decoder and write one sample-accurate Ogg/Opus file."""
+    n = len(chunk_files)
+    return [
+        *_FFMPEG_BASE,
+        *_audio_inputs(chunk_files),
+        "-filter_complex", _concat_chain(n) + "[aout]",
+        "-map", "[aout]",
+        "-c:a", "libopus", "-b:a", "96k",
+        "-f", "ogg", str(dest),
+    ]
+
+
 def mux_video_cmd(
     video: Path,
     chunk_files: list[tuple[Path, int]],
@@ -277,23 +290,12 @@ def build_export(cache, settings, spec, destination: Path, on_progress, cancel_e
             extension, media_type = "opus", "audio/ogg"
             final = destination / _safe_filename(meta.title, extension)
             part = final.with_suffix(final.suffix + ".part")
-            total = sum(size for _, size in chunk_files) or 1
-            written = 0
-            with part.open("wb") as out:
-                for path, _size in chunk_files:
-                    with path.open("rb") as source:
-                        while True:
-                            block = source.read(1024 * 1024)
-                            if not block:
-                                break
-                            if cancel_event.is_set():
-                                raise ExportBuildError("cancelled")
-                            out.write(block)
-                            written += len(block)
-                            on_progress("building", written / total)
-                out.flush()
-                os.fsync(out.fileno())
+            on_progress("encoding", 0.0)
+            _run_export_ffmpeg(opus_transcode_cmd(chunk_files, part))
+            if cancel_event.is_set():
+                raise ExportBuildError("cancelled")
             os.replace(part, final)
+            on_progress("encoding", 1.0)
             return ExportArtifact(final, final.name, media_type, final.stat().st_size)
 
         if spec.format == "mp3":

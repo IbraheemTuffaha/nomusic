@@ -24,6 +24,7 @@ from nomusic.pipeline.export import (
     complete_manifest,
     mp3_transcode_cmd,
     mux_video_cmd,
+    opus_transcode_cmd,
     snapshot_chunk_files,
 )
 from nomusic.pipeline.processor import (
@@ -630,6 +631,26 @@ def test_mp3_transcode_produces_playable_mp3(tmp_path):
     # timeline, so the duration reflects all of them (a regression guard against
     # byte-concatenation, which left the file unseekable).
     assert abs(_ffprobe_duration(out) - 6.0) < 0.3
+
+
+@pytest.mark.skipif(
+    not (_ffmpeg_has_encoder("libopus") and _has("ffprobe")),
+    reason="needs ffmpeg with libopus and ffprobe",
+)
+def test_opus_transcode_decodes_and_reencodes_one_complete_stream(tmp_path):
+    tone = tmp_path / "tone.wav"
+    _write_tone(tone, seconds=0.45)
+    chunk_files = []
+    for i in range(3):
+        c = tmp_path / f"chunk_{i:03d}.opus"
+        _make_opus_chunk(tone, c)
+        chunk_files.append((c, c.stat().st_size))
+
+    out = tmp_path / "full.opus"
+    subprocess.run(opus_transcode_cmd(chunk_files, out), check=True, capture_output=True)
+    streams = _ffprobe_streams(out)
+    assert streams == [{"codec_name": "opus", "codec_type": "audio"}]
+    assert abs(_ffprobe_duration(out) - 1.35) < 0.1
 
 
 @pytest.mark.skipif(
