@@ -4,6 +4,15 @@ Only the exact fixture URL receives generated local media; all other URLs are
 rejected before acquisition. Processing, Demucs, chunk encoding, SSE, exports,
 readiness, and shutdown remain real. This is not a deployment entry point and
 does not validate YouTube acquisition. Prefetch the pinned model before use.
+
+The fixture adapter is intentionally installed in this parent process. The
+production supervised worker uses ``spawn`` and must not inherit arbitrary test
+monkeypatches, so this controlled smoke selects the explicit direct-path test
+rollback; the supervisor's termination/restart contract is covered by the
+isolated worker suite. Production defaults remain supervised. The extended
+180-second fixture also uses a ten-minute lease so CPU inference itself can
+exceed the normal pause-retention window; explicit lease expiry is covered by
+the backend unit tests.
 """
 
 from __future__ import annotations
@@ -56,7 +65,7 @@ def install_adapter(fixture: Path, duration: float, record) -> None:
             record("source_rejected")
             raise ValueError("The controlled smoke backend only accepts its exact generated fixture URL")
 
-    def metadata(url: str):
+    def metadata(url: str, *, limits=None):
         check_url(url)
         record("fixture_metadata")
         return downloader.VideoMetadata(
@@ -85,11 +94,11 @@ def install_adapter(fixture: Path, duration: float, record) -> None:
             check_url(self.url)
             return copy_fixture(self.out_dir, "source.mp4", progress_hook)
 
-    def audio(url, out_dir, *, progress_hook=None):
+    def audio(url, out_dir, *, progress_hook=None, limits=None):
         check_url(url)
         return copy_fixture(out_dir, "source.mp4", progress_hook)
 
-    def video(url, out_dir, *, max_height=None, progress_hook=None):
+    def video(url, out_dir, *, max_height=None, progress_hook=None, limits=None):
         check_url(url)
         if max_height is not None and max_height < 360:
             raise ValueError("The generated fixture supports 360p or higher export requests")
@@ -143,6 +152,11 @@ def main() -> None:
             "NOMUSIC_CACHE_DIR": str(cache),
             "NOMUSIC_ENGINE": "demucs",
             "NOMUSIC_DEVICE": "cpu",
+            # The fixture adapter is installed in this process. The production
+            # supervisor intentionally runs acquisition in a spawned child, so
+            # keep this controlled smoke path on the in-process test seam.
+            "NOMUSIC_SUPERVISED_WORKER": "0",
+            "NOMUSIC_CLIENT_LEASE_SECONDS": "600",
             "NOMUSIC_RELOAD": "0",
             "NOMUSIC_CACHE_TTL_DAYS": "0",
             "NOMUSIC_CACHE_SWEEP_INTERVAL_SECONDS": "0",

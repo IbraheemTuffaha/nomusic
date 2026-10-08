@@ -10,8 +10,10 @@ The endpoints live in :mod:`nomusic.routes` (system / jobs / media):
   GET  /healthz
   GET  /readyz
   GET  /capabilities
-  POST /process              {url, model?, keep_stems?} -> {job_id, ...}
+  POST /process              {url, model?, keep_stems?, client_id?} -> {job_id, ...}
   POST /process/{job_id}/prioritize {from_chunk} -> {applied}
+  POST /process/{job_id}/interest {client_id, lease_seconds?} -> lease
+  DELETE /process/{job_id}/interest?client_id=... -> release that client lease
   GET  /status/{job_id}      -> JobStatus
   GET  /events/{job_id}      -> text/event-stream (SSE status updates)
   GET  /chunk/{job_id}/{idx} -> audio/ogg (425 if not yet ready)

@@ -18,13 +18,21 @@ import pytest
 import soundfile as sf
 
 from nomusic.engines.base import Engine, EngineCapabilities, SeparationResult
-from nomusic.pipeline.cache import JobCache
+from nomusic.pipeline.cache import CacheMeta, JobCache
+from nomusic.pipeline.downloader import ResourceLimitExceeded, ResourceLimits
 from nomusic.pipeline.export import (
+    complete_manifest,
     mp3_transcode_cmd,
     mux_video_cmd,
     snapshot_chunk_files,
 )
-from nomusic.pipeline.processor import Processor, RunHooks, plan_chunks
+from nomusic.pipeline.processor import (
+    ChunkPlan,
+    Processor,
+    RunHooks,
+    _ChunkWork,
+    plan_chunks,
+)
 
 
 def test_plan_chunks_covers_full_duration():
@@ -72,6 +80,47 @@ def test_plan_chunks_rejects_overlap_eq_chunk():
     except ValueError:
         return
     raise AssertionError("expected ValueError for overlap == chunk")
+
+
+def test_publish_check_fences_chunk_before_cache_publication(tmp_path, monkeypatch):
+    cache = JobCache(tmp_path / "cache")
+    key = "a" * 16
+    cache.save_meta(
+        key,
+        CacheMeta(
+            url="https://example.test/video",
+            model="fake",
+            keep_stems=["vocals"],
+            duration_seconds=1,
+            chunk_seconds=1,
+            chunk_overlap_seconds=0,
+            total_chunks=1,
+        ),
+    )
+    proc = Processor(None, cache, chunk_seconds=1, chunk_overlap_seconds=0)
+    audio = np.zeros((441, 2), dtype=np.float32)
+    result = SeparationResult(
+        stems={name: audio for name in ("vocals", "drums", "bass", "other")},
+        sample_rate=44100,
+        duration_seconds=0.01,
+    )
+    work = _ChunkWork(
+        plan=ChunkPlan(0, 0, 0.01, 0, 0.01),
+        prepared=None,
+        t_slice=0,
+        t_decode=0,
+        result=result,
+    )
+    writes = []
+    monkeypatch.setattr(proc, "_write_chunk", lambda *args, **kwargs: writes.append(True))
+
+    def stale():
+        raise RuntimeError("stale generation")
+
+    with pytest.raises(RuntimeError, match="stale generation"):
+        proc._finish_chunk(work, key, ["vocals"], None, stale)
+    assert writes == []
+    assert cache.load_meta(key).chunks_ready == []
 
 
 def test_mix_stems_gain_is_uniform_when_peak_would_clip():
@@ -349,6 +398,25 @@ def test_progressive_source_cancel_unblocks_source_for(tmp_path):
         dl.source_for(plan, overlap=0.5)
 
 
+def test_progressive_source_rejects_and_removes_short_completed_file(tmp_path, monkeypatch):
+    from nomusic.pipeline import processor as proc
+
+    source = tmp_path / "source.wav"
+    _write_tone(source, seconds=2.0)
+    monkeypatch.setattr(
+        proc, "download_source", lambda *args, **kwargs: source
+    )
+    dl = proc._ProgressiveSource(
+        "fake://v", tmp_path, duration=9.5, ui_hook=None,
+        limits=ResourceLimits(final_chunk_tolerance_seconds=1.0),
+    )
+    dl.start()
+    dl.close()
+    with pytest.raises(ResourceLimitExceeded, match="metadata requires"):
+        dl.raise_if_error()
+    assert not source.exists()
+
+
 def test_source_fetcher_download_propagates_cancel_without_retry(tmp_path, monkeypatch):
     # When the progress hook raises DownloadCancelled to abort an in-flight
     # download, SourceFetcher.download must propagate it — NOT catch it in the
@@ -511,6 +579,21 @@ def test_snapshot_chunk_files_returns_contiguous_prefix(tmp_path):
     ]
     # Sizes are captured in the same pass and match what's on disk.
     assert [size for _, size in files] == [len(b"chunk0"), len(b"chunk1"), len(b"chunk2")]
+
+
+@pytest.mark.parametrize("ready, complete, expected", [
+    ([0, 1, 2], True, True),
+    ([0, 2], True, False),
+    ([0, 1, 4], True, False),
+    ([0, 1, 2], False, False),
+])
+def test_complete_manifest_requires_every_chunk(ready, complete, expected):
+    meta = CacheMeta(
+        url="fixture://video", model="fake", keep_stems=["vocals"],
+        duration_seconds=3, chunk_seconds=1, chunk_overlap_seconds=0,
+        total_chunks=3, chunks_ready=ready, complete=complete,
+    )
+    assert complete_manifest(meta) is expected
 
 
 def _make_opus_chunk(wav: Path, out: Path) -> None:
@@ -742,7 +825,7 @@ def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):
     monkeypatch.setattr(
         registry,
         "_run",
-        lambda key, url, model, keep_stems, owner: None,
+        lambda execution, url, model, keep_stems: None,
     )
 
     status = registry.submit("fake://video", model="fake", keep_stems=["vocals"])

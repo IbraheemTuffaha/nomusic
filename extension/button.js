@@ -401,8 +401,6 @@ export class Button {
     { label: "MP3 — audio only", format: "mp3", height: 0 },
     { section: "Video (MP4)" },
     { label: "Best available", format: "mp4", height: 0 },
-    { label: "2160p · 4K", format: "mp4", height: 2160 },
-    { label: "1440p", format: "mp4", height: 1440 },
     { label: "1080p", format: "mp4", height: 1080 },
     { label: "720p", format: "mp4", height: 720 },
     { label: "480p", format: "mp4", height: 480 },

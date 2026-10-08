@@ -1,0 +1,161 @@
+"""Process-supervisor and bounded-admission regressions for M3-T2."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import multiprocessing as mp
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from nomusic.jobs import JobQueueFull, JobRegistry
+from nomusic.pipeline.processor import RunHooks
+from nomusic.worker import (
+    SupervisedModelWorker,
+    WorkerAbandoned,
+    _ChildCancelled,
+    _ChildChunkProvider,
+)
+from backend.tests.worker_targets import fixture_worker, stuck_worker
+
+
+def test_child_provider_honors_cancel_and_priority():
+    commands = mp.Queue()
+    provider = _ChildChunkProvider(commands)
+    provider.configure(5, [0])
+    assert provider.next() == 1
+    commands.put(("prioritize", 4))
+    time.sleep(0.05)  # multiprocessing.Queue uses a feeder thread
+    assert provider.next() == 4
+    commands.put(("cancel",))
+    time.sleep(0.05)
+    with pytest.raises(_ChildCancelled):
+        provider.next()
+
+
+def test_child_provider_stashes_only_current_run_priority_until_configured():
+    commands = mp.Queue()
+    provider = _ChildChunkProvider(commands, run_id=7)
+    commands.put(("prioritize", 6, 4))
+    commands.put(("prioritize", 7, 4))
+    time.sleep(0.05)
+    provider.poll()
+    provider.configure(5, [0])
+    assert provider.next() == 4
+
+
+def test_child_provider_applies_priority_received_before_configuration():
+    commands = mp.Queue()
+    provider = _ChildChunkProvider(commands, run_id=7)
+    commands.put(("prioritize", 7, 4))
+    time.sleep(0.05)
+    provider.poll()
+    provider.configure(5, [0])
+    assert provider.next() == 4
+
+
+def test_supervisor_terminates_stuck_child_and_restarts(tmp_path):
+    settings = SimpleNamespace(
+        engine_name="fixture",
+        cache_dir=Path(tmp_path),
+        chunk_seconds=10.0,
+        chunk_overlap_seconds=0.5,
+        keep_source_after_complete=False,
+        progressive_download=False,
+    )
+    worker = SupervisedModelWorker(
+        settings,
+        execution_timeout_seconds=30,
+        cancel_grace_seconds=0.1,
+        target=stuck_worker,
+    )
+    started = threading.Event()
+    try:
+        worker.start()
+        assert worker.alive
+
+        def abort():
+            started.set()
+            raise WorkerAbandoned("test cancel")
+
+        with pytest.raises(WorkerAbandoned, match="test cancel"):
+            worker.run(
+                "key",
+                "https://example.test/video",
+                model="fixture",
+                keep_stems=["vocals"],
+                hooks=RunHooks(),
+                abort_check=abort,
+            )
+        assert started.is_set()
+        assert not worker.alive
+
+        # A subsequent admission gets a new process instead of inheriting the
+        # stuck native state.
+        worker.start()
+        assert worker.alive
+    finally:
+        worker.shutdown()
+    assert not worker.alive
+
+
+def test_supervisor_runs_real_child_pipeline_and_can_run_again(tmp_path):
+    settings = SimpleNamespace(
+        engine_name="fixture",
+        cache_dir=Path(tmp_path),
+        chunk_seconds=1.0,
+        chunk_overlap_seconds=0.0,
+        keep_source_after_complete=False,
+        progressive_download=False,
+    )
+    worker = SupervisedModelWorker(
+        settings, execution_timeout_seconds=30, cancel_grace_seconds=1,
+        target=fixture_worker,
+    )
+    try:
+        worker.start()
+        result_key = None
+        for _ in range(2):
+            key = worker.run(
+                "fixture-key",
+                "fixture://video",
+                model="fixture",
+                keep_stems=["vocals"],
+                hooks=RunHooks(),
+            )
+            assert key
+            if result_key is None:
+                result_key = key
+            else:
+                assert key == result_key
+        assert result_key is not None
+        assert (Path(tmp_path) / result_key / "chunk_000.opus").exists()
+    finally:
+        worker.shutdown()
+
+
+def test_registry_rejects_excess_queued_work(monkeypatch):
+    class Cache:
+        def key(self, url, *_args, **_kwargs):
+            return url
+
+        def load_meta(self, _key):
+            return None
+
+    class Processor:
+        chunk_seconds = 10.0
+        chunk_overlap_seconds = 0.5
+
+        def run(self, *_args, **_kwargs):
+            time.sleep(1)
+
+    registry = JobRegistry(Processor(), Cache(), max_queued_jobs=1)
+    try:
+        registry.submit("one", model="fake", keep_stems=["vocals"])
+        registry.submit("two", model="fake", keep_stems=["vocals"])
+        with pytest.raises(JobQueueFull):
+            registry.submit("three", model="fake", keep_stems=["vocals"])
+    finally:
+        registry.shutdown()

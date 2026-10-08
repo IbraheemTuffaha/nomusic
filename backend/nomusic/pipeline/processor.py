@@ -39,10 +39,14 @@ from nomusic.engines.base import Engine
 from .cache import CacheMeta, JobCache
 from .downloader import (
     DownloadCancelled as _DownloadCancelled,
+    ResourceLimitExceeded,
+    ResourceLimits,
     SourceFetcher,
     VideoMetadata,
+    _remove_media_outputs,
     download_source,
     slice_source,
+    validate_source_file,
 )
 
 # Opus only supports 8/12/16/24/48 kHz; demucs hands us 44.1 kHz. ffmpeg
@@ -98,6 +102,10 @@ class RunHooks:
       when ``None`` the processor uses a FIFO over remaining chunks.
     * ``abort_check`` — raises to abort; polled during long waits (the
       progressive-download gate has no chunk boundary to abort at otherwise).
+    * ``publish_check`` — raises when this execution no longer owns the cache
+      generation. It is checked immediately before metadata, chunk and
+      completion publication so a replaced worker cannot repopulate a successor
+      cache after cancellation.
     * ``on_wait_for_download`` — fired while a chunk blocks on the progressive
       download, with the current download fraction.
     """
@@ -107,6 +115,8 @@ class RunHooks:
     on_download_progress: DownloadProgressCb | None = None
     next_chunk_provider: NextChunkProvider | None = None
     abort_check: Callable[[], None] | None = None
+    publish_check: Callable[[], None] | None = None
+    cache_generation: str | None = None
     on_wait_for_download: Callable[[float | None], None] | None = None
 
 
@@ -204,7 +214,8 @@ class _ProgressiveSource:
     """
 
     def __init__(
-        self, url: str, out_dir: Path, duration: float, ui_hook, fetcher=None
+        self, url: str, out_dir: Path, duration: float, ui_hook,
+        fetcher=None, limits: ResourceLimits | None = None,
     ) -> None:
         self._url = url
         self._out_dir = out_dir
@@ -213,6 +224,7 @@ class _ProgressiveSource:
         # When set, the worker already extracted metadata in this session; the
         # background download reuses it (no second extraction). None on resume.
         self._fetcher = fetcher
+        self._limits = limits
         self._lock = threading.Lock()
         self._available = 0.0
         self._tmpfile: Optional[str] = None
@@ -300,12 +312,16 @@ class _ProgressiveSource:
                 final = self._fetcher.download(progress_hook=self._hook)
             else:
                 final = download_source(
-                    self._url, self._out_dir, progress_hook=self._hook
+                    self._url, self._out_dir, progress_hook=self._hook,
+                    limits=self._limits,
                 )
+            validate_source_file(final, self._duration, self._limits)
             with self._lock:
                 self._final = final
                 self._available = self._duration
         except BaseException as exc:  # surfaced to the worker via raise_if_error
+            if isinstance(exc, ResourceLimitExceeded):
+                _remove_media_outputs(self._out_dir, "source", ("m4a", "webm", "opus", "ogg", "mp3", "aac", "mp4", "wav"))
             self._error = exc
         finally:
             self._done.set()
@@ -379,6 +395,7 @@ class Processor:
         chunk_overlap_seconds: float,
         keep_source_after_complete: bool = False,
         progressive: bool = False,
+        limits: ResourceLimits | None = None,
     ) -> None:
         self.engine = engine
         self.cache = cache
@@ -386,6 +403,7 @@ class Processor:
         self.chunk_overlap_seconds = chunk_overlap_seconds
         self.keep_source_after_complete = keep_source_after_complete
         self.progressive = progressive
+        self.limits = limits
 
     # -- planning ------------------------------------------------------------
 
@@ -395,6 +413,8 @@ class Processor:
         *,
         model: str,
         keep_stems: list[str],
+        publish_check: Callable[[], None] | None = None,
+        cache_generation: str | None = None,
     ) -> tuple[str, CacheMeta, VideoMetadata, list[ChunkPlan], Optional[SourceFetcher]]:
         """Probe the video, build/refresh the cache meta, and plan the chunks.
 
@@ -421,6 +441,12 @@ class Processor:
         # the cached meta. The URL is part of the cache key, so the cached
         # duration can't belong to a different video.
         if existing and existing.total_chunks > 0 and existing.duration_seconds > 0:
+            if self.limits is not None:
+                if existing.duration_seconds > self.limits.max_duration_seconds:
+                    raise RuntimeError(
+                        "cached metadata exceeds the current duration limit; "
+                        "clear the entry and retry"
+                    )
             plans = plan_chunks(
                 existing.duration_seconds,
                 self.chunk_seconds,
@@ -434,13 +460,21 @@ class Processor:
                     extractor=existing.extractor,
                     webpage_url=url,
                 )
-                self.cache.save_meta(key, existing)
+                if publish_check:
+                    publish_check()
+                with self.cache.publication(key, cache_generation):
+                    self.cache.save_meta(key, existing)
                 return key, existing, info, plans, None
 
         # First run: extract metadata in a session we'll also download from, so
         # the JS-challenge extraction is paid once, not once here + again at
         # download time.
+        # Keep the constructor compatible with small local SourceFetcher
+        # doubles and older adapters; the production implementation exposes a
+        # mutable policy attribute for this setup boundary.
         fetcher = SourceFetcher(url, self.cache.source_dir(url))
+        if self.limits is not None and hasattr(fetcher, "limits"):
+            fetcher.limits = self.limits
         try:
             info = fetcher.extract()
             plans = plan_chunks(
@@ -466,7 +500,10 @@ class Processor:
                     title=info.title,
                     extractor=info.extractor,
                 )
-            self.cache.save_meta(key, meta)
+            if publish_check:
+                publish_check()
+            with self.cache.publication(key, cache_generation):
+                self.cache.save_meta(key, meta)
             return key, meta, info, plans, fetcher
         except BaseException:
             fetcher.close()
@@ -513,12 +550,31 @@ class Processor:
         on_download_progress = hooks.on_download_progress
         next_chunk_provider = hooks.next_chunk_provider
         abort_check = hooks.abort_check
+        publish_check = hooks.publish_check
+        cache_generation = hooks.cache_generation
         on_wait_for_download = hooks.on_wait_for_download
 
         if abort_check:
             abort_check()
+        # Hold the content namespace from metadata publication through the
+        # final chunk/completion write. This is a shared lifetime lease: each
+        # chunk is published atomically, so readers may stream ready chunks
+        # while later chunks are still being processed. Eviction and
+        # /cache/clear try an exclusive lock and therefore skip this directory
+        # for the whole run.
+        provisional_key = self.cache.key(
+            url,
+            model,
+            keep_stems,
+            chunk_seconds=self.chunk_seconds,
+            chunk_overlap_seconds=self.chunk_overlap_seconds,
+        )
+        job_lease = self.cache.job_lease(provisional_key, shared=True)
+        resources.callback(job_lease.close)
         key, meta, info, plans, fetcher = self.prepare_job(
-            url, model=model, keep_stems=keep_stems
+            url, model=model, keep_stems=keep_stems,
+            publish_check=publish_check,
+            cache_generation=cache_generation,
         )
         if fetcher is not None:
             # Covers preparation hooks, cache hits and executor setup failures.
@@ -528,12 +584,17 @@ class Processor:
             on_probed(info, plans, meta)
         if abort_check:
             abort_check()
+        if publish_check:
+            publish_check()
 
         if meta.complete:
             log.info("Cache hit for %s (%d chunks)", url, meta.total_chunks)
             if on_download_progress:
                 on_download_progress(1.0)
             return key
+
+        source_lease = self.cache.source_lease(url)
+        resources.callback(source_lease.close)
 
         # Download the full source once. Each chunk is sliced from this file
         # so cuts are sample-accurate (yt-dlp's per-range download cuts at the
@@ -551,13 +612,16 @@ class Processor:
             except Exception:  # never let a UI hook break the pipeline
                 log.debug("download progress hook raised", exc_info=True)
 
+        if publish_check:
+            publish_check()
         source_dir = self.cache.source_dir(url)
         dl: _ProgressiveSource | None = None
         if self.progressive:
             # Download on a background thread; ``source_for`` blocks per chunk
             # until enough of the timeline is on disk to slice it.
             dl = _ProgressiveSource(
-                url, source_dir, info.duration_seconds, _yt_hook, fetcher=fetcher
+                url, source_dir, info.duration_seconds, _yt_hook,
+                fetcher=fetcher, limits=self.limits,
             )
             source_for = lambda plan: dl.source_for(
                 plan, self.chunk_overlap_seconds, abort_check, on_wait_for_download
@@ -579,7 +643,17 @@ class Processor:
                 if fetcher is not None:
                     full = fetcher.download(progress_hook=_sync_download_hook)
                 else:
-                    full = download_source(url, source_dir, progress_hook=_sync_download_hook)
+                    full = download_source(
+                        url, source_dir,
+                        progress_hook=_sync_download_hook,
+                        limits=self.limits,
+                    )
+                policy = (
+                    self.limits
+                    if fetcher is None or hasattr(fetcher, "limits")
+                    else None
+                )
+                validate_source_file(full, info.duration_seconds, policy)
             except _DownloadCancelled:
                 # Restore the caller's control exception (WorkerAbandoned for
                 # jobs), keeping cancellation distinct from processing failure.
@@ -667,7 +741,9 @@ class Processor:
         # at identical per-chunk output. Decode stays on one thread (so the
         # provider's skip-check is race-free) but we keep BATCH decodes queued so
         # a full batch is usually ready when the GPU frees up.
-        batch_size = max(1, SETTINGS.gpu_batch)
+        batch_cap = self.limits.max_inference_batch if self.limits else SETTINGS.gpu_batch
+        prefetch_cap = self.limits.max_prefetch_chunks if self.limits else batch_cap
+        batch_size = max(1, min(SETTINGS.gpu_batch, batch_cap, prefetch_cap))
         decode_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nm-decode")
         write_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nm-write")
         write_futures: list = []
@@ -733,7 +809,13 @@ class Processor:
                     # Hand mix+write+record to the consumer; overlaps the next GPU.
                     write_futures.append(
                         write_pool.submit(
-                            self._finish_chunk, work, key, keep_stems, on_progress
+                            self._finish_chunk,
+                            work,
+                            key,
+                            keep_stems,
+                            on_progress,
+                            publish_check,
+                            cache_generation,
                         )
                     )
                 # Bound the write backlog and surface any consumer error early.
@@ -764,12 +846,18 @@ class Processor:
             self.cache.chunk_path(key, p.index).exists() for p in plans
         )
         if all_present:
-            self.cache.mark_complete(key)
+            if publish_check:
+                publish_check()
+            with self.cache.publication(key, cache_generation):
+                self.cache.mark_complete(key)
             if not self.keep_source_after_complete:
                 # Source has served its purpose. Re-watches read straight from
                 # the chunk Opus files; only a stems/model change would need
                 # it back, and that re-downloads transparently.
-                self.cache.drop_source(url)
+                if publish_check:
+                    publish_check()
+                with self.cache.publication(key, cache_generation):
+                    self.cache.drop_source(url)
 
         return key
 
@@ -814,8 +902,14 @@ class Processor:
             with tempfile.TemporaryDirectory(prefix="decode-", dir=self.cache.scratch.path) as tmp_str:
                 raw = Path(tmp_str) / f"raw_{plan.index:03d}.wav"
                 t0 = time.perf_counter()
-                slice_source(src, raw, start=plan.start, end=plan.end,
-                             pass_fds=(self.cache.scratch.fd,))
+                slice_kwargs = {
+                    "start": plan.start,
+                    "end": plan.end,
+                    "pass_fds": (self.cache.scratch.fd,),
+                }
+                if self.limits is not None:
+                    slice_kwargs["limits"] = self.limits
+                slice_source(src, raw, **slice_kwargs)
                 t_slice = time.perf_counter() - t0
                 t1 = time.perf_counter()
                 prepared = self.engine.prepare(raw, model=model)
@@ -860,6 +954,8 @@ class Processor:
         key: str,
         keep_stems: list[str],
         on_progress: ProgressCb | None,
+        publish_check: Callable[[], None] | None = None,
+        cache_generation: str | None = None,
     ) -> None:
         """Consumer stage: mix the kept stems, encode + write the chunk, record
         it, and emit progress. Runs on the single write thread, so it's the only
@@ -867,10 +963,15 @@ class Processor:
         plan = work.plan
         t2 = time.perf_counter()
         mixed = self._mix_stems(work.result.stems, keep_stems)
-        self._write_chunk(mixed, work.result.sample_rate, key, plan)
+        if publish_check:
+            publish_check()
+        self._write_chunk(
+            mixed, work.result.sample_rate, key, plan,
+            publish_check=publish_check,
+            cache_generation=cache_generation,
+        )
         t_mix_write = time.perf_counter() - t2
 
-        self.cache.record_chunk(key, plan.index)
         if on_progress:
             refreshed = self.cache.load_meta(key)
             if refreshed:
@@ -946,6 +1047,9 @@ class Processor:
         sample_rate: int,
         key: str,
         plan: ChunkPlan,
+        *,
+        publish_check: Callable[[], None] | None = None,
+        cache_generation: str | None = None,
     ) -> None:
         """Write ``chunk_NNN.opus`` covering exactly ``[play_start, play_end]``.
 
@@ -984,7 +1088,15 @@ class Processor:
         with tempfile.TemporaryDirectory(prefix="chunk-", dir=self.cache.scratch.path) as work:
             tmp_path = Path(work) / "chunk.part"
             _encode_opus(trimmed, sample_rate, tmp_path, pass_fds=(self.cache.scratch.fd,))
-            tmp_path.replace(out)
+            if self.limits is not None and tmp_path.stat().st_size > self.limits.max_chunk_bytes:
+                raise ResourceLimitExceeded(
+                    f"encoded chunk exceeds the {self.limits.max_chunk_bytes} byte limit"
+                )
+            if publish_check:
+                publish_check()
+            with self.cache.publication(key, cache_generation):
+                tmp_path.replace(out)
+                self.cache.record_chunk(key, plan.index)
 
 
 

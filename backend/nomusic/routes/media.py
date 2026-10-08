@@ -21,10 +21,13 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
+from nomusic.config import SETTINGS
 from nomusic.pipeline import downloader
-from nomusic.pipeline.cache import CHUNK_MEDIA_TYPE
+from nomusic.pipeline.cache import CHUNK_MEDIA_TYPE, StorageLimitExceeded
+from nomusic.pipeline.downloader import ResourceLimitExceeded
 from nomusic.pipeline.export import (
     MP4_COPYABLE_VCODECS,
+    complete_manifest,
     mp3_transcode_cmd,
     mux_video_cmd,
     snapshot_chunk_files,
@@ -46,6 +49,13 @@ _STREAM_BLOCK_BYTES = 65536
 # hanging the worker. (ffprobe's shorter timeout lives with the probe helpers in
 # pipeline/export.py.)
 _FFMPEG_TIMEOUT_SECONDS = 3600.0
+
+
+def _export_reservation(chunk_files, *, cap: int, extra_bytes: int = 0) -> int:
+    """Reserve a bounded estimate instead of the maximum for every export."""
+    source_bytes = sum(size for _, size in chunk_files)
+    estimate = max(1, source_bytes * 2 + max(0, extra_bytes))
+    return min(cap, estimate)
 
 
 def _run_ffmpeg(cmd: list[str], *, pass_fds: tuple[int, ...] = ()) -> None:
@@ -185,10 +195,21 @@ def chunk(job_id: str, chunk_idx: int, request: Request) -> FileResponse:
             detail="chunk not ready",
             headers={"Cache-Control": "no-store"},
         )
+    # Chunks are atomically published one at a time. A shared lease keeps the
+    # namespace alive without waiting for the processor's lifetime lease, so
+    # progressive playback can consume ready chunks during a long job.
+    lease = cache.job_lease(job_id, shared=True)
+    try:
+        if not path.exists():
+            raise HTTPException(status_code=425, detail="chunk not ready")
+    except BaseException:
+        lease.close()
+        raise
     return FileResponse(
         str(path),
         media_type=CHUNK_MEDIA_TYPE,
         headers={"Cache-Control": "public, max-age=86400"},
+        background=BackgroundTask(lease.close),
     )
 
 
@@ -214,7 +235,7 @@ def audio(job_id: str, request: Request, format: str = "opus") -> Response:
     meta = cache.load_meta(job_id)
     if meta is None:
         raise HTTPException(status_code=404, detail="unknown job_id")
-    if not meta.complete:
+    if not complete_manifest(meta):
         raise HTTPException(status_code=425, detail="full audio not ready")
 
     # Snapshot the contiguous run of chunk files ONCE. The advertised
@@ -222,7 +243,13 @@ def audio(job_id: str, request: Request, format: str = "opus") -> Response:
     # disk; computing them in two passes lets a gap (or a concurrent TTL
     # sweep / cache clear) advertise more bytes than _gen actually yields,
     # which clients read as a truncated/hung response.
-    chunk_files = snapshot_chunk_files(cache, job_id, meta.total_chunks)
+    lease = cache.job_lease(job_id, shared=True)
+    chunk_files = snapshot_chunk_files(
+        cache, job_id, meta.total_chunks, require_complete=True
+    )
+    if not chunk_files:
+        lease.close()
+        raise HTTPException(status_code=425, detail="full audio not ready")
 
     if format == "mp3":
         if not chunk_files:
@@ -236,18 +263,31 @@ def audio(job_id: str, request: Request, format: str = "opus") -> Response:
         # FileResponse and delete the dir once the response is sent. A
         # single up-front transcode (rather than a streaming pipe) keeps
         # this simple and is fine for a local single-user backend.
+        try:
+            reservation = cache.reserve(
+                _export_reservation(chunk_files, cap=SETTINGS.max_export_bytes)
+            )
+        except StorageLimitExceeded as exc:
+            lease.close()
+            raise HTTPException(status_code=507, detail=str(exc)) from exc
         tmp_dir = Path(tempfile.mkdtemp(prefix="mp3-", dir=cache.scratch.path))
         try:
             out = tmp_dir / "full.mp3"
             _run_ffmpeg(mp3_transcode_cmd(chunk_files, out), pass_fds=(cache.scratch.fd,))
         except BaseException:
+            reservation.release()
+            lease.close()
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
+        def cleanup_mp3() -> None:
+            reservation.release()
+            lease.close()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         return FileResponse(
             str(out),
             media_type="audio/mpeg",
             headers={"Cache-Control": "no-store"},
-            background=BackgroundTask(shutil.rmtree, tmp_dir, ignore_errors=True),
+            background=BackgroundTask(cleanup_mp3),
         )
 
     def _gen():
@@ -268,7 +308,8 @@ def audio(job_id: str, request: Request, format: str = "opus") -> Response:
     if total:
         headers["Content-Length"] = str(total)
     return StreamingResponse(
-        _gen(), media_type=CHUNK_MEDIA_TYPE, headers=headers
+        _gen(), media_type=CHUNK_MEDIA_TYPE, headers=headers,
+        background=BackgroundTask(lease.close),
     )
 
 
@@ -298,17 +339,23 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
     meta = cache.load_meta(job_id)
     if meta is None:
         raise HTTPException(status_code=404, detail="unknown job_id")
-    if not meta.complete:
+    if not complete_manifest(meta):
         raise HTTPException(status_code=425, detail="full audio not ready")
 
-    chunk_files = snapshot_chunk_files(cache, job_id, meta.total_chunks)
+    lease = cache.job_lease(job_id, shared=True)
+    chunk_files = snapshot_chunk_files(
+        cache, job_id, meta.total_chunks, require_complete=True
+    )
     if not chunk_files:
+        lease.close()
         raise HTTPException(status_code=425, detail="full audio not ready")
 
     progress = request.app.state.export_progress
     progress_key = progress.key(job_id, max_height)
     progress.set(progress_key, "downloading", 0.0)
     tmp_dir: Optional[Path] = None
+    video_lease = None
+    reservation = None
     try:
         # --- Phase 1: fetch the video stream (cached per url+resolution) ---
         def _dl_hook(d: dict[str, object]) -> None:
@@ -321,12 +368,18 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
                 progress.set(progress_key, "downloading", 100.0)
 
         try:
+            video_lease = cache.video_lease(meta.url, max_height)
             video_path = downloader.download_video(
                 meta.url,
                 cache.video_dir(meta.url, max_height),
                 max_height=max_height,
                 progress_hook=_dl_hook,
+                limits=downloader.limits_from_settings(SETTINGS),
             )
+        except (StorageLimitExceeded, ResourceLimitExceeded) as exc:
+            log.warning("video download rejected by local resource policy for %s: %s", job_id, exc)
+            status_code = 507 if isinstance(exc, StorageLimitExceeded) else 413
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
         except Exception as exc:
             # yt-dlp failures are the user's URL going stale / network
             # issues, not a server bug — surface them as a 502.
@@ -334,6 +387,16 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
             raise HTTPException(status_code=502, detail=f"video download failed: {exc}")
 
         # --- Phase 2: mux the stripped audio over the video ---
+        try:
+            reservation = cache.reserve(
+                _export_reservation(
+                    chunk_files,
+                    cap=SETTINGS.max_export_bytes,
+                    extra_bytes=video_path.stat().st_size,
+                )
+            )
+        except StorageLimitExceeded as exc:
+            raise HTTPException(status_code=507, detail=str(exc)) from exc
         progress.set(progress_key, "encoding", 0.0)
         tmp_dir = Path(tempfile.mkdtemp(prefix="mp4-", dir=cache.scratch.path))
         out = tmp_dir / "full.mp4"
@@ -367,6 +430,11 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
             )
     except BaseException:
         progress.clear(progress_key)
+        if reservation is not None:
+            reservation.release()
+        if video_lease is not None:
+            video_lease.close()
+        lease.close()
         if tmp_dir is not None:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
@@ -375,6 +443,11 @@ def video(job_id: str, request: Request, max_height: Optional[int] = None) -> Re
 
     def _cleanup() -> None:
         progress.clear(progress_key)
+        if reservation is not None:
+            reservation.release()
+        if video_lease is not None:
+            video_lease.close()
+        lease.close()
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return FileResponse(

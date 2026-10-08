@@ -21,7 +21,9 @@ check YouTube availability or perform inference on each request. The extension's
 
 ## Playback and settings
 
-Click nomusic on the video and wait for processed playback. Try pause/resume and
+Click nomusic on the video and wait for processed playback. The extension keeps
+one bounded client lease alive separately from the status stream. Try pause/resume
+and
 a backward/forward seek, allowing processing to catch up. CPU processing may be
 slower than playback. The toolbar popup saves settings automatically:
 
@@ -40,18 +42,32 @@ recovery panel offers **Retry** (which preserves the current volume and
 play/pause intent) and **Return to original** (which explicitly restores the
 native track).
 
+Pausing normally closes the SSE stream and stops the heartbeat, but retains the
+job for the configured client lease plus the idle timeout (30 + 10 seconds by
+default). Playing again
+re-acquires the same job and resumes from its valid cached chunks. Disabling or
+closing the session sends a client-scoped release; another tab or extension
+session holding a lease keeps the worker running.
+
 ## Exports and cache
 
 The download chevron beside nomusic offers **MP3 — audio only** and **Video
 (MP4)** at several resolutions. You can request either before processing
 finishes; keep the tab open until the download completes. Pausing playback
 does not cancel export preparation. MP4 may require another source download.
-Check saved files have their full expected duration; resolution depends on
-the source and current downloader fallbacks.
+The local policy accepts finite sources up to two hours and 512 MiB of source
+audio. Video exports are capped at 1080p and 2 GiB; a larger selected format
+fails before a download starts. Check saved files have their full expected
+duration; resolution also depends on the source's available formats.
 
 Completed work is cached for reuse, with seven-day default retention. Finish
 playback and exports before clearing it: open the popup, click **Clear**, then
-**Confirm**. Model weights and files already saved to Downloads are preserved.
+**Confirm**. Active processing and downloads hold leases, so a clear skips those
+namespaces until their current writer/reader releases them. The helper keeps a
+4 GiB processed-media budget and requires 256 MiB of free space for a new
+export reservation; tighten these with the `NOMUSIC_MAX_*` settings when disk
+space is smaller. Model weights and files already saved to Downloads are
+preserved.
 
 ## Stop and restart
 

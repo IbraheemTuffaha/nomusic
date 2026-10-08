@@ -25,6 +25,12 @@ from typing import Callable, Optional
 from nomusic.config import SETTINGS
 from nomusic.pipeline.cache import CacheMeta, JobCache
 from nomusic.pipeline.processor import Processor, RunHooks
+from nomusic.worker import (
+    SupervisedModelWorker,
+    WorkerAbandoned as SupervisedWorkerAbandoned,
+    WorkerCrashed,
+    WorkerDeadlineExceeded as SupervisedWorkerDeadlineExceeded,
+)
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +45,10 @@ class WorkerAbandoned(Exception):
 
 class RegistryClosed(RuntimeError):
     """The service is stopping and cannot accept new work."""
+
+
+class JobQueueFull(RuntimeError):
+    """The bounded execution queue cannot admit another job."""
 
 
 class JobState(str, Enum):
@@ -105,6 +115,23 @@ class JobStatus:
         return d
 
 
+@dataclass(frozen=True)
+class _Execution:
+    """Identity of one physical run for a content-cache key.
+
+    ``key`` identifies the reusable content cache.  ``generation`` identifies
+    the current execution that is allowed to publish into that cache, while
+    ``status`` is the in-memory API state owned by the same run.  A replacement
+    run gets a new token even when it resumes the same cache directory; late
+    callbacks from the old token must be ignored or aborted.
+    """
+
+    key: str
+    generation: int
+    status: JobStatus
+    cache_generation: str | None = None
+
+
 class _JobControl:
     """Per-job runtime control surface.
 
@@ -151,10 +178,33 @@ class JobRegistry:
     def __init__(
         self, processor: Processor, cache: JobCache,
         *, is_stopping: Callable[[], bool] | None = None,
+        worker: SupervisedModelWorker | None = None,
+        max_queued_jobs: int | None = None,
+        client_lease_seconds: float | None = None,
+        sse_queue_size: int | None = None,
     ) -> None:
         self.processor = processor
         self.cache = cache
+        self.worker = worker
+        self.max_queued_jobs = (
+            SETTINGS.max_queued_jobs if max_queued_jobs is None else max_queued_jobs
+        )
+        if self.max_queued_jobs < 0:
+            raise ValueError("max_queued_jobs must be non-negative")
+        self.client_lease_seconds = (
+            SETTINGS.client_lease_seconds
+            if client_lease_seconds is None else client_lease_seconds
+        )
+        if self.client_lease_seconds <= 0:
+            raise ValueError("client_lease_seconds must be positive")
+        self.sse_queue_size = (
+            SETTINGS.sse_queue_size if sse_queue_size is None else sse_queue_size
+        )
+        if self.sse_queue_size <= 0:
+            raise ValueError("sse_queue_size must be positive")
         self._jobs: dict[str, JobStatus] = {}
+        self._executions: dict[str, _Execution] = {}
+        self._next_generation = 0
         self._threads: dict[str, threading.Thread] = {}
         # A key may be replaced before its old worker finishes unwinding.
         # Retain physical thread handles independently so shutdown joins both
@@ -180,6 +230,11 @@ class JobRegistry:
         # back to it safely.
         self._subscribers: dict[str, list[asyncio.Queue]] = {}
         self._last_disconnect_at: dict[str, float] = {}
+        # Client interest is deliberately separate from SSE transport. A tab
+        # may pause, reconnect, or switch to status reads while its bounded
+        # lease keeps the worker alive. Values use monotonic deadlines so a
+        # wall-clock adjustment cannot retain work indefinitely.
+        self._interests: dict[str, dict[str, float]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         # Keys whose worker should stop at its next chunk boundary. Set either
         # by the idle-abandon decision (atomically, under _lock, so a racing
@@ -238,10 +293,12 @@ class JobRegistry:
             self._worker_threads.clear()
             self._threads.clear()
             self._jobs.clear()
+            self._executions.clear()
             self._controls.clear()
             self._pending_priority.clear()
             self._subscribers.clear()
             self._last_disconnect_at.clear()
+            self._interests.clear()
             self._abandoning.clear()
             self._loop = None
 
@@ -250,7 +307,7 @@ class JobRegistry:
 
         Clearing ``_last_disconnect_at`` here means a returning viewer resets
         the idle clock the instant their stream opens."""
-        q: asyncio.Queue = asyncio.Queue()
+        q: asyncio.Queue = asyncio.Queue(maxsize=self.sse_queue_size)
         with self._lock:
             if self.stopping:
                 raise RegistryClosed("job registry is shutting down")
@@ -269,8 +326,83 @@ class JobRegistry:
                 return
             if q in subs:
                 subs.remove(q)
-            if not subs and key in self._jobs:
+            if not subs and key in self._jobs and not self._has_live_interest_locked(key):
                 self._last_disconnect_at[key] = time.time()
+
+    # -- explicit client interest ------------------------------------------
+
+    @staticmethod
+    def _validate_client_id(client_id: str) -> str:
+        value = str(client_id).strip()
+        if not value or len(value) > 128:
+            raise ValueError("client_id must contain 1-128 characters")
+        return value
+
+    def _purge_expired_interests_locked(self, key: str, *, now: float | None = None) -> int:
+        """Remove expired leases for one key; caller holds ``_lock``."""
+        leases = self._interests.get(key)
+        if not leases:
+            return 0
+        now = time.monotonic() if now is None else now
+        expired = [client for client, deadline in leases.items() if deadline <= now]
+        for client in expired:
+            leases.pop(client, None)
+        if not leases:
+            self._interests.pop(key, None)
+            if key in self._jobs and not self._subscribers.get(key):
+                self._last_disconnect_at.setdefault(key, time.time())
+        return len(expired)
+
+    def _has_live_interest_locked(self, key: str) -> bool:
+        self._purge_expired_interests_locked(key)
+        return bool(self._interests.get(key))
+
+    def acquire_interest(
+        self, key: str, client_id: str, lease_seconds: float | None = None
+    ) -> dict[str, object] | None:
+        """Acquire or renew one client's bounded interest in a live/ready job."""
+        client_id = self._validate_client_id(client_id)
+        requested = self.client_lease_seconds if lease_seconds is None else float(lease_seconds)
+        if requested <= 0:
+            raise ValueError("lease_seconds must be positive")
+        ttl = min(requested, self.client_lease_seconds)
+        with self._lock:
+            if self.stopping or key not in self._jobs:
+                return None
+            self._purge_expired_interests_locked(key)
+            self._interests.setdefault(key, {})[client_id] = time.monotonic() + ttl
+            # A newly renewed client supersedes the old no-subscriber clock.
+            self._last_disconnect_at.pop(key, None)
+        return {
+            "leased": True,
+            "client_id": client_id,
+            "lease_seconds": ttl,
+            "heartbeat_seconds": min(
+                SETTINGS.client_heartbeat_seconds, max(1.0, ttl / 2)
+            ),
+        }
+
+    def release_interest(self, key: str, client_id: str) -> bool:
+        """Release only ``client_id``; other clients' leases remain intact."""
+        client_id = self._validate_client_id(client_id)
+        with self._lock:
+            leases = self._interests.get(key)
+            if not leases or client_id not in leases:
+                return False
+            leases.pop(client_id, None)
+            if not leases:
+                self._interests.pop(key, None)
+                if key in self._jobs and not self._subscribers.get(key):
+                    self._last_disconnect_at[key] = time.time()
+            return True
+
+    def expire_interests(self) -> int:
+        """Expire abandoned client leases and start idle clocks where needed."""
+        with self._lock:
+            return sum(
+                self._purge_expired_interests_locked(key)
+                for key in tuple(self._interests)
+            )
 
     # -- public --------------------------------------------------------------
 
@@ -280,7 +412,10 @@ class JobRegistry:
         *,
         model: str,
         keep_stems: list[str],
+        client_id: str | None = None,
     ) -> JobStatus:
+        if client_id is not None:
+            client_id = self._validate_client_id(client_id)
         with self._lock:
             if self.stopping:
                 raise RegistryClosed("job registry is shutting down")
@@ -296,8 +431,10 @@ class JobRegistry:
             chunk_seconds=self.processor.chunk_seconds,
             chunk_overlap_seconds=self.processor.chunk_overlap_seconds,
         )
+        # Keep the slow disk read outside the registry lock so shutdown and
+        # other submissions remain responsive. A leased re-read below closes
+        # the clear/submit race for an entry that was present at this point.
         existing_meta = self.cache.load_meta(key)
-
         with self._lock:
             if self.stopping:
                 raise RegistryClosed("job registry is shutting down")
@@ -310,21 +447,52 @@ class JobRegistry:
                 # /process landing during the unwind respawns a fresh worker
                 # instead of adopting one that's about to vanish.)
                 self._last_disconnect_at[key] = time.time()
+                if client_id is not None:
+                    self._interests.setdefault(key, {})[client_id] = (
+                        time.monotonic() + self.client_lease_seconds
+                    )
+                    self._last_disconnect_at.pop(key, None)
                 return existing
+
+            live_jobs = sum(
+                status.state in _LIVE_JOB_STATES
+                for status in self._jobs.values()
+            )
+            if live_jobs >= 1 + self.max_queued_jobs:
+                raise JobQueueFull(
+                    f"execution queue is full ({self.max_queued_jobs} queued job(s))"
+                )
 
             # New job, or one superseding an abandoning predecessor: clear any
             # stale abandon mark so the fresh worker isn't killed on its first
             # chunk boundary.
             self._abandoning.discard(key)
+            self._interests.pop(key, None)
 
+            cache_generation = None
+            if existing_meta is not None:
+                lease_factory = getattr(self.cache, "job_lease", None)
+                if lease_factory is not None:
+                    with lease_factory(key, shared=True):
+                        existing_meta = self.cache.load_meta(key)
+            claim_generation = getattr(self.cache, "claim_generation", None)
+            if claim_generation:
+                cache_generation = claim_generation(key)
             status = self._build_submit_status(key, existing_meta)
             self._jobs[key] = status
+            if client_id is not None:
+                self._interests[key] = {
+                    client_id: time.monotonic() + self.client_lease_seconds
+                }
+            self._next_generation += 1
+            execution = _Execution(key, self._next_generation, status, cache_generation)
+            self._executions[key] = execution
             if status.state == JobState.READY:
                 return status
 
             t = threading.Thread(
                 target=self._run,
-                args=(key, url, model, keep_stems, status),
+                args=(execution, url, model, keep_stems),
                 name=f"nomusic-job-{key[:6]}",
                 daemon=True,
             )
@@ -339,6 +507,7 @@ class JobRegistry:
                 self._worker_threads.remove(t)
                 self._threads.pop(key, None)
                 self._jobs.pop(key, None)
+                self._executions.pop(key, None)
                 raise
             return status
 
@@ -353,6 +522,8 @@ class JobRegistry:
         return (
             existing is not None
             and existing.state in _LIVE_JOB_STATES
+            and self._executions.get(key) is not None
+            and self._executions[key].status is existing
             and key not in self._abandoning
         )
 
@@ -432,9 +603,14 @@ class JobRegistry:
             with self._lock:
                 if key in self._threads:
                     continue  # a fresh submit spawned a worker since we looked
-                if self._jobs.pop(key, None) is not None:
+                current = self._jobs.pop(key, None)
+                if current is not None:
+                    execution = self._executions.get(key)
+                    if execution is not None and execution.status is current:
+                        self._executions.pop(key, None)
                     self._subscribers.pop(key, None)
                     self._last_disconnect_at.pop(key, None)
+                    self._interests.pop(key, None)
                     dropped += 1
         return dropped
 
@@ -455,7 +631,11 @@ class JobRegistry:
         # the request thread, not the event loop.
         pending: list[tuple[asyncio.Queue, dict]] = []
         with self._lock:
+            keys = tuple(self._jobs)
             for key, status in self._jobs.items():
+                revoke_generation = getattr(self.cache, "revoke_generation", None)
+                if revoke_generation:
+                    revoke_generation(key)
                 self._abandoning.add(key)
                 subs = self._subscribers.get(key)
                 if not subs:
@@ -471,11 +651,15 @@ class JobRegistry:
             self._jobs.clear()
             self._subscribers.clear()
             self._last_disconnect_at.clear()
+            self._interests.clear()
+        if self.worker is not None:
+            for key in keys:
+                self.worker.cancel(key)
         loop = self._loop
         if pending and loop is not None and not loop.is_closed():
             for q, snapshot in pending:
                 try:
-                    loop.call_soon_threadsafe(q.put_nowait, snapshot)
+                    loop.call_soon_threadsafe(self._enqueue_snapshot, q, snapshot)
                 except RuntimeError:
                     break
 
@@ -483,47 +667,65 @@ class JobRegistry:
 
     def _run(
         self,
-        key: str,
+        execution: _Execution,
         url: str,
         model: str,
         keep_stems: list[str],
-        owner: JobStatus,
     ) -> None:
+        key = execution.key
         abandoned = False
         try:
             try:
                 with self._gpu_lock:
                     # Queued work must not begin probing/downloading after a
                     # shutdown signal received while it waited for the lock.
-                    self._raise_if_abandoned(key, SETTINGS.idle_timeout_seconds, owner)
+                    self._raise_if_abandoned(key, SETTINGS.idle_timeout_seconds, execution)
                     # Stay in QUEUED while waiting for the GPU lock. Only flip
                     # to PROBING once we actually own it, so a second
                     # concurrent job honestly reports "Queued" instead of
                     # falsely showing "Inspecting video" while really blocked.
-                    self._enter_phase(key, JobState.PROBING, progress=None, owner=owner)
-                    self.processor.run(
-                        url,
-                        model=model,
-                        keep_stems=keep_stems,
-                        hooks=RunHooks(
-                            on_probed=lambda info, plans, meta: self._on_probed(
-                                key, info, plans, meta, owner=owner
-                            ),
-                            on_progress=lambda meta, phase: self._on_separation_progress(
-                                key, meta, phase, owner=owner
-                            ),
-                            on_download_progress=lambda p: self._on_download_progress(
-                                key, p, owner=owner
-                            ),
-                            next_chunk_provider=self._make_chunk_provider(key, owner),
-                            abort_check=lambda: self._raise_if_abandoned(
-                                key, SETTINGS.idle_timeout_seconds, owner
-                            ),
-                            on_wait_for_download=lambda frac: self._on_wait_for_download(
-                                key, frac, owner=owner
-                            ),
+                    self._enter_phase(key, JobState.PROBING, progress=None, execution=execution)
+                    hooks = RunHooks(
+                        on_probed=lambda info, plans, meta: self._on_probed(
+                            key, info, plans, meta, execution=execution
                         ),
+                        on_progress=lambda meta, phase: self._on_separation_progress(
+                            key, meta, phase, execution=execution
+                        ),
+                        on_download_progress=lambda p: self._on_download_progress(
+                            key, p, execution=execution
+                        ),
+                        next_chunk_provider=self._make_chunk_provider(key, execution),
+                        abort_check=lambda: self._raise_if_abandoned(
+                            key, SETTINGS.idle_timeout_seconds, execution
+                        ),
+                        on_wait_for_download=lambda frac: self._on_wait_for_download(
+                            key, frac, execution=execution
+                        ),
+                        publish_check=lambda: self._assert_publishable(execution),
+                        cache_generation=execution.cache_generation,
                     )
+                    if self.worker is not None:
+                        self.worker.run(
+                            key,
+                            url,
+                            model=model,
+                            keep_stems=keep_stems,
+                            hooks=hooks,
+                            abort_check=lambda: self._raise_if_abandoned(
+                                key, SETTINGS.idle_timeout_seconds, execution
+                            ),
+                            publish_check=lambda: self._assert_publishable(execution),
+                            cache_generation=execution.cache_generation,
+                        )
+                    else:
+                        self.processor.run(
+                            url,
+                            model=model,
+                            keep_stems=keep_stems,
+                            hooks=hooks,
+                        )
+                    self._assert_publishable(execution)
                 meta = self.cache.load_meta(key)
                 chunks_ready = len(meta.chunks_ready) if meta else 0
                 ready_chunks = sorted(meta.chunks_ready) if meta else []
@@ -535,10 +737,19 @@ class JobRegistry:
                     chunks_ready=chunks_ready,
                     ready_chunks=ready_chunks,
                     total_chunks=total,
-                    owner=owner,
+                    execution=execution,
                 )
                 log.info("Job %s ready", key)
-            except WorkerAbandoned:
+            except SupervisedWorkerDeadlineExceeded as exc:
+                log.error("Job %s exceeded its execution deadline", key)
+                self._enter_phase(
+                    key,
+                    JobState.ERROR,
+                    progress=1.0,
+                    error=f"{type(exc).__name__}: {exc}",
+                    execution=execution,
+                )
+            except (WorkerAbandoned, SupervisedWorkerAbandoned):
                 # Listed before the generic handler so an idle-abandon isn't
                 # mistaken for a failure. The GPU lock has already released via
                 # the with-block unwind; just flag it for finally to clean up.
@@ -557,15 +768,15 @@ class JobRegistry:
                     JobState.ERROR,
                     progress=1.0,
                     error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}",
-                    owner=owner,
+                    execution=execution,
                 )
         finally:
-            self._cleanup_worker(key, owner, abandoned)
+            self._cleanup_worker(key, execution, abandoned)
 
-    def _cleanup_worker(self, key: str, owner: JobStatus, abandoned: bool) -> None:
+    def _cleanup_worker(self, key: str, execution: _Execution, abandoned: bool) -> None:
         """Release state only when this worker still owns the job generation."""
         with self._lock:
-            if self._jobs.get(key) is not owner:
+            if not self._is_current_locked(execution):
                 return
             self._controls.pop(key, None)
             self._pending_priority.pop(key, None)
@@ -587,6 +798,7 @@ class JobRegistry:
                     # finding a stale entry. Completed/errored jobs are kept
                     # for /status until memory_gc reclaims them.
                     self._jobs.pop(key, None)
+                    self._executions.pop(key, None)
 
     def _enter_phase(
         self,
@@ -594,12 +806,12 @@ class JobRegistry:
         state: JobState,
         *,
         progress: float | None,
-        owner: JobStatus | None = None,
+        execution: _Execution | None = None,
         **extra,
     ) -> None:
         self._update(
             key,
-            owner=owner,
+            execution=execution,
             state=state,
             phase=state.value,
             phase_progress=progress,
@@ -614,14 +826,14 @@ class JobRegistry:
         plans,
         meta: CacheMeta,
         *,
-        owner: JobStatus | None = None,
+        execution: _Execution | None = None,
     ) -> None:
         # Probe done. Surface metadata so the popup / button can show real
         # duration + title; phase stays at PROBING until the first download
         # tick flips it to DOWNLOADING.
         self._update(
             key,
-            owner=owner,
+            execution=execution,
             title=info.title,
             duration_seconds=info.duration_seconds,
             total_chunks=meta.total_chunks,
@@ -631,7 +843,7 @@ class JobRegistry:
         # Now that we know total_chunks, build the per-job control. If a
         # /prioritize call beat us here, apply the stashed hint now.
         with self._lock:
-            if owner is not None and self._jobs.get(key) is not owner:
+            if execution is not None and not self._is_current_locked(execution):
                 return
             control = self._controls.get(key)
             if control is None:
@@ -649,12 +861,12 @@ class JobRegistry:
         key: str,
         fraction: float | None,
         *,
-        owner: JobStatus | None = None,
+        execution: _Execution | None = None,
     ) -> None:
         """Flip the job to the DOWNLOADING ("Fetching") phase at ``fraction``.
         Shared by the two download-progress callbacks, which differ only in
         whether they suppress this update once separation is underway."""
-        self._update(key, owner=owner, state=JobState.DOWNLOADING, phase="downloading",
+        self._update(key, execution=execution, state=JobState.DOWNLOADING, phase="downloading",
                      phase_label=_PHASE_LABELS["downloading"],
                      phase_progress=fraction)
 
@@ -663,7 +875,7 @@ class JobRegistry:
         key: str,
         fraction: float | None,
         *,
-        owner: JobStatus | None = None,
+        execution: _Execution | None = None,
     ) -> None:
         # In progressive mode the download runs concurrently with separation,
         # so download ticks ("Fetching", download %) and separation ticks
@@ -673,7 +885,7 @@ class JobRegistry:
         # different scales. The download still proceeds in the background.
         with self._lock:
             status = self._jobs.get(key)
-            if owner is not None and status is not owner:
+            if execution is not None and not self._is_current_locked(execution):
                 return
             if status is not None and status.state in (
                 JobState.PROCESSING,
@@ -681,14 +893,14 @@ class JobRegistry:
                 JobState.ERROR,
             ):
                 return
-        self._set_downloading(key, fraction, owner=owner)
+        self._set_downloading(key, fraction, execution=execution)
 
     def _on_wait_for_download(
         self,
         key: str,
         fraction: float | None,
         *,
-        owner: JobStatus | None = None,
+        execution: _Execution | None = None,
     ) -> None:
         # Separation is blocked waiting for the download to reach this chunk —
         # the user seeked past the downloaded point, or the download is slower
@@ -696,7 +908,7 @@ class JobRegistry:
         # "Fetching" is right: playback is genuinely gated on the download, not
         # on separation. Unlike _on_download_progress this isn't suppressed
         # during PROCESSING, because here the download IS the bottleneck.
-        self._set_downloading(key, fraction, owner=owner)
+        self._set_downloading(key, fraction, execution=execution)
 
     def _on_separation_progress(
         self,
@@ -704,7 +916,7 @@ class JobRegistry:
         meta: CacheMeta,
         phase: str,
         *,
-        owner: JobStatus | None = None,
+        execution: _Execution | None = None,
     ) -> None:
         done = len(meta.chunks_ready)
         total = max(1, meta.total_chunks)
@@ -715,7 +927,7 @@ class JobRegistry:
         progress = min(1.0, (done + per_chunk) / total)
         self._update(
             key,
-            owner=owner,
+            execution=execution,
             state=JobState.PROCESSING,
             phase="processing",
             phase_label=_PHASE_LABELS["processing"],
@@ -728,7 +940,7 @@ class JobRegistry:
     # -- prioritization ------------------------------------------------------
 
     def _make_chunk_provider(
-        self, key: str, owner: JobStatus | None = None
+        self, key: str, execution: _Execution | None = None
     ) -> Callable[[], Optional[int]]:
         """Build the callable that ``Processor.run`` calls between chunks.
 
@@ -741,9 +953,9 @@ class JobRegistry:
         idle_timeout = SETTINGS.idle_timeout_seconds
 
         def provider() -> Optional[int]:
-            self._raise_if_abandoned(key, idle_timeout, owner)
+            self._raise_if_abandoned(key, idle_timeout, execution)
             with self._lock:
-                if owner is not None and self._jobs.get(key) is not owner:
+                if execution is not None and not self._is_current_locked(execution):
                     raise WorkerAbandoned
                 control = self._controls.get(key)
             if control is None:
@@ -756,7 +968,7 @@ class JobRegistry:
         self,
         key: str,
         idle_timeout: float,
-        owner: JobStatus | None = None,
+        execution: _Execution | None = None,
     ) -> None:
         """Raise ``WorkerAbandoned`` if the job has been flagged (idle decision
         on a prior call, or a cache clear) or has now gone idle. The whole
@@ -765,11 +977,13 @@ class JobRegistry:
         provider and the progressive-download abort hook so a pause that lands
         mid-download still releases the GPU promptly."""
         with self._lock:
-            if owner is not None and self._jobs.get(key) is not owner:
+            if execution is not None and not self._is_current_locked(execution):
                 raise WorkerAbandoned
             if self.stopping or key in self._abandoning:
                 raise WorkerAbandoned
             if idle_timeout <= 0:
+                return
+            if self._has_live_interest_locked(key):
                 return
             if self._subscribers.get(key):
                 return
@@ -784,6 +998,22 @@ class JobRegistry:
             ref = last_disc if last_disc is not None else created_at
             if time.time() - ref >= idle_timeout:
                 self._abandoning.add(key)
+                raise WorkerAbandoned
+
+    def _assert_publishable(self, execution: _Execution) -> None:
+        """Fence cache publication without cancelling a normal shutdown drain.
+
+        ``begin_shutdown`` stops admission and makes boundary checks abort new
+        work, but the current active batch is still allowed to drain and publish
+        its already-computed chunks. Cache clear, idle abandon and replacement
+        instead remove or invalidate the execution, so their stale writers are
+        rejected here.
+        """
+        with self._lock:
+            if (
+                not self._is_current_locked(execution)
+                or execution.key in self._abandoning
+            ):
                 raise WorkerAbandoned
 
     def prioritize(self, key: str, from_chunk: int) -> bool:
@@ -807,6 +1037,8 @@ class JobRegistry:
                     "prioritize: stashed (control not yet built) key=%s from_chunk=%d",
                     key, from_chunk,
                 )
+                if self.worker is not None:
+                    self.worker.prioritize(key, from_chunk)
                 return True
         before_size = len(control.pending)
         before_head = list(control.pending)[:5]
@@ -816,11 +1048,31 @@ class JobRegistry:
             "prioritize: key=%s from_chunk=%d pending=%d head_before=%s head_after=%s",
             key, from_chunk, before_size, before_head, after_head,
         )
+        if self.worker is not None:
+            self.worker.prioritize(key, from_chunk)
         return True
 
     # -- internals -----------------------------------------------------------
 
-    def _update(self, key: str, *, owner: JobStatus | None = None, **fields) -> None:
+    def _is_current_locked(self, execution: _Execution) -> bool:
+        """Return whether ``execution`` still owns its content key.
+
+        Callers must hold ``self._lock``.  Checking the token object, rather
+        than only the cache key, fences a predecessor after cache-clear and
+        resubmit have installed a replacement generation.
+        """
+        return (
+            self._executions.get(execution.key) is execution
+            and self._jobs.get(execution.key) is execution.status
+        )
+
+    def _update(
+        self,
+        key: str,
+        *,
+        execution: _Execution | None = None,
+        **fields,
+    ) -> None:
         snapshot: dict | None = None
         subs: list[asyncio.Queue] = []
         with self._lock:
@@ -829,7 +1081,7 @@ class JobRegistry:
             status = self._jobs.get(key)
             if status is None:
                 return
-            if owner is not None and status is not owner:
+            if execution is not None and not self._is_current_locked(execution):
                 return
             for name, value in fields.items():
                 setattr(status, name, value)
@@ -850,6 +1102,19 @@ class JobRegistry:
         if snapshot is not None and loop is not None and not loop.is_closed():
             for q in subs:
                 try:
-                    loop.call_soon_threadsafe(q.put_nowait, snapshot)
+                    loop.call_soon_threadsafe(self._enqueue_snapshot, q, snapshot)
                 except RuntimeError:
                     break
+
+    @staticmethod
+    def _enqueue_snapshot(q: asyncio.Queue, snapshot: dict) -> None:
+        """Keep only the newest bounded snapshot for a slow SSE consumer."""
+        while True:
+            try:
+                q.put_nowait(snapshot)
+                return
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    return

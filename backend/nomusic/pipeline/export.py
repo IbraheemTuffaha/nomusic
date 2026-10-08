@@ -43,6 +43,16 @@ _FFPROBE_TIMEOUT_SECONDS = 60.0
 MP4_COPYABLE_VCODECS = frozenset({"h264", "hevc"})
 
 
+def complete_manifest(meta) -> bool:
+    """Return true only for a complete, gap-free, in-range chunk manifest."""
+    try:
+        total = int(meta.total_chunks)
+        ready = sorted(int(index) for index in meta.chunks_ready)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return bool(meta.complete and total > 0 and ready == list(range(total)))
+
+
 def video_codec(path: Path) -> str:
     """Return the first video stream's codec name via ffprobe ("" on failure)."""
     try:
@@ -88,7 +98,9 @@ def video_duration(path: Path) -> float:
     return 0.0
 
 
-def snapshot_chunk_files(cache, job_id: str, total_chunks: int) -> list[tuple[Path, int]]:
+def snapshot_chunk_files(
+    cache, job_id: str, total_chunks: int, *, require_complete: bool = False
+) -> list[tuple[Path, int]]:
     """Snapshot the contiguous run of on-disk chunk files for ``job_id`` ONCE.
 
     Returns ``(path, size)`` pairs for the contiguous prefix that exists,
@@ -105,6 +117,8 @@ def snapshot_chunk_files(cache, job_id: str, total_chunks: int) -> list[tuple[Pa
         except FileNotFoundError:
             break
         chunk_files.append((p, size))
+    if require_complete and len(chunk_files) != total_chunks:
+        return []
     return chunk_files
 
 

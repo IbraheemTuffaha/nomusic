@@ -100,13 +100,10 @@ class Settings:
         default_factory=lambda: _env_bool("KEEP_SOURCE_AFTER_COMPLETE", False)
     )
 
-    # How long a worker keeps running after its last status subscriber drops.
-    # The extension closes its /events stream when you close the tab OR pause
-    # the video, so "no subscriber for this long" means "not actively
-    # watching". When it elapses, the worker abandons the job between chunks —
-    # releasing the GPU lock — so an idle server stops burning the GPU. Resume
-    # is cheap (re-spawn from disk-cached progress, no re-probe), so we keep
-    # this short. ``0`` disables idle-abandon (workers always run to completion
+    # How long a worker keeps running after its last client interest and status
+    # subscriber drop. Explicit client leases are the normal path; the SSE
+    # subscriber clock remains as a compatibility fallback for older local
+    # extensions. ``0`` disables idle-abandon (workers always run to completion
     # regardless of who's watching).
     idle_timeout_seconds: float = field(
         default_factory=lambda: _env_float("IDLE_TIMEOUT_SECONDS", 10.0)
@@ -116,6 +113,26 @@ class Settings:
     # slow probe + download with no chunk events) as a dead connection.
     sse_keepalive_seconds: float = field(
         default_factory=lambda: _env_float("SSE_KEEPALIVE_SECONDS", 15.0)
+    )
+    # Explicit processing interest is renewed by the extension heartbeat. A
+    # paused tab stops renewing and retains the worker for at most this lease;
+    # a later play re-submits the same cache key and resumes completed chunks.
+    # The server clamps caller-requested TTLs to this bound.
+    client_lease_seconds: float = field(
+        default_factory=lambda: _env_float("CLIENT_LEASE_SECONDS", 30.0)
+    )
+    client_heartbeat_seconds: float = field(
+        default_factory=lambda: _env_float("CLIENT_HEARTBEAT_SECONDS", 10.0)
+    )
+    # Maintenance expiry is separate from the worker idle check so abandoned
+    # client entries do not accumulate in memory. ``0`` is useful for tests.
+    interest_sweep_interval_seconds: float = field(
+        default_factory=lambda: _env_float("INTEREST_SWEEP_INTERVAL_SECONDS", 5.0)
+    )
+    # SSE queues retain only the most recent bounded set of snapshots. A slow
+    # subscriber cannot grow process memory without limit.
+    sse_queue_size: int = field(
+        default_factory=lambda: _env_int("SSE_QUEUE_SIZE", 64)
     )
     # Interval for the in-memory GC pass that drops JobStatus entries whose
     # disk cache has already been swept away. Runs on its own daemon thread
@@ -142,6 +159,69 @@ class Settings:
     # force download-once.
     progressive_download: bool = field(
         default_factory=lambda: _env_bool("PROGRESSIVE", True)
+    )
+
+    # The model process accepts one execution at a time.  Registry admission
+    # keeps this many additional jobs queued so a burst cannot create an
+    # unbounded set of native downloads or waiting threads.
+    max_queued_jobs: int = field(
+        default_factory=lambda: _env_int("MAX_QUEUED_JOBS", 2)
+    )
+    # A native inference/download run is allowed this long from admission to
+    # terminal publication.  The supervisor uses a monotonic deadline and
+    # terminates a child that ignores cooperative cancellation.
+    execution_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("EXECUTION_TIMEOUT_SECONDS", 1800.0)
+    )
+    worker_cancel_grace_seconds: float = field(
+        default_factory=lambda: _env_float("WORKER_CANCEL_GRACE_SECONDS", 5.0)
+    )
+    worker_warmup_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("WORKER_WARMUP_TIMEOUT_SECONDS", 300.0)
+    )
+    # The supervised process is the production path.  Keeping an explicit
+    # switch makes emergency local rollback possible without changing routes.
+    supervised_worker: bool = field(
+        default_factory=lambda: _env_bool("SUPERVISED_WORKER", True)
+    )
+
+    # Source/output policy. These are deliberately finite local-use defaults;
+    # operators can tighten them for a smaller disk or memory budget.
+    max_duration_seconds: float = field(
+        default_factory=lambda: _env_float("MAX_DURATION_SECONDS", 7200.0)
+    )
+    max_source_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_SOURCE_BYTES", 512 * 1024 * 1024)
+    )
+    max_video_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_VIDEO_BYTES", 2 * 1024 * 1024 * 1024)
+    )
+    max_video_height: int = field(
+        default_factory=lambda: _env_int("MAX_VIDEO_HEIGHT", 1080)
+    )
+    max_decode_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_DECODE_BYTES", 64 * 1024 * 1024)
+    )
+    max_chunk_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_CHUNK_BYTES", 16 * 1024 * 1024)
+    )
+    max_inference_batch: int = field(
+        default_factory=lambda: _env_int("MAX_INFERENCE_BATCH", 2)
+    )
+    max_prefetch_chunks: int = field(
+        default_factory=lambda: _env_int("MAX_PREFETCH_CHUNKS", 2)
+    )
+    final_chunk_tolerance_seconds: float = field(
+        default_factory=lambda: _env_float("FINAL_CHUNK_TOLERANCE_SECONDS", 1.0)
+    )
+    max_cache_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_CACHE_BYTES", 4 * 1024 * 1024 * 1024)
+    )
+    min_free_bytes: int = field(
+        default_factory=lambda: _env_int("MIN_FREE_BYTES", 256 * 1024 * 1024)
+    )
+    max_export_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_EXPORT_BYTES", 2 * 1024 * 1024 * 1024)
     )
 
 

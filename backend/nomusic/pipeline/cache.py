@@ -19,19 +19,27 @@ streams chunks together on demand.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from nomusic.pipeline.scratch import ScratchWorkspace
 
 log = logging.getLogger(__name__)
+
+
+class PublicationRevoked(RuntimeError):
+    """A replaced execution has lost permission to publish cached content."""
 
 # Bump when the on-disk chunk encoding, sample rate, or directory layout
 # changes. Old entries become invisible to the new code and the TTL sweep
@@ -44,6 +52,59 @@ CHUNK_MEDIA_TYPE = "audio/ogg"
 # Top-level directories that are not completed job entries. Source/video caches
 # have separate accounting; private staging is reclaimed only via its leases.
 _RESERVED_DIRS = frozenset({"sources", "videos", ".scratch"})
+
+
+class StorageLimitExceeded(RuntimeError):
+    """The cache cannot safely reserve more local storage."""
+
+
+class CacheLease:
+    """Advisory lease for one cache namespace."""
+    def __init__(self, directory: Path, *, shared: bool = False) -> None:
+        self.directory = directory
+        self.shared = shared
+        directory.mkdir(parents=True, exist_ok=True)
+        self.path = directory / ".lease"
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        except BaseException:
+            os.close(self.fd)
+            raise
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+
+    def __enter__(self) -> "CacheLease":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+
+@dataclass
+class CacheReservation:
+    cache: "JobCache"
+    amount: int
+    _released: bool = False
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self.cache.release(self.amount)
+
+    def __enter__(self) -> "CacheReservation":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.release()
 
 
 @dataclass
@@ -62,13 +123,135 @@ class CacheMeta:
 
 
 class JobCache:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        max_bytes: int | None = None,
+        min_free_bytes: int = 0,
+    ) -> None:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = max_bytes
+        self.min_free_bytes = max(0, min_free_bytes)
+        self._reservation_lock = threading.Lock()
+        self._reserved_bytes = 0
         self.scratch = ScratchWorkspace(self.root)
 
     def close(self) -> None:
         self.scratch.close()
+
+    @contextmanager
+    def _generation_file(self, key: str):
+        """Hold a stable lock while changing or checking publication ownership."""
+        path = self._key_dir(key) / ".generation"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                if os.fstat(fd).st_ino == path.stat().st_ino:
+                    break
+            except FileNotFoundError:
+                pass
+            os.close(fd)
+            path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            yield fd
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def claim_generation(self, key: str) -> str:
+        token = uuid.uuid4().hex
+        with self._generation_file(key) as fd:
+            os.ftruncate(fd, 0)
+            os.write(fd, token.encode())
+        return token
+
+    def revoke_generation(self, key: str) -> None:
+        with self._generation_file(key) as fd:
+            os.ftruncate(fd, 0)
+
+    @contextmanager
+    def publication(self, key: str, token: str | None):
+        """Keep the ownership check and the content commit in one critical section."""
+        if token is None:
+            yield
+            return
+        with self._generation_file(key) as fd:
+            if os.read(fd, 128).decode() != token:
+                raise PublicationRevoked("execution publication ownership was replaced")
+            yield
+
+    # -- ownership ----------------------------------------------------------
+
+    def job_lease(self, key: str, *, shared: bool = False) -> CacheLease:
+        return CacheLease(self._key_dir(key), shared=shared)
+
+    def source_lease(self, url: str) -> CacheLease:
+        return CacheLease(self.root / "sources" / self.url_key(url))
+
+    def video_lease(self, url: str, max_height: int | None = None) -> CacheLease:
+        return CacheLease(self.video_dir(url, max_height))
+
+    @staticmethod
+    def _try_exclusive_lock(directory: Path) -> int | None:
+        lease = directory / ".lease"
+        try:
+            fd = os.open(lease, os.O_RDWR | os.O_NOFOLLOW)
+        except OSError:
+            return None
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                return None
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @staticmethod
+    def _release_exclusive_lock(fd: int) -> None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def _is_locked(cls, directory: Path) -> bool:
+        fd = cls._try_exclusive_lock(directory)
+        if fd is None:
+            return True
+        cls._release_exclusive_lock(fd)
+        return False
+
+    def reserve(self, amount: int) -> CacheReservation:
+        amount = max(0, int(amount))
+        with self._reservation_lock:
+            usage = self.stats()["total_bytes"]
+            free = shutil.disk_usage(self.root).free
+            if (
+                self.max_bytes is not None
+                and usage + self._reserved_bytes + amount > self.max_bytes
+            ):
+                raise StorageLimitExceeded(
+                    f"cache budget exceeded: "
+                    f"{usage + self._reserved_bytes + amount} > {self.max_bytes} bytes"
+                )
+            if free - amount < self.min_free_bytes:
+                raise StorageLimitExceeded(
+                    f"insufficient free storage for {amount} bytes; "
+                    f"reserve at least {self.min_free_bytes} bytes"
+                )
+            self._reserved_bytes += amount
+        return CacheReservation(self, amount)
+
+    def release(self, amount: int) -> None:
+        with self._reservation_lock:
+            self._reserved_bytes = max(0, self._reserved_bytes - max(0, amount))
 
     # -- key helpers ---------------------------------------------------------
 
@@ -272,18 +455,38 @@ class JobCache:
         }
 
     def clear_all(self) -> int:
-        """Delete every cached source and job. Returns bytes freed.
+        """Delete every unleased cached artifact and return bytes freed.
 
-        Survives an in-flight job at the cost of that job's next chunk write
-        failing (the worker thread crashes; the user re-clicks). The root
-        directory itself is preserved so subsequent writes don't need to
-        recreate it.
+        Active processors and export readers hold namespace leases. A clear
+        skips those directories and leaves them intact; their owner releases
+        the lease after publication/response, allowing the next clear or TTL
+        sweep to reclaim them.
         """
         self.scratch.reap()
         freed = 0
         for child in list(self.root.iterdir()):
             if child.name == ".scratch":
                 continue  # active staging is lease-owned, not completed cache
+            if child.name in ("sources", "videos") and child.is_dir():
+                for entry in list(child.iterdir()):
+                    if not entry.is_dir():
+                        continue
+                    fd = self._try_exclusive_lock(entry)
+                    if fd is None:
+                        continue
+                    try:
+                        freed += _dir_bytes(entry)
+                        shutil.rmtree(entry, ignore_errors=True)
+                    finally:
+                        self._release_exclusive_lock(fd)
+                continue
+            if child.is_dir():
+                fd = self._try_exclusive_lock(child)
+                if fd is None:
+                    log.info("clear skipped leased cache namespace %s", child)
+                    continue
+            else:
+                fd = None
             try:
                 freed += _dir_bytes(child) if child.is_dir() else child.stat().st_size
             except OSError as err:
@@ -299,6 +502,9 @@ class JobCache:
                 # One stubborn entry shouldn't abort the whole clear; report it
                 # and continue so the rest of the cache is still reclaimed.
                 log.warning("clear_all: couldn't remove %s: %s", child, err)
+            finally:
+                if fd is not None:
+                    self._release_exclusive_lock(fd)
         return freed
 
     def sweep_older_than(self, ttl_seconds: float) -> tuple[int, int]:
@@ -320,20 +526,32 @@ class JobCache:
         for child in list(self.root.iterdir()):
             if not child.is_dir() or child.name in _RESERVED_DIRS:
                 continue
-            if _dir_newest_mtime(child) < now - ttl_seconds:
-                freed += _dir_bytes(child)
-                shutil.rmtree(child, ignore_errors=True)
-                removed += 1
+            fd = self._try_exclusive_lock(child)
+            if fd is None:
+                continue
+            try:
+                if _dir_newest_mtime(child) < now - ttl_seconds:
+                    freed += _dir_bytes(child)
+                    shutil.rmtree(child, ignore_errors=True)
+                    removed += 1
+            finally:
+                self._release_exclusive_lock(fd)
 
         # Sources + videos: ~/.cache/nomusic/{sources,videos}/<url_hash>. Both
         # are url-keyed caches swept per-entry (a single old dir doesn't drag
         # the whole tree down with it).
         for tree in ("sources", "videos"):
             for child in self._tree_entries(tree):
-                if _dir_newest_mtime(child) < now - ttl_seconds:
-                    freed += _dir_bytes(child)
-                    shutil.rmtree(child, ignore_errors=True)
-                    removed += 1
+                fd = self._try_exclusive_lock(child)
+                if fd is None:
+                    continue
+                try:
+                    if _dir_newest_mtime(child) < now - ttl_seconds:
+                        freed += _dir_bytes(child)
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed += 1
+                finally:
+                    self._release_exclusive_lock(fd)
 
         if removed:
             log.info(

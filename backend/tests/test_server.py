@@ -94,6 +94,33 @@ def test_process_requires_url(client):
     assert client.post("/process", json={}).status_code == 422
 
 
+def test_process_interest_heartbeat_and_client_scoped_release(client):
+    response = client.post(
+        "/process",
+        json={"url": "http://example.com/video", "client_id": "tab-a"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["interest"]["supported"] is True
+    job_id = body["job_id"]
+
+    heartbeat = client.post(
+        f"/process/{job_id}/interest",
+        json={"client_id": "tab-a"},
+    )
+    assert heartbeat.status_code == 200
+    assert heartbeat.json()["leased"] is True
+
+    released = client.delete(
+        f"/process/{job_id}/interest", params={"client_id": "tab-a"}
+    )
+    assert released.status_code == 200
+    assert released.json() == {"released": True}
+    assert client.delete(
+        f"/process/{job_id}/interest", params={"client_id": "tab-a"}
+    ).status_code == 404
+
+
 def test_process_request_url_validator(monkeypatch):
     # A page can drive /process, so the URL is an SSRF / local-file primitive:
     # only public http(s) URLs are allowed. (Unit-level so no worker is spawned.)

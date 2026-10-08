@@ -65,7 +65,7 @@ def test_handle_exit_immediately_closes_registry_gates_and_discards_prefetch(tmp
         app.state.registry = registry
         monkeypatch.setattr(registry.processor, "_decode_chunk", decode)
 
-        def publish(work, key, stems, on_progress):
+        def publish(work, key, stems, on_progress, publish_check=None, cache_generation=None):
             cache.chunk_path(key, work.plan.index).write_bytes(b"published audio")
             cache.record_chunk(key, work.plan.index)
 
