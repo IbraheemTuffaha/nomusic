@@ -79,7 +79,7 @@ def _fixture_worker(settings, commands, events):
         def close(self):
             return None
 
-    def slice_source(source, out_path, *, start, end, pass_fds=()):
+    def slice_source(source, out_path, *, start, end, pass_fds=(), limits=None):
         audio, sample_rate = sf.read(str(source), always_2d=True, dtype="float32")
         sf.write(str(out_path), audio[int(start * sample_rate):int(end * sample_rate)], sample_rate)
         return out_path
