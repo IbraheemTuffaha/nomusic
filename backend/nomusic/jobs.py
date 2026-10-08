@@ -29,6 +29,7 @@ from nomusic.worker import (
     SupervisedModelWorker,
     WorkerAbandoned as SupervisedWorkerAbandoned,
     WorkerCrashed,
+    WorkerDeadlineExceeded as SupervisedWorkerDeadlineExceeded,
 )
 
 log = logging.getLogger(__name__)
@@ -630,6 +631,15 @@ class JobRegistry:
                     execution=execution,
                 )
                 log.info("Job %s ready", key)
+            except SupervisedWorkerDeadlineExceeded as exc:
+                log.error("Job %s exceeded its execution deadline", key)
+                self._enter_phase(
+                    key,
+                    JobState.ERROR,
+                    progress=1.0,
+                    error=f"{type(exc).__name__}: {exc}",
+                    execution=execution,
+                )
             except (WorkerAbandoned, SupervisedWorkerAbandoned):
                 # Listed before the generic handler so an idle-abandon isn't
                 # mistaken for a failure. The GPU lock has already released via

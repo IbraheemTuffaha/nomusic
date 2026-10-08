@@ -38,6 +38,10 @@ class WorkerAbandoned(RuntimeError):
     """The parent cancelled or expired the current worker run."""
 
 
+class WorkerDeadlineExceeded(WorkerAbandoned):
+    """The supervised execution exceeded its configured total deadline."""
+
+
 class WorkerCrashed(RuntimeError):
     """The supervised child exited without reporting a terminal result."""
 
@@ -449,6 +453,7 @@ class SupervisedModelWorker:
             self._commands.put(("run", run_id, url, model, list(keep_stems), deadline))
             try:
                 cancel_sent = False
+                deadline_cancelled = False
                 cancel_at = 0.0
                 while True:
                     now = time.monotonic()
@@ -466,10 +471,15 @@ class SupervisedModelWorker:
                     if now >= deadline and not cancel_sent:
                         self.cancel(key)
                         cancel_sent = True
+                        deadline_cancelled = True
                         cancel_at = now
                     if cancel_sent and now - cancel_at >= self.cancel_grace_seconds:
                         self._terminate(force=True)
-                        raise WorkerAbandoned(f"execution deadline/cancel exceeded for {key}")
+                        if deadline_cancelled:
+                            raise WorkerDeadlineExceeded(
+                                f"execution deadline exceeded for {key}"
+                            )
+                        raise WorkerAbandoned(f"execution cancel grace exceeded for {key}")
                     try:
                         event = self._events.get(timeout=0.1)
                     except queue.Empty:
