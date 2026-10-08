@@ -87,6 +87,15 @@ class LifecycleServer(uvicorn.Server):
     def _force_exit(self, *, repeated=False):
         reason = "second interrupt" if repeated else "shutdown grace period expired"
         self._announce(f"Forced shutdown ({reason}); unfinished work was interrupted; restart and retry.\n")
+        services = getattr(getattr(self._application, "state", None), "services", None)
+        worker = getattr(services, "worker", None)
+        if worker is not None:
+            try:
+                worker.force_shutdown()
+            except Exception:
+                # The process is exiting immediately; diagnostics must not keep
+                # a stuck native worker alive or block the signal path.
+                pass
         os._exit(130 if repeated else 124)
 
     def _start_watchdog(self, seconds=None):

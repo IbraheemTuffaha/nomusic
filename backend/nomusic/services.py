@@ -73,6 +73,7 @@ class Services:
                 settings,
                 execution_timeout_seconds=settings.execution_timeout_seconds,
                 cancel_grace_seconds=settings.worker_cancel_grace_seconds,
+                warmup_timeout_seconds=settings.worker_warmup_timeout_seconds,
             )
             self.worker.start()
         self.registry = JobRegistry(
