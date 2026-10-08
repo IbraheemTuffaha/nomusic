@@ -218,7 +218,7 @@ def _worker_main(settings: WorkerSettings, commands: Any, events: Any) -> None:
                         "error": f"{type(exc).__name__}: {exc}",
                     })
                 continue
-            if name != "run" or len(command) != 6:
+            if name != "run" or len(command) != 7:
                 _send(events, {
                     "type": "protocol_error",
                     "run_id": command[1] if len(command) > 1 else None,
@@ -226,7 +226,7 @@ def _worker_main(settings: WorkerSettings, commands: Any, events: Any) -> None:
                 })
                 continue
 
-            _, run_id, url, model, keep_stems, deadline = command
+            _, run_id, url, model, keep_stems, deadline, cache_generation = command
             provider = _ChildChunkProvider(commands, run_id)
             _send(events, {"type": "run_started", "run_id": run_id, "pid": os.getpid()})
 
@@ -264,6 +264,7 @@ def _worker_main(settings: WorkerSettings, commands: Any, events: Any) -> None:
                         next_chunk_provider=provider.next,
                         abort_check=abort,
                         publish_check=abort,
+                        cache_generation=cache_generation,
                         on_wait_for_download=on_wait,
                     ),
                 )
@@ -437,6 +438,7 @@ class SupervisedModelWorker:
         hooks: RunHooks,
         abort_check: Callable[[], None] | None = None,
         publish_check: Callable[[], None] | None = None,
+        cache_generation: str | None = None,
     ) -> str:
         with self._operation_lock:
             self._ensure_started()
@@ -450,7 +452,9 @@ class SupervisedModelWorker:
             self._active_run_id = run_id
             self._cancelled.discard(key)
             deadline = time.monotonic() + self.execution_timeout_seconds
-            self._commands.put(("run", run_id, url, model, list(keep_stems), deadline))
+            self._commands.put(
+                ("run", run_id, url, model, list(keep_stems), deadline, cache_generation)
+            )
             try:
                 cancel_sent = False
                 deadline_cancelled = False
