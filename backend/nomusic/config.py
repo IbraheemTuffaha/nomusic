@@ -223,6 +223,21 @@ class Settings:
     max_export_bytes: int = field(
         default_factory=lambda: _env_int("MAX_EXPORT_BYTES", 2 * 1024 * 1024 * 1024)
     )
+    # Export preparation is deliberately separate from the HTTP download. A
+    # small bounded queue keeps duplicate/slow builds from creating an
+    # unbounded set of ffmpeg processes or retained artifacts.
+    max_export_jobs: int = field(
+        default_factory=lambda: _env_int("MAX_EXPORT_JOBS", 2)
+    )
+    export_ttl_seconds: float = field(
+        default_factory=lambda: _env_float("EXPORT_TTL_SECONDS", 86400.0)
+    )
+    export_sweep_interval_seconds: float = field(
+        default_factory=lambda: _env_float("EXPORT_SWEEP_INTERVAL_SECONDS", 300.0)
+    )
+    export_wait_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("EXPORT_WAIT_TIMEOUT_SECONDS", 7200.0)
+    )
 
 
 SETTINGS = Settings()

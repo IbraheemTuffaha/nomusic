@@ -8,7 +8,7 @@ their coverage is tracked rather than only reached transitively through server.
 
 from __future__ import annotations
 
-from nomusic.routes import media, system
+from nomusic.routes import exports, media, system
 from nomusic.routes.media import _ExportProgress
 
 
@@ -44,6 +44,10 @@ def test_routers_expose_expected_paths():
     assert "/audio/{job_id}" in media_paths
     assert "/video/{job_id}" in media_paths
     assert "/video/{job_id}/progress" in media_paths
+
+    export_paths = {r.path for r in exports.router.routes}
+    assert {"/exports", "/exports/{export_id}",
+            "/exports/{export_id}/download"} <= export_paths
 
     system_paths = {r.path for r in system.router.routes}
     assert {"/healthz", "/capabilities", "/cache", "/cache/clear"} <= system_paths

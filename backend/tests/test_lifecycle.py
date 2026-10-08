@@ -84,14 +84,18 @@ def test_repeated_lifespan_joins_threads_and_replaces_services(monkeypatch, sett
             assert engines[-1].warmed.wait(2)
             threads = list(owner._threads)
             assert {t.name for t in threads} == {
-                "nomusic-cache-ttl", "nomusic-memory-gc", "nomusic-engine-warmup",
+                "nomusic-cache-ttl", "nomusic-memory-gc", "nomusic-export-gc",
+                "nomusic-engine-warmup",
             }
             assert client.get("/healthz").status_code == 200
             assert app.state.export_progress.get("job:0")["phase"] == "idle"
             app.state.export_progress.set("job:0", "encoding", 10)
             previous = owner
         assert all(not t.is_alive() for t in threads)
-        assert owner.engine is None and owner.registry is None and owner.cache is None
+        assert (
+            owner.engine is None and owner.registry is None
+            and owner.exports is None and owner.cache is None
+        )
         assert not hasattr(app.state, "services")
         assert not hasattr(app.state, "export_progress")
         assert settings.cache_dir.exists()  # shutdown retains the disk cache

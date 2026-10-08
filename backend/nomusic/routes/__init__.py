@@ -10,6 +10,7 @@ Routers:
   * :mod:`routes.system` — health, capabilities, cache stats/clear.
   * :mod:`routes.jobs`   — submit/prioritize/status + the SSE event stream.
   * :mod:`routes.media`  — per-chunk audio, the concatenated track, MP4 export.
+  * :mod:`routes.exports` — asynchronous export preparation and downloads.
 """
 
 from __future__ import annotations

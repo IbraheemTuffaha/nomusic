@@ -51,7 +51,7 @@ CHUNK_MEDIA_TYPE = "audio/ogg"
 
 # Top-level directories that are not completed job entries. Source/video caches
 # have separate accounting; private staging is reclaimed only via its leases.
-_RESERVED_DIRS = frozenset({"sources", "videos", ".scratch"})
+_RESERVED_DIRS = frozenset({"sources", "videos", "exports", ".scratch"})
 
 
 class StorageLimitExceeded(RuntimeError):
@@ -194,6 +194,21 @@ class JobCache:
 
     def video_lease(self, url: str, max_height: int | None = None) -> CacheLease:
         return CacheLease(self.video_dir(url, max_height))
+
+    def export_dir(self, export_id: str) -> Path:
+        """Return the persistent directory for one prepared export artifact."""
+        if not export_id or any(ch not in "0123456789abcdef-" for ch in export_id.lower()):
+            raise ValueError("invalid export id")
+        path = self.root / "exports" / export_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def export_entries(self) -> list[Path]:
+        """List export artifact directories without creating the tree."""
+        return self._tree_entries("exports")
+
+    def export_lease(self, export_id: str, *, shared: bool = False) -> CacheLease:
+        return CacheLease(self.export_dir(export_id), shared=shared)
 
     @staticmethod
     def _try_exclusive_lock(directory: Path) -> int | None:
@@ -436,6 +451,10 @@ class JobCache:
         video_count = len(video_dirs)
         video_bytes = sum(_dir_bytes(p) for p in video_dirs)
 
+        export_dirs = self._tree_entries("exports")
+        export_count = len(export_dirs)
+        export_bytes = sum(_dir_bytes(p) for p in export_dirs)
+
         job_count = 0
         job_bytes = 0
         for p in self.root.iterdir():
@@ -445,12 +464,14 @@ class JobCache:
             job_bytes += _dir_bytes(p)
 
         return {
-            "total_bytes": source_bytes + video_bytes + job_bytes,
+            "total_bytes": source_bytes + video_bytes + export_bytes + job_bytes,
             "source_bytes": source_bytes,
             "video_bytes": video_bytes,
             "job_bytes": job_bytes,
             "source_count": source_count,
             "video_count": video_count,
+            "export_bytes": export_bytes,
+            "export_count": export_count,
             "job_count": job_count,
         }
 
@@ -467,7 +488,7 @@ class JobCache:
         for child in list(self.root.iterdir()):
             if child.name == ".scratch":
                 continue  # active staging is lease-owned, not completed cache
-            if child.name in ("sources", "videos") and child.is_dir():
+            if child.name in ("sources", "videos", "exports") and child.is_dir():
                 for entry in list(child.iterdir()):
                     if not entry.is_dir():
                         continue
@@ -537,10 +558,14 @@ class JobCache:
             finally:
                 self._release_exclusive_lock(fd)
 
+        # Sources, videos, and prepared exports: ~/.cache/nomusic/{sources,videos,exports}/<id>.
+        # All are entry-keyed caches swept independently so one old artifact
+        # does not drag the whole tree down with it.
+        #
         # Sources + videos: ~/.cache/nomusic/{sources,videos}/<url_hash>. Both
         # are url-keyed caches swept per-entry (a single old dir doesn't drag
         # the whole tree down with it).
-        for tree in ("sources", "videos"):
+        for tree in ("sources", "videos", "exports"):
             for child in self._tree_entries(tree):
                 fd = self._try_exclusive_lock(child)
                 if fd is None:

@@ -69,7 +69,9 @@ def cache_clear(request: Request) -> dict[str, int]:
     # unwinds cleanly instead of crashing on a chunk write into a
     # just-deleted directory.
     registry = request.app.state.registry
+    exports = request.app.state.exports
     cache = request.app.state.cache
+    exports.clear_all()
     registry.abandon_all()
     freed = cache.clear_all()
     return {"deleted_bytes": freed}

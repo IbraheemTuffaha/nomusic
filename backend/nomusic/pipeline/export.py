@@ -28,6 +28,8 @@ counts real videos produce).
 from __future__ import annotations
 
 import logging
+import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -41,6 +43,9 @@ _FFPROBE_TIMEOUT_SECONDS = 60.0
 # Any other video codec (VP9/AV1, which YouTube uses above 1080p) is re-encoded
 # to H.264 so the exported MP4 plays everywhere, not just in VLC/Chrome.
 MP4_COPYABLE_VCODECS = frozenset({"h264", "hevc"})
+
+_FFMPEG_TIMEOUT_SECONDS = 3600.0
+_PART_SUFFIX = ".part"
 
 
 def complete_manifest(meta) -> bool:
@@ -207,3 +212,173 @@ def mux_video_cmd(
         "-movflags", "+faststart",
         str(dest),
     ]
+
+
+def _export_reservation(
+    chunk_files: list[tuple[Path, int]], *, cap: int, extra_bytes: int = 0
+) -> int:
+    """Reserve a bounded estimate rather than the maximum for every export."""
+    source_bytes = sum(size for _, size in chunk_files)
+    estimate = max(1, source_bytes * 2 + max(0, extra_bytes))
+    return min(cap, estimate)
+
+
+def _run_export_ffmpeg(cmd: list[str]) -> None:
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS:.0f}s"
+        ) from exc
+    if proc.returncode:
+        detail = proc.stderr.decode("utf-8", "replace").strip() or "(no stderr)"
+        raise RuntimeError(f"ffmpeg failed: {detail[-2000:]}")
+
+
+def _safe_filename(title: str, extension: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._ -]+", "", title or "nomusic").strip(" .")
+    value = re.sub(r"\s+", " ", value)[:120] or "nomusic"
+    return f"{value}.{extension}"
+
+
+def build_export(cache, settings, spec, destination: Path, on_progress, cancel_event) -> object:
+    """Build one complete export into ``destination``.
+
+    This is deliberately a synchronous worker function.  ``ExportRegistry``
+    owns the worker thread and durable state; this function only handles the
+    format-specific snapshot/ffmpeg work and checks the cancellation event at
+    every bounded phase.  The returned object is an ``ExportArtifact``; the
+    import is local to keep this module's ffmpeg helpers usable in isolation.
+    """
+    from nomusic.exports import ExportArtifact, ExportBuildError
+    from nomusic.pipeline import downloader
+    from nomusic.pipeline.downloader import ResourceLimitExceeded
+    from nomusic.pipeline.cache import StorageLimitExceeded
+
+    meta = cache.load_meta(spec.job_id)
+    if meta is None:
+        raise ExportBuildError("unknown source job")
+    if not complete_manifest(meta):
+        raise ExportBuildError("source job is not complete")
+    lease = cache.job_lease(spec.job_id, shared=True)
+    video_lease = None
+    reservation = None
+    try:
+        chunk_files = snapshot_chunk_files(
+            cache, spec.job_id, meta.total_chunks, require_complete=True
+        )
+        if not chunk_files:
+            raise ExportBuildError("source chunks are unavailable")
+        if cancel_event.is_set():
+            raise ExportBuildError("cancelled")
+        if spec.format == "opus":
+            extension, media_type = "opus", "audio/ogg"
+            final = destination / _safe_filename(meta.title, extension)
+            part = final.with_suffix(final.suffix + ".part")
+            total = sum(size for _, size in chunk_files) or 1
+            written = 0
+            with part.open("wb") as out:
+                for path, _size in chunk_files:
+                    with path.open("rb") as source:
+                        while True:
+                            block = source.read(1024 * 1024)
+                            if not block:
+                                break
+                            if cancel_event.is_set():
+                                raise ExportBuildError("cancelled")
+                            out.write(block)
+                            written += len(block)
+                            on_progress("building", written / total)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(part, final)
+            return ExportArtifact(final, final.name, media_type, final.stat().st_size)
+
+        if spec.format == "mp3":
+            extension, media_type = "mp3", "audio/mpeg"
+            final = destination / _safe_filename(meta.title, extension)
+            part = final.with_suffix(final.suffix + ".part")
+            reservation = cache.reserve(
+                _export_reservation(chunk_files, cap=settings.max_export_bytes)
+            )
+            on_progress("encoding", 0.0)
+            _run_export_ffmpeg(mp3_transcode_cmd(chunk_files, part))
+            if cancel_event.is_set():
+                raise ExportBuildError("cancelled")
+            os.replace(part, final)
+            on_progress("encoding", 1.0)
+            return ExportArtifact(final, final.name, media_type, final.stat().st_size)
+
+        if spec.format != "mp4":
+            raise ExportBuildError(f"unsupported export format: {spec.format}")
+
+        extension, media_type = "mp4", "video/mp4"
+        final = destination / _safe_filename(meta.title, extension)
+        part = final.with_suffix(final.suffix + ".part")
+        on_progress("downloading", 0.0)
+        try:
+            video_lease = cache.video_lease(meta.url, spec.max_height)
+            video_path = downloader.download_video(
+                meta.url,
+                cache.video_dir(meta.url, spec.max_height),
+                max_height=spec.max_height,
+                limits=downloader.limits_from_settings(settings),
+                progress_hook=lambda data: _download_progress(data, on_progress),
+            )
+        except (StorageLimitExceeded, ResourceLimitExceeded) as exc:
+            raise ExportBuildError(str(exc)) from exc
+        except Exception as exc:
+            raise ExportBuildError(f"video download failed: {exc}") from exc
+        if cancel_event.is_set():
+            raise ExportBuildError("cancelled")
+        reservation = cache.reserve(
+            _export_reservation(
+                chunk_files,
+                cap=settings.max_export_bytes,
+                extra_bytes=video_path.stat().st_size,
+            )
+        )
+        on_progress("encoding", 0.0)
+        reencode = video_codec(video_path) not in MP4_COPYABLE_VCODECS
+        try:
+            _run_export_ffmpeg(
+                mux_video_cmd(video_path, chunk_files, part, reencode_video=reencode)
+            )
+        except RuntimeError:
+            if reencode:
+                raise
+            _run_export_ffmpeg(
+                mux_video_cmd(video_path, chunk_files, part, reencode_video=True)
+            )
+        if cancel_event.is_set():
+            raise ExportBuildError("cancelled")
+        os.replace(part, final)
+        on_progress("encoding", 1.0)
+        return ExportArtifact(final, final.name, media_type, final.stat().st_size)
+    except StorageLimitExceeded as exc:
+        raise ExportBuildError(str(exc)) from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ExportBuildError(str(exc)) from exc
+    finally:
+        if reservation is not None:
+            reservation.release()
+        if video_lease is not None:
+            video_lease.close()
+        lease.close()
+        for part in destination.glob(f"*{_PART_SUFFIX}"):
+            try:
+                part.unlink()
+            except OSError:
+                pass
+
+
+def _download_progress(data: dict[str, object], on_progress) -> None:
+    if data.get("status") == "downloading":
+        total = data.get("total_bytes") or data.get("total_bytes_estimate")
+        got = data.get("downloaded_bytes")
+        if total and got is not None:
+            on_progress("downloading", max(0.0, min(1.0, float(got) / float(total))))
+    elif data.get("status") == "finished":
+        on_progress("downloading", 1.0)

@@ -100,10 +100,10 @@ class ProcessRequest(BaseModel):
     url: str = Field(..., min_length=1)
     model: Optional[str] = None
     keep_stems: Optional[list[str]] = None
-    # Optional during the compatibility window for older local extensions.
-    # New clients use it to acquire a processing lease atomically with submit.
+    # Optional during the compatibility window for older local extensions;
+    # newer clients use it to acquire a processing lease atomically with
+    # submission.
     client_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
-
     @field_validator("url")
     @classmethod
     def _validate_url(cls, v: str) -> str:

@@ -1,0 +1,110 @@
+"""Asynchronous export preparation and artifact serving."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
+
+from nomusic.exports import ExportQueueFull, ExportRegistryClosed, ExportState
+
+from . import JsonDict
+
+router = APIRouter()
+
+
+class ExportRequest(BaseModel):
+    job_id: str = Field(..., min_length=1)
+    format: str = Field(..., min_length=1)
+    max_height: int | None = Field(default=None, ge=-1, le=10000)
+
+
+def _payload(request: Request, status) -> JsonDict:
+    body = status.to_dict()
+    if status.state is ExportState.READY:
+        body["download_url"] = f"/exports/{status.export_id}/download"
+    return body
+
+
+@router.post("/exports")
+def submit_export(req: ExportRequest, request: Request) -> JSONResponse:
+    registry = request.app.state.exports
+    try:
+        status = registry.submit(req.job_id, req.format, req.max_height)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="unknown job_id") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ExportQueueFull as exc:
+        return JSONResponse(
+            {"detail": str(exc)},
+            status_code=429,
+            headers={"Retry-After": "2", "Cache-Control": "no-store"},
+        )
+    except ExportRegistryClosed as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    code = 200 if status.state is ExportState.READY else 202
+    return JSONResponse(_payload(request, status), status_code=code,
+                        headers={"Cache-Control": "no-store"})
+
+
+@router.get("/exports/{export_id}/download")
+def download_export(export_id: str, request: Request) -> Response:
+    registry = request.app.state.exports
+    status = registry.get(export_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="unknown export_id")
+    if status.state in (ExportState.QUEUED, ExportState.BUILDING):
+        raise HTTPException(
+            status_code=425,
+            detail="export is not ready",
+            headers={"Cache-Control": "no-store"},
+        )
+    if status.state is ExportState.EXPIRED:
+        raise HTTPException(status_code=410, detail="export has expired")
+    if status.state is ExportState.CANCELLED:
+        raise HTTPException(status_code=409, detail="export was cancelled")
+    if status.state is ExportState.FAILED:
+        raise HTTPException(status_code=409, detail=status.error or "export failed")
+    if not status.filename or Path(status.filename).name != status.filename:
+        raise HTTPException(status_code=410, detail="export artifact is unavailable")
+
+    cache = request.app.state.cache
+    directory = cache.export_dir(export_id)
+    artifact = directory / status.filename
+    if not artifact.is_file() or artifact.stat().st_size <= 0:
+        raise HTTPException(status_code=410, detail="export artifact is unavailable")
+    lease = cache.export_lease(export_id, shared=True)
+    try:
+        if not artifact.is_file():
+            raise HTTPException(status_code=410, detail="export artifact is unavailable")
+    except BaseException:
+        lease.close()
+        raise
+    return FileResponse(
+        str(artifact),
+        media_type=status.media_type,
+        filename=status.filename,
+        headers={"Cache-Control": "no-store", "Content-Length": str(status.size_bytes or artifact.stat().st_size)},
+        background=BackgroundTask(lease.close),
+    )
+
+
+@router.get("/exports/{export_id}")
+def get_export(export_id: str, request: Request) -> JsonDict:
+    status = request.app.state.exports.get(export_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="unknown export_id")
+    return _payload(request, status)
+
+
+@router.delete("/exports/{export_id}")
+def cancel_export(export_id: str, request: Request) -> JsonDict:
+    status = request.app.state.exports.cancel(export_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="unknown export_id")
+    return _payload(request, status)
+
