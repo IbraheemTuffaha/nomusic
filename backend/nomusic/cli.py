@@ -16,6 +16,7 @@ import time
 from nomusic.config import SETTINGS
 from nomusic.engines import get_engine
 from nomusic.pipeline.cache import JobCache
+from nomusic.pipeline.downloader import limits_from_settings
 from nomusic.pipeline.processor import Processor, RunHooks
 
 
@@ -41,12 +42,19 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     engine = get_engine(args.engine)
-    cache = JobCache(SETTINGS.cache_dir)
+    cache = JobCache(
+        SETTINGS.cache_dir,
+        max_bytes=SETTINGS.max_cache_bytes,
+        min_free_bytes=SETTINGS.min_free_bytes,
+    )
     processor = Processor(
         engine=engine,
         cache=cache,
         chunk_seconds=SETTINGS.chunk_seconds,
         chunk_overlap_seconds=SETTINGS.chunk_overlap_seconds,
+        keep_source_after_complete=SETTINGS.keep_source_after_complete,
+        progressive=SETTINGS.progressive_download,
+        limits=limits_from_settings(SETTINGS),
     )
     keep_stems = (
         [s.strip() for s in args.stems.split(",")]
