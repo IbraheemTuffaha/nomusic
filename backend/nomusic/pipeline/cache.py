@@ -146,6 +146,7 @@ class JobCache:
     def _generation_file(self, key: str):
         """Hold a stable lock while changing or checking publication ownership."""
         path = self._key_dir(key) / ".generation"
+        path.parent.mkdir(parents=True, exist_ok=True)
         while True:
             fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
