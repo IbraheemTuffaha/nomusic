@@ -19,6 +19,7 @@ import soundfile as sf
 
 from nomusic.engines.base import Engine, EngineCapabilities, SeparationResult
 from nomusic.pipeline.cache import CacheMeta, JobCache
+from nomusic.pipeline.downloader import ResourceLimitExceeded, ResourceLimits
 from nomusic.pipeline.export import (
     mp3_transcode_cmd,
     mux_video_cmd,
@@ -394,6 +395,25 @@ def test_progressive_source_cancel_unblocks_source_for(tmp_path):
     plan = ChunkPlan(index=5, start=50.0, end=60.0, play_start=50.0, play_end=60.0)
     with pytest.raises(_DownloadCancelled):
         dl.source_for(plan, overlap=0.5)
+
+
+def test_progressive_source_rejects_and_removes_short_completed_file(tmp_path, monkeypatch):
+    from nomusic.pipeline import processor as proc
+
+    source = tmp_path / "source.wav"
+    _write_tone(source, seconds=2.0)
+    monkeypatch.setattr(
+        proc, "download_source", lambda *args, **kwargs: source
+    )
+    dl = proc._ProgressiveSource(
+        "fake://v", tmp_path, duration=9.5, ui_hook=None,
+        limits=ResourceLimits(final_chunk_tolerance_seconds=1.0),
+    )
+    dl.start()
+    dl.close()
+    with pytest.raises(ResourceLimitExceeded, match="metadata requires"):
+        dl.raise_if_error()
+    assert not source.exists()
 
 
 def test_source_fetcher_download_propagates_cancel_without_retry(tmp_path, monkeypatch):

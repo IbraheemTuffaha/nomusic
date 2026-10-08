@@ -649,7 +649,7 @@ class SourceFetcher:
                     "SourceFetcher: same-session download OK (no re-extract), %.1fs",
                     time.monotonic() - t0,
                 )
-            except DownloadCancelled:
+            except (DownloadCancelled, ResourceLimitExceeded):
                 # Never restart a download the caller is deliberately stopping.
                 raise
             except Exception:
@@ -677,6 +677,9 @@ class SourceFetcher:
             if self.limits is not None:
                 _validate_file_size(final, self.limits.max_source_bytes, "source")
             return final
+        except ResourceLimitExceeded:
+            _remove_media_outputs(self.out_dir, _SOURCE_STEM, _SOURCE_EXTS)
+            raise
         finally:
             self.close()
 

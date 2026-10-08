@@ -43,6 +43,7 @@ from .downloader import (
     ResourceLimits,
     SourceFetcher,
     VideoMetadata,
+    _remove_media_outputs,
     download_source,
     slice_source,
     validate_source_file,
@@ -213,7 +214,8 @@ class _ProgressiveSource:
     """
 
     def __init__(
-        self, url: str, out_dir: Path, duration: float, ui_hook, fetcher=None
+        self, url: str, out_dir: Path, duration: float, ui_hook,
+        fetcher=None, limits: ResourceLimits | None = None,
     ) -> None:
         self._url = url
         self._out_dir = out_dir
@@ -222,6 +224,7 @@ class _ProgressiveSource:
         # When set, the worker already extracted metadata in this session; the
         # background download reuses it (no second extraction). None on resume.
         self._fetcher = fetcher
+        self._limits = limits
         self._lock = threading.Lock()
         self._available = 0.0
         self._tmpfile: Optional[str] = None
@@ -309,12 +312,16 @@ class _ProgressiveSource:
                 final = self._fetcher.download(progress_hook=self._hook)
             else:
                 final = download_source(
-                    self._url, self._out_dir, progress_hook=self._hook
+                    self._url, self._out_dir, progress_hook=self._hook,
+                    limits=self._limits,
                 )
+            validate_source_file(final, self._duration, self._limits)
             with self._lock:
                 self._final = final
                 self._available = self._duration
         except BaseException as exc:  # surfaced to the worker via raise_if_error
+            if isinstance(exc, ResourceLimitExceeded):
+                _remove_media_outputs(self._out_dir, "source", ("m4a", "webm", "opus", "ogg", "mp3", "aac", "mp4", "wav"))
             self._error = exc
         finally:
             self._done.set()
@@ -595,7 +602,8 @@ class Processor:
             # Download on a background thread; ``source_for`` blocks per chunk
             # until enough of the timeline is on disk to slice it.
             dl = _ProgressiveSource(
-                url, source_dir, info.duration_seconds, _yt_hook, fetcher=fetcher
+                url, source_dir, info.duration_seconds, _yt_hook,
+                fetcher=fetcher, limits=self.limits,
             )
             source_for = lambda plan: dl.source_for(
                 plan, self.chunk_overlap_seconds, abort_check, on_wait_for_download

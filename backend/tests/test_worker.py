@@ -35,6 +35,27 @@ def test_child_provider_honors_cancel_and_priority():
         provider.next()
 
 
+def test_child_provider_stashes_only_current_run_priority_until_configured():
+    commands = mp.Queue()
+    provider = _ChildChunkProvider(commands, run_id=7)
+    commands.put(("prioritize", 6, 4))
+    commands.put(("prioritize", 7, 4))
+    time.sleep(0.05)
+    provider.poll()
+    provider.configure(5, [0])
+    assert provider.next() == 4
+
+
+def test_child_provider_applies_priority_received_before_configuration():
+    commands = mp.Queue()
+    provider = _ChildChunkProvider(commands, run_id=7)
+    commands.put(("prioritize", 7, 4))
+    time.sleep(0.05)
+    provider.poll()
+    provider.configure(5, [0])
+    assert provider.next() == 4
+
+
 def test_supervisor_terminates_stuck_child_and_restarts(tmp_path):
     settings = SimpleNamespace(
         engine_name="fixture",
