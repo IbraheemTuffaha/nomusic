@@ -199,8 +199,7 @@ class ExportRegistry:
                 if status.expires_at is not None and status.expires_at <= self._clock():
                     self._remove_directory(directory)
                     continue
-                artifact_name = str(data.get("artifact") or status.filename)
-                artifact = directory / artifact_name
+                artifact = directory / status.filename
                 if status.state is ExportState.READY:
                     if not self._valid_artifact_path(artifact, directory) or not artifact.is_file():
                         raise ValueError("ready export artifact is missing")
@@ -208,14 +207,18 @@ class ExportRegistry:
                     status.size_bytes = artifact.stat().st_size
                     if status.size_bytes <= 0:
                         raise ValueError("ready export artifact is empty")
+                    if self.max_artifact_bytes is not None and status.size_bytes > self.max_artifact_bytes:
+                        raise ValueError("ready export artifact exceeds its size limit")
                 elif status.state not in (ExportState.FAILED, ExportState.CANCELLED):
                     self._remove_directory(directory)
                     continue
                 with self._lock:
                     self._statuses[status.export_id] = status
-                    self._dedupe[ExportSpec(
-                        status.job_id, status.format, status.max_height
-                    ).dedupe_key] = status.export_id
+                    if status.state is ExportState.READY:
+                        key = self._dedupe_key(status)
+                        previous = self._statuses.get(self._dedupe.get(key))
+                        if previous is None or previous.created_at < status.created_at:
+                            self._dedupe[key] = status.export_id
             except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
                 log.warning("Removing invalid export directory %s: %s", directory, exc)
                 self._remove_directory(directory)
@@ -234,6 +237,8 @@ class ExportRegistry:
         fmt = str(data["format"])
         if fmt not in _ALLOWED_FORMATS:
             raise ValueError("invalid export format")
+        if state in (ExportState.READY, ExportState.FAILED, ExportState.CANCELLED) and data.get("expires_at") is None:
+            raise ValueError("terminal export has no expiry")
         return ExportStatus(
             export_id=export_id,
             job_id=job_id.lower(),
@@ -464,10 +469,11 @@ class ExportRegistry:
                 return replace(status)
             if client_id:
                 owners = self._clients.get(export_id)
-                if owners and client_id in owners:
-                    owners.remove(client_id)
-                    if owners:
-                        return replace(status)
+                if not owners or client_id not in owners:
+                    return replace(status)
+                owners.remove(client_id)
+                if owners:
+                    return replace(status)
             now = self._clock()
             status.state = ExportState.CANCELLED
             status.phase = "cancelled"
@@ -478,6 +484,8 @@ class ExportRegistry:
             event = self._cancel.get(export_id)
             if event is not None:
                 event.set()
+            self._clients.pop(export_id, None)
+            self._remove_dedupe_if_owner(status)
             try:
                 self._write_manifest(status)
             except OSError:
@@ -633,18 +641,20 @@ class ExportRegistry:
                 except OSError:
                     log.warning("Could not persist failed export %s", export_id, exc_info=True)
         finally:
-            if lease is not None:
-                lease.close()
             with self._lock:
                 status = self._statuses.get(export_id)
                 terminal_without_artifact = status is None or status.state in (
                     ExportState.CANCELLED, ExportState.FAILED, ExportState.EXPIRED
                 )
-            if terminal_without_artifact:
-                self._cleanup_worker_files(export_id)
-            with self._lock:
-                self._threads.pop(export_id, None)
-                self._cancel.pop(export_id, None)
+            try:
+                if terminal_without_artifact:
+                    self._cleanup_worker_files(export_id)
+            finally:
+                if lease is not None:
+                    lease.close()
+                with self._lock:
+                    self._threads.pop(export_id, None)
+                    self._cancel.pop(export_id, None)
 
     def _progress_for(self, export_id: str) -> ProgressCallback:
         def update(phase: str, fraction: float | None) -> None:
@@ -701,8 +711,8 @@ class ExportRegistry:
     def begin_shutdown(self) -> None:
         with self._lock:
             self._closed = True
-            for event in self._cancel.values():
-                event.set()
+            for export_id in list(self._cancel):
+                self.cancel(export_id)
 
 
 __all__ = [

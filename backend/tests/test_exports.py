@@ -159,6 +159,32 @@ def test_cancel_keeps_admission_until_builder_exits(tmp_path):
     assert not registry.has_active_workers
 
 
+def test_cancel_requires_the_last_client_owner(tmp_path):
+    cache = JobCache(tmp_path / "cache")
+    entered, release = threading.Event(), threading.Event()
+
+    def waits_for_release(spec, directory, progress, cancel):
+        entered.set()
+        assert release.wait(2)
+        return _builder(spec, directory, progress, cancel)
+
+    registry = ExportRegistry(
+        cache, FakeJobs(), waits_for_release, max_jobs=1, ttl_seconds=60,
+    )
+    first = registry.submit("a" * 16, "mp3", client_id="tab-a")
+    assert entered.wait(1)
+    duplicate = registry.submit("a" * 16, "mp3", client_id="tab-b")
+    assert duplicate.export_id == first.export_id
+
+    assert registry.cancel(first.export_id, "unknown-tab").state is ExportState.BUILDING
+    assert registry.cancel(first.export_id, "tab-a").state is ExportState.BUILDING
+    assert registry.cancel(first.export_id, "tab-b").state is ExportState.CANCELLED
+
+    release.set()
+    registry.shutdown()
+    assert not registry.has_active_workers
+
+
 def test_cleanup_does_not_remove_a_replacement_dedupe_entry(tmp_path):
     cache = JobCache(tmp_path / "cache")
     now = [100.0]

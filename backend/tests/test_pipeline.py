@@ -62,6 +62,21 @@ def test_export_ffmpeg_cancellation_terminates_process():
     assert time.monotonic() - started < 5
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_export_ffmpeg_stops_when_staged_output_exceeds_limit(tmp_path):
+    output = tmp_path / "too-large.wav"
+    with pytest.raises(RuntimeError, match="output exceeds"):
+        _run_export_ffmpeg(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                "-c:a", "pcm_s16le", str(output),
+            ],
+            output_path=output,
+            max_output_bytes=1,
+        )
+
+
 def test_plan_chunks_covers_full_duration():
     plans = plan_chunks(duration=95.0, chunk_seconds=30.0, overlap_seconds=1.0)
     # Total play coverage must equal the source duration (modulo rounding).

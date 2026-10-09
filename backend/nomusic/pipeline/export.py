@@ -52,6 +52,10 @@ _FFMPEG_TIMEOUT_SECONDS = 3600.0
 _PART_SUFFIX = ".part"
 
 
+class FFmpegOutputLimitExceeded(RuntimeError):
+    """The staged export grew beyond the configured output budget."""
+
+
 def complete_manifest(meta) -> bool:
     """Return true only for a complete, gap-free, in-range chunk manifest."""
     try:
@@ -244,7 +248,8 @@ def _export_reservation(
 
 
 def _run_export_ffmpeg(
-    cmd: list[str], cancel_event=None, *, on_progress=None, total_seconds: float = 0.0
+    cmd: list[str], cancel_event=None, *, on_progress=None, total_seconds: float = 0.0,
+    output_path: Path | None = None, max_output_bytes: int | None = None,
 ) -> None:
     """Run ffmpeg without pipe deadlocks and with cancellable progress."""
     report_progress = on_progress is not None and total_seconds > 0
@@ -316,6 +321,16 @@ def _run_export_ffmpeg(
                             except (ValueError, ZeroDivisionError):
                                 log.debug("unparseable ffmpeg progress: %r", text)
                     output = output.split(b"\n")[-1]
+            if output_path is not None and max_output_bytes is not None:
+                try:
+                    if output_path.stat().st_size > max_output_bytes:
+                        stop(force=True)
+                        proc.wait(timeout=2)
+                        raise FFmpegOutputLimitExceeded(
+                            f"ffmpeg output exceeds the {max_output_bytes}-byte limit"
+                        )
+                except FileNotFoundError:
+                    pass
             if proc.poll() is not None and not selector.get_map():
                 break
         proc.wait(timeout=2)
@@ -381,7 +396,10 @@ def build_export(cache, settings, spec, destination: Path, on_progress, cancel_e
                     _export_reservation(chunk_files, cap=settings.max_export_bytes)
                 )
                 on_progress("encoding", 0.0)
-                _run_export_ffmpeg(command(chunk_files, part), cancel_event)
+                _run_export_ffmpeg(
+                    command(chunk_files, part), cancel_event,
+                    output_path=part, max_output_bytes=settings.max_export_bytes,
+                )
                 if cancel_event.is_set():
                     raise ExportBuildError("cancelled")
                 size = part.stat().st_size
@@ -463,10 +481,14 @@ def build_export(cache, settings, spec, destination: Path, on_progress, cancel_e
                     cancel_event,
                     on_progress=lambda fraction: on_progress("encoding", fraction),
                     total_seconds=duration,
+                    output_path=part,
+                    max_output_bytes=settings.max_export_bytes,
                 )
 
             try:
                 encode()
+            except FFmpegOutputLimitExceeded:
+                raise
             except RuntimeError:
                 if reencode or cancel_event.is_set():
                     raise

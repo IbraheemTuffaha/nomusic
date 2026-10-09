@@ -7,50 +7,21 @@ export preparation lives in :mod:`nomusic.exports` and its dedicated routes.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 
 from nomusic.pipeline.cache import CHUNK_MEDIA_TYPE
 from nomusic.pipeline.export import (
     complete_manifest,
     snapshot_chunk_files,
 )
-
+from .responses import LeasedFileResponse, LeasedStreamingResponse
 
 router = APIRouter()
 
 # Block size (64 KiB) for streaming concatenated audio chunks to the client.
 _STREAM_BLOCK_BYTES = 65536
 
-
-class _LeasedFileResponse(FileResponse):
-    """Close a cache lease even when a client disconnects mid-response."""
-
-    def __init__(self, path: str, lease, **kwargs) -> None:
-        super().__init__(path, **kwargs)
-        self._lease = lease
-
-    async def __call__(self, scope, receive, send):
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            self._lease.close()
-
-
-class _LeasedStreamingResponse(StreamingResponse):
-    """Close a cache lease for both completed and cancelled streams."""
-
-    def __init__(self, content, lease, **kwargs) -> None:
-        super().__init__(content, **kwargs)
-        self._lease = lease
-
-    async def __call__(self, scope, receive, send):
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            self._lease.close()
 
 @router.get("/chunk/{job_id}/{chunk_idx}")
 def chunk(job_id: str, chunk_idx: int, request: Request) -> FileResponse:
@@ -81,7 +52,7 @@ def chunk(job_id: str, chunk_idx: int, request: Request) -> FileResponse:
     except BaseException:
         lease.close()
         raise
-    return _LeasedFileResponse(
+    return LeasedFileResponse(
         str(path),
         lease,
         media_type=CHUNK_MEDIA_TYPE,
@@ -137,6 +108,6 @@ def audio(job_id: str, request: Request) -> Response:
     headers = {"Cache-Control": "public, max-age=86400"}
     if total:
         headers["Content-Length"] = str(total)
-    return _LeasedStreamingResponse(
+    return LeasedStreamingResponse(
         _gen(), lease, media_type=CHUNK_MEDIA_TYPE, headers=headers,
     )

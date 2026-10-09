@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from nomusic.exports import (
@@ -18,6 +18,7 @@ from nomusic.exports import (
 )
 
 from . import JsonDict
+from .responses import LeasedFileResponse
 
 router = APIRouter()
 _EXPORT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -30,7 +31,7 @@ class ExportRequest(BaseModel):
     client_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
-def _payload(request: Request, status) -> JsonDict:
+def _payload(status) -> JsonDict:
     body = status.to_dict()
     if status.state is ExportState.READY:
         body["download_url"] = f"/exports/{status.export_id}/download"
@@ -65,7 +66,7 @@ def submit_export(req: ExportRequest, request: Request) -> JSONResponse:
             status_code=425, detail=str(exc), headers={"Cache-Control": "no-store"}
         ) from exc
     code = 200 if status.state is ExportState.READY else 202
-    return JSONResponse(_payload(request, status), status_code=code,
+    return JSONResponse(_payload(status), status_code=code,
                         headers={"Cache-Control": "no-store"})
 
 
@@ -105,7 +106,7 @@ def download_export(export_id: str, request: Request) -> Response:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     if lease is None:
         raise HTTPException(status_code=410, detail="export artifact is unavailable")
-    return _LeasedFileResponse(
+    return LeasedFileResponse(
         str(artifact),
         lease,
         media_type=status.media_type,
@@ -120,7 +121,7 @@ def get_export(export_id: str, request: Request) -> JsonDict:
     status = request.app.state.exports.get(export_id)
     if status is None:
         raise HTTPException(status_code=404, detail="unknown export_id")
-    return _payload(request, status)
+    return _payload(status)
 
 
 @router.delete("/exports/{export_id}")
@@ -133,18 +134,4 @@ def cancel_export(
     status = request.app.state.exports.cancel(export_id, client_id)
     if status is None:
         raise HTTPException(status_code=404, detail="unknown export_id")
-    return _payload(request, status)
-
-
-class _LeasedFileResponse(FileResponse):
-    """Release the reader lease even when range parsing or send fails."""
-
-    def __init__(self, path: str, lease, **kwargs) -> None:
-        super().__init__(path, **kwargs)
-        self._lease = lease
-
-    async def __call__(self, scope, receive, send):
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            self._lease.close()
+    return _payload(status)
