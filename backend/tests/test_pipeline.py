@@ -534,7 +534,7 @@ def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
     assert len(returned_plans) == len(plans)
 
 
-# --- Download export helpers (back the /audio?format=mp3 and /video endpoints) ---
+# --- Format helpers used by asynchronous exports ---
 
 
 def _has(*bins: str) -> bool:
@@ -637,8 +637,8 @@ def _make_opus_chunk(wav: Path, out: Path) -> None:
     reason="needs ffmpeg with libopus + libmp3lame and ffprobe",
 )
 def test_mp3_transcode_produces_playable_mp3(tmp_path):
-    # The /audio?format=mp3 path: concatenated Opus chunks must transcode to a
-    # single MP3 of the combined duration.
+    # The MP3 export path: concatenated Opus chunks must transcode to a single
+    # MP3 of the combined duration.
     tone = tmp_path / "tone.wav"
     _write_tone(tone, seconds=2.0)
     chunk_files = []

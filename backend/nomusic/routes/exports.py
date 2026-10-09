@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -19,6 +20,7 @@ from nomusic.exports import (
 from . import JsonDict
 
 router = APIRouter()
+_EXPORT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 class ExportRequest(BaseModel):
@@ -33,6 +35,12 @@ def _payload(request: Request, status) -> JsonDict:
     if status.state is ExportState.READY:
         body["download_url"] = f"/exports/{status.export_id}/download"
     return body
+
+
+def _require_export_id(export_id: str) -> str:
+    if not _EXPORT_ID_RE.fullmatch(export_id):
+        raise HTTPException(status_code=404, detail="unknown export_id")
+    return export_id
 
 
 @router.post("/exports")
@@ -63,6 +71,7 @@ def submit_export(req: ExportRequest, request: Request) -> JSONResponse:
 
 @router.get("/exports/{export_id}/download")
 def download_export(export_id: str, request: Request) -> Response:
+    _require_export_id(export_id)
     registry = request.app.state.exports
     status = registry.get(export_id)
     if status is None:
@@ -85,8 +94,11 @@ def download_export(export_id: str, request: Request) -> Response:
     cache = request.app.state.cache
     directory = cache.export_path(export_id)
     artifact = directory / status.filename
-    if not artifact.is_file() or artifact.stat().st_size <= 0:
-        raise HTTPException(status_code=410, detail="export artifact is unavailable")
+    try:
+        if not artifact.is_file() or artifact.stat().st_size <= 0:
+            raise HTTPException(status_code=410, detail="export artifact is unavailable")
+    except OSError as exc:
+        raise HTTPException(status_code=410, detail="export artifact is unavailable") from exc
     try:
         lease = registry.open_download(export_id)
     except ExportDownloadsFull as exc:
@@ -104,6 +116,7 @@ def download_export(export_id: str, request: Request) -> Response:
 
 @router.get("/exports/{export_id}")
 def get_export(export_id: str, request: Request) -> JsonDict:
+    _require_export_id(export_id)
     status = request.app.state.exports.get(export_id)
     if status is None:
         raise HTTPException(status_code=404, detail="unknown export_id")
@@ -116,6 +129,7 @@ def cancel_export(
     request: Request,
     client_id: str | None = Query(default=None, min_length=1, max_length=128),
 ) -> JsonDict:
+    _require_export_id(export_id)
     status = request.app.state.exports.cancel(export_id, client_id)
     if status is None:
         raise HTTPException(status_code=404, detail="unknown export_id")

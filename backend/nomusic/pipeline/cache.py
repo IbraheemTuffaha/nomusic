@@ -222,7 +222,10 @@ class JobCache:
         return self.export_path(export_id)
 
     def export_path(self, export_id: str) -> Path:
-        if not export_id or any(ch not in "0123456789abcdef-" for ch in export_id.lower()):
+        if (
+            len(export_id) != 32
+            or any(ch not in "0123456789abcdef" for ch in export_id.lower())
+        ):
             raise ValueError("invalid export id")
         path = self.root / "exports" / export_id
         try:
@@ -410,7 +413,7 @@ class JobCache:
         """Dir for a cached *video* download backing the MP4 export.
 
         The pipeline only ever fetches audio, so the video stream is pulled
-        on demand by ``GET /video/{job_id}``. We cache it here so repeat
+        on demand by an asynchronous MP4 export. We cache it here so repeat
         exports of the same video don't re-download a multi-GB stream. The key
         includes the requested ``max_height`` so switching the download-quality
         setting fetches the new resolution instead of reusing the old one.

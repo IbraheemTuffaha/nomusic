@@ -1,11 +1,8 @@
 // Background service worker.
 //
-// Today this is intentionally tiny: the content script talks to the local
-// backend directly, so the worker just owns the storage defaults and answers
-// the popup's "is the backend up?" probe.
-//
-// Reasons to put logic here later: cross-tab job sharing, a periodic backend
-// health check, or migrating away from a localhost origin.
+// The content script talks to the local backend directly. The worker owns
+// storage defaults, answers the backend health probe, and hands prepared export
+// responses to chrome.downloads so page memory never holds a whole file.
 
 const DEFAULTS = {
   backendUrl: "http://127.0.0.1:8723",
@@ -25,7 +22,37 @@ chrome.runtime.onInstalled.addListener(async () => {
   }
 });
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+const activeDownloads = new Map();
+
+chrome.downloads.onChanged?.addListener((delta) => {
+  const entry = activeDownloads.get(delta.id);
+  if (!entry) return;
+  const state = delta.state?.current;
+  if (state === "complete") {
+    activeDownloads.delete(delta.id);
+    if (entry.tabId != null) {
+      chrome.tabs?.sendMessage?.(entry.tabId, {
+        type: "download-export-complete",
+        downloadId: delta.id,
+      });
+    }
+  } else if (state === "interrupted") {
+    activeDownloads.delete(delta.id);
+    if (entry.cancelUrl) {
+      fetch(entry.cancelUrl, { method: "DELETE", cache: "no-store", keepalive: true })
+        .catch(() => {});
+    }
+    if (entry.tabId != null) {
+      chrome.tabs?.sendMessage?.(entry.tabId, {
+        type: "download-export-failed",
+        downloadId: delta.id,
+        error: delta.error?.current || "browser download interrupted",
+      });
+    }
+  }
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "ping-backend") {
     (async () => {
       try {
@@ -53,6 +80,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         if (error) {
           sendResponse({ ok: false, error: error.message || String(error) });
         } else {
+          activeDownloads.set(downloadId, {
+            tabId: sender?.tab?.id,
+            cancelUrl: typeof msg.cancelUrl === "string" ? msg.cancelUrl : "",
+          });
           sendResponse({ ok: true, downloadId });
         }
       },

@@ -221,6 +221,16 @@ def test_malformed_manifest_is_quarantined(tmp_path):
     assert not directory.exists()
 
 
+def test_malformed_export_directory_name_is_quarantined(tmp_path):
+    cache = JobCache(tmp_path / "cache")
+    directory = cache.root / "exports" / "copied-from-old-cache"
+    directory.mkdir(parents=True)
+    (directory / ".export.json").write_text("{}")
+    registry = ExportRegistry(cache, FakeJobs(), _builder)
+    assert not directory.exists()
+    registry.shutdown()
+
+
 def test_failed_manifest_write_rolls_back_admission(tmp_path, monkeypatch):
     cache = JobCache(tmp_path / "cache")
     registry = ExportRegistry(cache, FakeJobs(), _builder, max_jobs=1)
@@ -309,3 +319,9 @@ def test_http_export_api_serves_prepared_opus(client):
     )
     assert good_range.status_code == 206
     assert good_range.content == b"pre"
+
+
+def test_http_export_api_rejects_malformed_export_ids(client):
+    assert client.get("/exports/not-an-id").status_code == 404
+    assert client.get("/exports/not-an-id/download").status_code == 404
+    assert client.delete("/exports/not-an-id").status_code == 404

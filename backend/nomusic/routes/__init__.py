@@ -9,15 +9,15 @@ no deeply-nested closures) while create_app stays a thin assembler.
 Routers:
   * :mod:`routes.system` — health, capabilities, cache stats/clear.
   * :mod:`routes.jobs`   — submit/prioritize/status + the SSE event stream.
-  * :mod:`routes.media`  — per-chunk audio, the concatenated track, MP4 export.
-  * :mod:`routes.exports` — asynchronous export preparation and downloads.
+  * :mod:`routes.media`  — per-chunk audio and the concatenated track.
+  * :mod:`routes.exports` — asynchronous preparation and leased downloads.
 """
 
 from __future__ import annotations
 
 # JSON object response bodies carry heterogeneous values, so this is as specific
 # as a single alias gets; it documents intent better than a bare dict. Shared by
-# the route modules and the export-progress map.
+# the route modules.
 JsonDict = dict[str, object]
 
 __all__ = ["JsonDict"]

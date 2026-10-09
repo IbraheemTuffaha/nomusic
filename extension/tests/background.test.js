@@ -9,6 +9,7 @@ let loadCounter = 0;
 async function loadBackground({ stored }) {
   const captured = {};
   let written = null;
+  const messages = [];
   globalThis.chrome = {
     runtime: {
       onInstalled: { addListener: (cb) => (captured.onInstalled = cb) },
@@ -16,10 +17,14 @@ async function loadBackground({ stored }) {
       lastError: null,
     },
     downloads: {
+      onChanged: { addListener: (cb) => (captured.onChanged = cb) },
       download: (options, callback) => {
         captured.downloadOptions = options;
         callback(42);
       },
+    },
+    tabs: {
+      sendMessage: (tabId, message) => messages.push({ tabId, message }),
     },
     storage: {
       sync: {
@@ -31,7 +36,7 @@ async function loadBackground({ stored }) {
   // Unique query each call so the module's top-level listener registration
   // re-runs against this call's capturing stubs (ESM caches by specifier).
   await import(`../background.js?load=${++loadCounter}`);
-  return { captured, getWritten: () => written };
+  return { captured, getWritten: () => written, messages };
 }
 
 test("download-export delegates the response body to chrome downloads", async () => {
@@ -54,6 +59,45 @@ test("download-export delegates the response body to chrome downloads", async ()
     saveAs: false,
   });
   assert.deepEqual(response, { ok: true, downloadId: 42 });
+});
+
+test("an interrupted native download cancels its export and notifies its tab", async () => {
+  const { captured, messages } = await loadBackground({ stored: {} });
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return { ok: true };
+  };
+  let response;
+  captured.onMessage(
+    {
+      type: "download-export",
+      url: "http://127.0.0.1:8723/exports/export-1/download",
+      filename: "sample.mp3",
+      cancelUrl: "http://127.0.0.1:8723/exports/export-1?client_id=client-1",
+    },
+    { tab: { id: 9 } },
+    (value) => { response = value; },
+  );
+  assert.deepEqual(response, { ok: true, downloadId: 42 });
+  captured.onChanged({
+    id: 42,
+    state: { current: "interrupted" },
+    error: { current: "NETWORK_FAILED" },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(requests, [{
+    url: "http://127.0.0.1:8723/exports/export-1?client_id=client-1",
+    options: { method: "DELETE", cache: "no-store", keepalive: true },
+  }]);
+  assert.deepEqual(messages, [{
+    tabId: 9,
+    message: {
+      type: "download-export-failed",
+      downloadId: 42,
+      error: "NETWORK_FAILED",
+    },
+  }]);
 });
 
 test("onInstalled seeds only the missing storage defaults", async () => {

@@ -54,9 +54,9 @@ session holding a lease keeps the worker running.
 The download chevron beside nomusic offers **MP3 — audio only** and **Video
 (MP4)** at several resolutions. The extension submits a durable export job,
 shows its preparation progress, and hands the ready artifact to the browser's
-native downloads service; it never buffers the whole file in the page. You can
-request either before processing finishes; keep the tab open until the
-download completes. Pausing playback does not cancel export preparation. MP4
+native downloads service; it never buffers the whole file in the page. Request
+an export after processing reaches Ready; keep the tab open until the download
+completes. Pausing playback does not cancel an admitted export. MP4
 may require another source download.
 The local policy accepts finite sources up to two hours and 512 MiB of source
 audio. Video exports are capped at 1080p and 2 GiB; a larger selected format

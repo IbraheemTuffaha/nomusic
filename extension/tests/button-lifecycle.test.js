@@ -45,7 +45,9 @@ test("ready export uses the native downloads API without reading a Blob", async 
   const fetch = t.mock.method(globalThis, "fetch", async (url, options) => {
     assert.equal(url, "http://localhost:8723/exports");
     assert.equal(options.method, "POST");
-    assert.deepEqual(JSON.parse(options.body), { job_id: "job", format: "mp3" });
+    const body = JSON.parse(options.body);
+    assert.deepEqual({ job_id: body.job_id, format: body.format }, { job_id: "job", format: "mp3" });
+    assert.match(body.client_id, /^/);
     return response({
       export_id: "export-1", state: "ready", filename: "A song.mp3",
       progress: 1, phase: "ready",
@@ -53,11 +55,16 @@ test("ready export uses the native downloads API without reading a Blob", async 
   });
   await button._startDownload("mp3");
   assert.equal(fetch.mock.callCount(), 1);
-  assert.deepEqual(messages, [{
-    type: "download-export",
-    url: "http://localhost:8723/exports/export-1/download",
-    filename: "A song.mp3",
-  }]);
+  assert.equal(messages.length, 1);
+  assert.deepEqual(
+    { type: messages[0].type, url: messages[0].url, filename: messages[0].filename },
+    {
+      type: "download-export",
+      url: "http://localhost:8723/exports/export-1/download",
+      filename: "A song.mp3",
+    },
+  );
+  assert.match(messages[0].cancelUrl, /client_id=/);
   assert.equal(elements.filter((element) => element.tagName === "A").length, 0);
   assert.equal(button._downloading, false);
   assert.equal(button.label.textContent, "nomusic on");

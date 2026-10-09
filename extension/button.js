@@ -86,7 +86,17 @@ export class Button {
     this._menuOpen = false;
     this._downloading = false;
     this._download = null;
-    this._downloadUrls = new Map();
+    this.clientId = globalThis.crypto?.randomUUID?.()
+      || `client-${Math.random().toString(16).slice(2)}-${Date.now()}`;
+    this._nativeDownloads = new Set();
+    this._onRuntimeMessage = (message) => {
+      if (!this._nativeDownloads.has(message?.downloadId)) return;
+      this._nativeDownloads.delete(message.downloadId);
+      if (message.type === "download-export-complete") return;
+      if (message.type !== "download-export-failed") return;
+      if (!this._retired) this._flashDownloadError(message.error || "browser download interrupted");
+    };
+    chrome.runtime.onMessage?.addListener?.(this._onRuntimeMessage);
     // A download requested before the track finished processing: {format,
     // height}. Held until the job reaches "ready", then saved automatically.
     this._pendingDownload = null;
@@ -357,7 +367,7 @@ export class Button {
     // hidden menu orphaned on document.body, one per navigation. openMenu()
     // re-appends it if this same button is later reused.
     this._cancelDownload();
-    this._revokeDownloadUrls();
+    chrome.runtime.onMessage?.removeListener?.(this._onRuntimeMessage);
     this.closeMenu();
     this.menu.remove();
     this.setIdle();
@@ -387,14 +397,6 @@ export class Button {
     }
     this._downloading = false;
     this._pendingDownload = null;
-  }
-
-  _revokeDownloadUrls() {
-    for (const [url, timer] of this._downloadUrls) {
-      clearTimeout(timer);
-      URL.revokeObjectURL(url);
-    }
-    this._downloadUrls.clear();
   }
 
   // The download menu. MP3 (audio only) plus MP4 at a few resolution caps.
@@ -538,6 +540,7 @@ export class Button {
         body: JSON.stringify({
           job_id: jobId,
           format,
+          client_id: this.clientId,
           ...(format === "mp4" && height ? { max_height: height } : {}),
         }),
       });
@@ -545,7 +548,7 @@ export class Button {
       const submitted = await submit.json();
       if (!submit.ok) throw new Error(submitted?.detail || `HTTP ${submit.status}`);
       download.exportId = submitted.export_id;
-      download.cancelUrl = `${base}/exports/${encodeURIComponent(download.exportId)}`;
+      download.cancelUrl = `${base}/exports/${encodeURIComponent(download.exportId)}?client_id=${encodeURIComponent(this.clientId)}`;
       let status = submitted;
       while (current() && status.state !== "ready") {
         if (["failed", "expired", "cancelled"].includes(status.state)) {
@@ -572,8 +575,10 @@ export class Button {
         status = await statusResponse.json();
       }
       if (!current()) return;
-      const filename = sanitizeFilename(status.filename)
-        || `${sanitizeFilename(this.title) || "nomusic"}.${format}`;
+      const title = sanitizeFilename(this.title);
+      const filename = title
+        ? `${title}.${format}`
+        : sanitizeFilename(status.filename) || `nomusic.${format}`;
       const message = await new Promise((resolve, reject) => {
         try {
           chrome.runtime.sendMessage(
@@ -581,6 +586,7 @@ export class Button {
               type: "download-export",
               url: `${base}/exports/${encodeURIComponent(download.exportId)}/download`,
               filename,
+              cancelUrl: download.cancelUrl,
             },
             (response) => {
               const error = chrome.runtime.lastError;
@@ -592,8 +598,10 @@ export class Button {
           reject(error);
         }
       });
+      if (!current()) return;
       if (!message?.ok) throw new Error(message?.error || "browser download failed");
       download.nativeStarted = true;
+      this._nativeDownloads.add(message.downloadId);
       this._cancelDownload({ cancelExport: false });
       this._restoreAfterDownload();
     } catch (err) {

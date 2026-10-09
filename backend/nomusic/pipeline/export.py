@@ -1,6 +1,6 @@
 """Helpers for assembling a finished job's chunks into a downloadable file.
 
-These back the ``/audio?format=mp3`` and ``/video`` download endpoints. They're
+These back the asynchronous ``/exports`` workflow. They're
 kept out of ``server.py`` so they can be unit-tested without importing the
 FastAPI app (which loads the separation engine at import time).
 

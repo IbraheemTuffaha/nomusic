@@ -274,10 +274,35 @@ class ExportRegistry:
             return False
 
     def _remove_directory(self, directory: Path) -> bool:
-        if not directory.exists() or directory.is_symlink():
+        if directory.is_symlink():
+            try:
+                directory.unlink(missing_ok=True)
+                return True
+            except OSError:
+                log.debug("Could not remove export symlink %s", directory, exc_info=True)
+                return False
+        if not directory.exists():
             return True
+        exports_root = (self.cache.root / "exports").resolve()
         try:
-            with self.cache.export_lease(directory.name, shared=False, blocking=False):
+            if directory.parent.resolve() != exports_root:
+                return False
+        except OSError:
+            return False
+        try:
+            try:
+                lease = self.cache.export_lease(
+                    directory.name, shared=False, blocking=False
+                )
+            except ValueError:
+                # A malformed directory can exist on disk after a manual copy
+                # or an older version. It is already confined to exports_root,
+                # so quarantine it with the path-level lease instead of letting
+                # startup fail while trying to validate its name.
+                from nomusic.pipeline.cache import CacheLease
+
+                lease = CacheLease(directory, shared=False, blocking=False)
+            with lease:
                 shutil.rmtree(directory, ignore_errors=True)
             return True
         except BlockingIOError:
