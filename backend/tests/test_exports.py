@@ -54,7 +54,7 @@ class FakeJobs:
         self.job = FakeJob(state)
 
     def get(self, job_id):
-        return self.job if job_id in ("job", "job-2") else None
+        return self.job if job_id in ("a" * 16, "b" * 16) else None
 
 
 def _builder(spec, directory, progress, cancel):
@@ -79,46 +79,43 @@ def test_registry_deduplicates_and_recovers_ready_manifest(tmp_path):
     cache = JobCache(tmp_path / "cache")
     jobs = FakeJobs()
     registry = ExportRegistry(
-        cache, jobs, _builder, max_jobs=1, ttl_seconds=60, wait_timeout_seconds=2
+        cache, jobs, _builder, max_jobs=1, ttl_seconds=60
     )
-    first = registry.submit("job", "mp3")
+    first = registry.submit("a" * 16, "mp3")
     ready = _wait(registry, first.export_id)
-    duplicate = registry.submit("job", "mp3")
+    duplicate = registry.submit("a" * 16, "mp3")
     assert duplicate.export_id == first.export_id
     assert ready.size_bytes == len(b"prepared")
     registry.shutdown()
 
-    recovered = ExportRegistry(
-        cache, jobs, _builder, max_jobs=1, ttl_seconds=60, wait_timeout_seconds=2
-    )
+    recovered = ExportRegistry(cache, jobs, _builder, max_jobs=1, ttl_seconds=60)
     assert recovered.get(first.export_id).state is ExportState.READY
-    assert recovered.submit("job", "mp3").export_id == first.export_id
+    assert recovered.submit("a" * 16, "mp3").export_id == first.export_id
     recovered.shutdown()
 
 
 def test_registry_bounds_active_builds_and_cancels_waiter(tmp_path):
     cache = JobCache(tmp_path / "cache")
-    jobs = FakeJobs(JobState.PROCESSING)
+    jobs = FakeJobs()
     registry = ExportRegistry(
-        cache, jobs, _builder, max_jobs=1, ttl_seconds=60, wait_timeout_seconds=10
+        cache, jobs, _builder, max_jobs=1, ttl_seconds=60
     )
-    first = registry.submit("job", "opus")
+    first = registry.submit("a" * 16, "opus")
     with pytest.raises(ExportQueueFull):
-        registry.submit("job-2", "opus")
+        registry.submit("b" * 16, "opus")
     cancelled = registry.cancel(first.export_id)
     assert cancelled.state is ExportState.CANCELLED
     registry.shutdown()
 
 
-def test_registry_fails_when_source_wait_expires(tmp_path):
+def test_registry_rejects_source_that_is_not_ready(tmp_path):
     cache = JobCache(tmp_path / "cache")
     registry = ExportRegistry(
         cache, FakeJobs(JobState.PROCESSING), _builder, max_jobs=1,
-        ttl_seconds=60, wait_timeout_seconds=0.05,
+        ttl_seconds=60,
     )
-    status = registry.submit("job", "mp3")
-    failed = _wait(registry, status.export_id, ExportState.FAILED)
-    assert "did not become ready" in failed.error
+    with pytest.raises(RuntimeError, match="not ready"):
+        registry.submit("a" * 16, "mp3")
     registry.shutdown()
 
 
@@ -132,10 +129,9 @@ def test_registry_expires_ready_artifact(tmp_path):
         _builder,
         max_jobs=1,
         ttl_seconds=10,
-        wait_timeout_seconds=2,
         clock=lambda: now[0],
     )
-    status = registry.submit("job", "opus")
+    status = registry.submit("a" * 16, "opus")
     _wait(registry, status.export_id)
     assert registry.cleanup(now=111) == 1
     assert registry.get(status.export_id).state is ExportState.EXPIRED
@@ -143,13 +139,49 @@ def test_registry_expires_ready_artifact(tmp_path):
     registry.shutdown()
 
 
+def test_cancel_keeps_admission_until_builder_exits(tmp_path):
+    cache = JobCache(tmp_path / "cache")
+    entered, release = threading.Event(), threading.Event()
+
+    def ignores_cancel(spec, directory, progress, cancel):
+        entered.set()
+        assert release.wait(2)
+        return _builder(spec, directory, progress, cancel)
+
+    registry = ExportRegistry(cache, FakeJobs(), ignores_cancel, max_jobs=1, ttl_seconds=1)
+    first = registry.submit("a" * 16, "mp3")
+    assert entered.wait(1)
+    registry.cancel(first.export_id)
+    with pytest.raises(ExportQueueFull):
+        registry.submit("b" * 16, "mp3")
+    release.set()
+    registry.shutdown()
+    assert not registry.has_active_workers
+
+
+def test_cleanup_does_not_remove_a_replacement_dedupe_entry(tmp_path):
+    cache = JobCache(tmp_path / "cache")
+    now = [100.0]
+    registry = ExportRegistry(cache, FakeJobs(), _builder, ttl_seconds=10, clock=lambda: now[0])
+    first = registry.submit("a" * 16, "mp3")
+    _wait(registry, first.export_id)
+    assert registry.cleanup(now=111) == 1
+    now[0] = 111
+    replacement = registry.submit("a" * 16, "mp3")
+    _wait(registry, replacement.export_id)
+    now[0] = 112
+    registry.cleanup()
+    assert registry.submit("a" * 16, "mp3").export_id == replacement.export_id
+    registry.shutdown()
+
+
 def test_download_reader_slots_are_bounded(tmp_path):
     cache = JobCache(tmp_path / "cache")
     registry = ExportRegistry(
         cache, FakeJobs(), _builder, max_jobs=1, max_downloads=1,
-        ttl_seconds=60, wait_timeout_seconds=2,
+        ttl_seconds=60,
     )
-    status = registry.submit("job", "opus")
+    status = registry.submit("a" * 16, "opus")
     _wait(registry, status.export_id)
     first = registry.open_download(status.export_id)
     with pytest.raises(ExportDownloadsFull):
@@ -171,17 +203,43 @@ def test_artifact_size_limit_fails_before_publication(tmp_path):
 
     registry = ExportRegistry(
         cache, FakeJobs(), oversized, max_jobs=1, max_artifact_bytes=5,
-        ttl_seconds=60, wait_timeout_seconds=2,
+        ttl_seconds=60,
     )
-    status = registry.submit("job", "opus")
+    status = registry.submit("a" * 16, "opus")
     failed = _wait(registry, status.export_id, ExportState.FAILED)
     assert "exceeds" in failed.error
+    assert not (cache.export_path(status.export_id) / "too-large").exists()
+    registry.shutdown()
+
+
+def test_malformed_manifest_is_quarantined(tmp_path):
+    cache = JobCache(tmp_path / "cache")
+    directory = cache.ensure_export_dir("a" * 32)
+    (directory / ".export.json").write_text("{}")
+    registry = ExportRegistry(cache, FakeJobs(), _builder)
+    assert registry.get("a" * 32) is None
+    assert not directory.exists()
+
+
+def test_failed_manifest_write_rolls_back_admission(tmp_path, monkeypatch):
+    cache = JobCache(tmp_path / "cache")
+    registry = ExportRegistry(cache, FakeJobs(), _builder, max_jobs=1)
+
+    def fail(_status):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(registry, "_write_manifest", fail)
+    with pytest.raises(OSError, match="disk full"):
+        registry.submit("a" * 16, "mp3")
+    assert not registry._statuses
+    assert not registry._threads
+    assert not list(cache.export_entries())
     registry.shutdown()
 
 
 def test_source_cache_sweep_does_not_expire_export_ttl(tmp_path):
     cache = JobCache(tmp_path / "cache")
-    directory = cache.export_dir("a" * 32)
+    directory = cache.ensure_export_dir("a" * 32)
     artifact = directory / "ready.opus"
     artifact.write_bytes(b"artifact")
     old = time.time() - 1000
@@ -238,3 +296,16 @@ def test_http_export_api_serves_prepared_opus(client):
     assert downloaded.status_code == 200
     assert downloaded.content == b"prepared"
     assert downloaded.headers["content-type"].startswith("audio/ogg")
+
+    # Range errors and missing-artifact paths must release the reader slot even
+    # though Starlette returns before its normal background callback.
+    client.app.state.exports._download_slots = threading.BoundedSemaphore(1)
+    bad_range = client.get(
+        f"/exports/{export_id}/download", headers={"Range": "bytes=999-1000"}
+    )
+    assert bad_range.status_code == 416
+    good_range = client.get(
+        f"/exports/{export_id}/download", headers={"Range": "bytes=0-2"}
+    )
+    assert good_range.status_code == 206
+    assert good_range.content == b"pre"

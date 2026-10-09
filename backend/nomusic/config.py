@@ -235,9 +235,6 @@ class Settings:
     export_sweep_interval_seconds: float = field(
         default_factory=lambda: _env_float("EXPORT_SWEEP_INTERVAL_SECONDS", 300.0)
     )
-    export_wait_timeout_seconds: float = field(
-        default_factory=lambda: _env_float("EXPORT_WAIT_TIMEOUT_SECONDS", 7200.0)
-    )
     max_export_downloads: int = field(
         default_factory=lambda: _env_int("MAX_EXPORT_DOWNLOADS", 4)
     )

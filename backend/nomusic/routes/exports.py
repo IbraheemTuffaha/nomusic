@@ -4,15 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from starlette.background import BackgroundTask
 
 from nomusic.exports import (
     ExportDownloadsFull,
     ExportQueueFull,
     ExportRegistryClosed,
+    ExportSourceNotReady,
     ExportState,
 )
 
@@ -22,9 +22,10 @@ router = APIRouter()
 
 
 class ExportRequest(BaseModel):
-    job_id: str = Field(..., min_length=1)
+    job_id: str = Field(..., min_length=16, max_length=16, pattern=r"^[0-9a-fA-F]{16}$")
     format: str = Field(..., min_length=1)
     max_height: int | None = Field(default=None, ge=-1, le=10000)
+    client_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 def _payload(request: Request, status) -> JsonDict:
@@ -38,7 +39,7 @@ def _payload(request: Request, status) -> JsonDict:
 def submit_export(req: ExportRequest, request: Request) -> JSONResponse:
     registry = request.app.state.exports
     try:
-        status = registry.submit(req.job_id, req.format, req.max_height)
+        status = registry.submit(req.job_id, req.format, req.max_height, req.client_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="unknown job_id") from exc
     except ValueError as exc:
@@ -51,6 +52,10 @@ def submit_export(req: ExportRequest, request: Request) -> JSONResponse:
         )
     except ExportRegistryClosed as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ExportSourceNotReady as exc:
+        raise HTTPException(
+            status_code=425, detail=str(exc), headers={"Cache-Control": "no-store"}
+        ) from exc
     code = 200 if status.state is ExportState.READY else 202
     return JSONResponse(_payload(request, status), status_code=code,
                         headers={"Cache-Control": "no-store"})
@@ -78,7 +83,7 @@ def download_export(export_id: str, request: Request) -> Response:
         raise HTTPException(status_code=410, detail="export artifact is unavailable")
 
     cache = request.app.state.cache
-    directory = cache.export_dir(export_id)
+    directory = cache.export_path(export_id)
     artifact = directory / status.filename
     if not artifact.is_file() or artifact.stat().st_size <= 0:
         raise HTTPException(status_code=410, detail="export artifact is unavailable")
@@ -88,12 +93,12 @@ def download_export(export_id: str, request: Request) -> Response:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     if lease is None:
         raise HTTPException(status_code=410, detail="export artifact is unavailable")
-    return FileResponse(
+    return _LeasedFileResponse(
         str(artifact),
+        lease,
         media_type=status.media_type,
         filename=status.filename,
-        headers={"Cache-Control": "no-store", "Content-Length": str(status.size_bytes or artifact.stat().st_size)},
-        background=BackgroundTask(lease.close),
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -106,8 +111,26 @@ def get_export(export_id: str, request: Request) -> JsonDict:
 
 
 @router.delete("/exports/{export_id}")
-def cancel_export(export_id: str, request: Request) -> JsonDict:
-    status = request.app.state.exports.cancel(export_id)
+def cancel_export(
+    export_id: str,
+    request: Request,
+    client_id: str | None = Query(default=None, min_length=1, max_length=128),
+) -> JsonDict:
+    status = request.app.state.exports.cancel(export_id, client_id)
     if status is None:
         raise HTTPException(status_code=404, detail="unknown export_id")
     return _payload(request, status)
+
+
+class _LeasedFileResponse(FileResponse):
+    """Release the reader lease even when range parsing or send fails."""
+
+    def __init__(self, path: str, lease, **kwargs) -> None:
+        super().__init__(path, **kwargs)
+        self._lease = lease
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._lease.close()

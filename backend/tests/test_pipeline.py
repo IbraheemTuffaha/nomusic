@@ -595,7 +595,7 @@ def test_snapshot_chunk_files_returns_contiguous_prefix(tmp_path):
     # A gap in the chunk sequence must truncate the snapshot — the export must
     # never advertise/serve chunks past the first hole.
     cache = JobCache(tmp_path / "cache")
-    key = "job0"
+    key = "0" * 16
     cache.dir_for(key)  # create the dir without going through the processor
     for idx in (0, 1, 2, 4):  # note: 3 is missing
         cache.chunk_path(key, idx).write_bytes(f"chunk{idx}".encode())

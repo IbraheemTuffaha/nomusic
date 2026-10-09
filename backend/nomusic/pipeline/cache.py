@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -48,6 +49,7 @@ SCHEMA_VERSION = 3
 
 CHUNK_EXT = ".opus"
 CHUNK_MEDIA_TYPE = "audio/ogg"
+_CACHE_KEY_RE = re.compile(r"^[0-9a-f]{16}$")
 
 # Top-level directories that are not completed job entries. Source/video caches
 # have separate accounting; private staging is reclaimed only via its leases.
@@ -60,14 +62,19 @@ class StorageLimitExceeded(RuntimeError):
 
 class CacheLease:
     """Advisory lease for one cache namespace."""
-    def __init__(self, directory: Path, *, shared: bool = False) -> None:
+    def __init__(
+        self, directory: Path, *, shared: bool = False, blocking: bool = True
+    ) -> None:
         self.directory = directory
         self.shared = shared
         directory.mkdir(parents=True, exist_ok=True)
         self.path = directory / ".lease"
         self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            lock = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+            if not blocking:
+                lock |= fcntl.LOCK_NB
+            fcntl.flock(self.fd, lock)
         except BaseException:
             os.close(self.fd)
             raise
@@ -99,6 +106,12 @@ class CacheReservation:
         if not self._released:
             self._released = True
             self.cache.release(self.amount)
+
+    def resize(self, amount: int) -> None:
+        """Atomically change the reservation while bytes remain staged."""
+        if self._released:
+            raise RuntimeError("cannot resize a released cache reservation")
+        self.cache.resize(self, amount)
 
     def __enter__(self) -> "CacheReservation":
         return self
@@ -192,23 +205,52 @@ class JobCache:
     def source_lease(self, url: str) -> CacheLease:
         return CacheLease(self.root / "sources" / self.url_key(url))
 
-    def video_lease(self, url: str, max_height: int | None = None) -> CacheLease:
-        return CacheLease(self.video_dir(url, max_height))
+    def video_lease(
+        self,
+        url: str,
+        max_height: int | None = None,
+        *,
+        shared: bool = False,
+        blocking: bool = True,
+    ) -> CacheLease:
+        return CacheLease(
+            self.video_dir(url, max_height), shared=shared, blocking=blocking
+        )
 
     def export_dir(self, export_id: str) -> Path:
-        """Return the persistent directory for one prepared export artifact."""
+        """Return the export path without creating it."""
+        return self.export_path(export_id)
+
+    def export_path(self, export_id: str) -> Path:
         if not export_id or any(ch not in "0123456789abcdef-" for ch in export_id.lower()):
             raise ValueError("invalid export id")
         path = self.root / "exports" / export_id
+        try:
+            if path.is_symlink() or not path.resolve().is_relative_to(
+                (self.root / "exports").resolve()
+            ):
+                raise ValueError("invalid export path")
+        except OSError as exc:
+            raise ValueError("invalid export path") from exc
+        return path
+
+    def ensure_export_dir(self, export_id: str) -> Path:
+        path = self.export_path(export_id)
         path.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink():
+            raise ValueError("invalid export path")
         return path
 
     def export_entries(self) -> list[Path]:
         """List export artifact directories without creating the tree."""
         return self._tree_entries("exports")
 
-    def export_lease(self, export_id: str, *, shared: bool = False) -> CacheLease:
-        return CacheLease(self.export_dir(export_id), shared=shared)
+    def export_lease(
+        self, export_id: str, *, shared: bool = False, blocking: bool = True
+    ) -> CacheLease:
+        return CacheLease(
+            self.ensure_export_dir(export_id), shared=shared, blocking=blocking
+        )
 
     @staticmethod
     def _try_exclusive_lock(directory: Path) -> int | None:
@@ -264,6 +306,26 @@ class JobCache:
             self._reserved_bytes += amount
         return CacheReservation(self, amount)
 
+    def resize(self, reservation: CacheReservation, amount: int) -> None:
+        """Atomically change a reservation while bytes remain staged."""
+        amount = max(0, int(amount))
+        with self._reservation_lock:
+            current = reservation.amount
+            usage = self.stats()["total_bytes"]
+            free = shutil.disk_usage(self.root).free
+            projected = usage + self._reserved_bytes - current + amount
+            if self.max_bytes is not None and projected > self.max_bytes:
+                raise StorageLimitExceeded(
+                    f"cache budget exceeded: {projected} > {self.max_bytes} bytes"
+                )
+            if free - (self._reserved_bytes - current + amount) < self.min_free_bytes:
+                raise StorageLimitExceeded(
+                    f"insufficient free storage for {amount} bytes; "
+                    f"reserve at least {self.min_free_bytes} bytes"
+                )
+            self._reserved_bytes += amount - current
+            reservation.amount = amount
+
     def release(self, amount: int) -> None:
         with self._reservation_lock:
             self._reserved_bytes = max(0, self._reserved_bytes - max(0, amount))
@@ -305,7 +367,11 @@ class JobCache:
         return hashlib.sha256(url.encode()).hexdigest()[:16]
 
     def dir_for(self, key: str) -> Path:
-        path = self.root / key
+        if not self.valid_key(key):
+            raise ValueError("invalid cache key")
+        path = self.root / str(key).lower()
+        if path.is_symlink():
+            raise ValueError("invalid cache key")
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -314,7 +380,16 @@ class JobCache:
         any request with an unknown ``job_id`` (GET /status, /chunk, /audio,
         the GC re-checking swept keys) leaves a phantom empty dir behind that
         then inflates ``stats().job_count`` until the TTL sweep reclaims it."""
-        return self.root / key
+        if not _CACHE_KEY_RE.fullmatch(str(key).lower()):
+            # Invalid user input must never escape the cache root. Returning a
+            # guaranteed-miss path keeps read routes 404able while write paths
+            # reject it in ``dir_for``.
+            return self.root / ".invalid-key"
+        return self.root / str(key).lower()
+
+    @staticmethod
+    def valid_key(key: str) -> bool:
+        return bool(_CACHE_KEY_RE.fullmatch(str(key).lower()))
 
     def source_dir(self, url: str) -> Path:
         path = self.root / "sources" / self.url_key(url)

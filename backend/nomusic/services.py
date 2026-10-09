@@ -92,9 +92,9 @@ class Services:
             max_queued_jobs=settings.max_queued_jobs,
         )
         self.registry.attach_loop(loop)
-        # Export workers wait for the source job to reach READY, then prepare a
-        # durable artifact behind their own cache lease.  The closure keeps the
-        # format builder independent from the service/state machine module.
+        # Export workers prepare a durable artifact behind their own cache lease.
+        # The source must already be READY, which keeps export admission bounded
+        # and avoids retaining abandoned source jobs for hours.
         self.exports = ExportRegistry(
             self.cache,
             self.registry,
@@ -103,7 +103,6 @@ class Services:
             ),
             max_jobs=settings.max_export_jobs,
             ttl_seconds=settings.export_ttl_seconds,
-            wait_timeout_seconds=settings.export_wait_timeout_seconds,
             max_artifact_bytes=settings.max_export_bytes,
             max_downloads=settings.max_export_downloads,
         )
