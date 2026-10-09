@@ -710,7 +710,10 @@ def test_mux_video_replaces_audio_with_stripped_track(tmp_path):
         check=True, capture_output=True,
     )
 
-    out = tmp_path / "out.mp4"
+    # The export worker stages this as ``*.mp4.part`` before renaming it.
+    # Keep the temporary suffix here so the command remains covered by the
+    # regression test that motivated the explicit MP4 muxer.
+    out = tmp_path / "out.mp4.part"
     subprocess.run(mux_video_cmd(video, chunk_files, out), check=True, capture_output=True)
 
     streams = _ffprobe_streams(out)

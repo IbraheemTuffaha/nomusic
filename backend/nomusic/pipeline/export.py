@@ -223,6 +223,9 @@ def mux_video_cmd(
         "-c:a", "aac", "-b:a", "192k",
         "-shortest",
         "-movflags", "+faststart",
+        # The worker writes to a .mp4.part staging path. Keep the muxer
+        # explicit because ffmpeg cannot infer it from that temporary suffix.
+        "-f", "mp4",
         str(dest),
     ]
 
