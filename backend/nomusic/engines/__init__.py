@@ -1,0 +1,38 @@
+"""Source-separation engine implementations.
+
+The package exposes a stable :class:`Engine` interface in :mod:`engines.base`.
+Concrete engines (MLX today, ONNX or CUDA tomorrow) implement that interface and
+are loaded by name from :func:`get_engine`.
+"""
+
+from __future__ import annotations
+
+import importlib
+
+from .base import Engine, EngineCapabilities, SeparationResult
+
+_REGISTRY: dict[str, str] = {
+    # ``mlx`` is the historical name (the strategic Apple Silicon backend); the
+    # current implementation runs demucs via torch on MPS/CUDA/CPU. ``demucs`` is
+    # an alias that reads more honestly on non-Apple hosts.
+    "mlx": "nomusic.engines.mlx_engine:MLXEngine",
+    "demucs": "nomusic.engines.mlx_engine:MLXEngine",
+}
+
+
+def get_engine(name: str, *, local_files_only: bool = False) -> Engine:
+    """Instantiate the engine registered under ``name``.
+
+    Engines are imported lazily so a missing optional dependency (e.g. MLX on a
+    non-Apple-Silicon host) never breaks unrelated engines.
+    """
+    if name not in _REGISTRY:
+        raise ValueError(
+            f"Unknown engine {name!r}. Known engines: {sorted(_REGISTRY)}"
+        )
+    module_path, _, attr = _REGISTRY[name].partition(":")
+    module = importlib.import_module(module_path)
+    return getattr(module, attr)(local_files_only=local_files_only)
+
+
+__all__ = ["Engine", "EngineCapabilities", "SeparationResult", "get_engine"]

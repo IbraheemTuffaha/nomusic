@@ -1,0 +1,1120 @@
+"""In-process job registry and background worker.
+
+The HTTP layer is intentionally thin: clients POST a job, then poll
+``/status/{id}`` and pull ready chunks. All state lives here so server.py stays
+small and the worker stays testable without spinning up uvicorn.
+
+Concurrency model: one background ``threading.Thread`` per job. The MLX engine
+holds the GPU exclusively (Apple unified memory; demucs serializes anyway), so
+we serialize *runs* across jobs with a global lock; multiple jobs queue up
+rather than fighting for the GPU.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import collections
+import logging
+import threading
+import time
+import traceback
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Callable, Optional
+
+from nomusic.config import SETTINGS
+from nomusic.pipeline.cache import CacheMeta, JobCache
+from nomusic.pipeline.processor import Processor, RunHooks
+from nomusic.worker import (
+    SupervisedModelWorker,
+    WorkerAbandoned as SupervisedWorkerAbandoned,
+    WorkerCrashed,
+    WorkerDeadlineExceeded as SupervisedWorkerDeadlineExceeded,
+)
+
+log = logging.getLogger(__name__)
+
+
+class WorkerAbandoned(Exception):
+    """Raised when a job goes idle, its cache is cleared, or shutdown starts.
+    It propagates up through
+    ``Processor.run`` and out of ``with self._gpu_lock:``, so the GPU lock is
+    released naturally on the way out and the worker thread exits. The client
+    re-spawns the job from disk-cached progress on its next click."""
+
+
+class RegistryClosed(RuntimeError):
+    """The service is stopping and cannot accept new work."""
+
+
+class JobQueueFull(RuntimeError):
+    """The bounded execution queue cannot admit another job."""
+
+
+class JobState(str, Enum):
+    QUEUED = "queued"
+    PROBING = "probing"
+    DOWNLOADING = "downloading"
+    PROCESSING = "processing"
+    READY = "ready"
+    ERROR = "error"
+
+
+# Button labels. Kept to a single word each and device-neutral: the audio is
+# fetched to the *server*, not the browser, and it's audio not video, so we
+# avoid "Downloading video". "Fetching" covers the yt-dlp pull without implying
+# where the bytes land; "Preparing" covers the metadata probe + planning;
+# "Removing" is the separation phase (music removal).
+_PHASE_LABELS: dict[str, str] = {
+    "queued": "Queued",
+    "probing": "Preparing",
+    "downloading": "Fetching",
+    "processing": "Removing",
+    "ready": "Ready",
+    "error": "Error",
+}
+
+# States in which a job's worker is still live, so a duplicate /process should
+# adopt the running job rather than spawn a second worker for the same key.
+_LIVE_JOB_STATES = (
+    JobState.QUEUED,
+    JobState.PROBING,
+    JobState.DOWNLOADING,
+    JobState.PROCESSING,
+)
+
+
+@dataclass
+class JobStatus:
+    job_id: str  # equals the cache key
+    state: JobState
+    # phase mirrors state.value for the UI; kept separate so future phases
+    # (probing, mixing, post-processing) can split out without renaming
+    # existing states.
+    phase: str = "queued"
+    # phase_progress is 0..1 within the current phase. None = indeterminate
+    # (rare; only when yt-dlp can't report total bytes).
+    phase_progress: float | None = 0.0
+    phase_label: str = "Queued"
+    chunks_ready: int = 0
+    # Sorted list of completed chunk indices. With seek-driven reordering
+    # these are no longer contiguous from 0, so the client needs the actual
+    # set, not just the count, to know which /chunk/{idx} URLs to fetch.
+    ready_chunks: list[int] = field(default_factory=list)
+    total_chunks: int = 0
+    duration_seconds: float = 0.0
+    title: str = ""
+    error: str = ""
+    cache_key: str = ""
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, object]:
+        d = asdict(self)
+        d["state"] = self.state.value
+        return d
+
+
+@dataclass(frozen=True)
+class _Execution:
+    """Identity of one physical run for a content-cache key.
+
+    ``key`` identifies the reusable content cache.  ``generation`` identifies
+    the current execution that is allowed to publish into that cache, while
+    ``status`` is the in-memory API state owned by the same run.  A replacement
+    run gets a new token even when it resumes the same cache directory; late
+    callbacks from the old token must be ignored or aborted.
+    """
+
+    key: str
+    generation: int
+    status: JobStatus
+    cache_generation: str | None = None
+
+
+class _JobControl:
+    """Per-job runtime control surface.
+
+    Owns the pending-chunk deque that the worker pops from and the HTTP
+    layer mutates via ``JobRegistry.prioritize``. The deque holds chunk
+    indices in the order they should be processed; under its own lock so
+    a /prioritize call can reorder it while the worker is mid-chunk.
+    """
+
+    def __init__(self, total_chunks: int, done: set[int]) -> None:
+        self.lock = threading.Lock()
+        self.total_chunks = total_chunks
+        self.pending: collections.deque[int] = collections.deque(
+            i for i in range(total_chunks) if i not in done
+        )
+
+    def next_chunk(self) -> Optional[int]:
+        with self.lock:
+            return self.pending.popleft() if self.pending else None
+
+    def prioritize(self, from_chunk: int) -> None:
+        """Rotate to [from_chunk, from_chunk+1, …, N-1, 0, 1, …, from_chunk-1],
+        keeping only entries currently still pending. No-op if the queue is
+        empty.
+
+        We sort both halves explicitly: after even one reorder the deque is
+        no longer in ascending order, so a position-preserving filter would
+        leave whichever chunks happened to be near the front of the prior
+        ordering ahead of the new seek target. Sorting guarantees the next
+        pop is always ``from_chunk`` (or the next still-pending index after
+        it) regardless of how scrambled the prior order was.
+        """
+        with self.lock:
+            if not self.pending:
+                return
+            from_chunk = max(0, min(from_chunk, self.total_chunks - 1))
+            pending = set(self.pending)
+            front = sorted(i for i in pending if i >= from_chunk)
+            back = sorted(i for i in pending if i < from_chunk)
+            self.pending = collections.deque(front + back)
+
+
+class JobRegistry:
+    def __init__(
+        self, processor: Processor, cache: JobCache,
+        *, is_stopping: Callable[[], bool] | None = None,
+        worker: SupervisedModelWorker | None = None,
+        max_queued_jobs: int | None = None,
+        client_lease_seconds: float | None = None,
+        sse_queue_size: int | None = None,
+    ) -> None:
+        self.processor = processor
+        self.cache = cache
+        self.worker = worker
+        self.max_queued_jobs = (
+            SETTINGS.max_queued_jobs if max_queued_jobs is None else max_queued_jobs
+        )
+        if self.max_queued_jobs < 0:
+            raise ValueError("max_queued_jobs must be non-negative")
+        self.client_lease_seconds = (
+            SETTINGS.client_lease_seconds
+            if client_lease_seconds is None else client_lease_seconds
+        )
+        if self.client_lease_seconds <= 0:
+            raise ValueError("client_lease_seconds must be positive")
+        self.sse_queue_size = (
+            SETTINGS.sse_queue_size if sse_queue_size is None else sse_queue_size
+        )
+        if self.sse_queue_size <= 0:
+            raise ValueError("sse_queue_size must be positive")
+        self._jobs: dict[str, JobStatus] = {}
+        self._executions: dict[str, _Execution] = {}
+        self._next_generation = 0
+        self._threads: dict[str, threading.Thread] = {}
+        # A key may be replaced before its old worker finishes unwinding.
+        # Retain physical thread handles independently so shutdown joins both
+        # generations. Finished handles are pruned when admitting another job;
+        # workers cannot remove themselves before they have actually exited.
+        self._worker_threads: set[threading.Thread] = set()
+        self._closed = False
+        # The service's plain signal flag is visible before lock-taking cleanup.
+        self._is_stopping = is_stopping or (lambda: False)
+        # Per-job control for chunk ordering. Built lazily inside
+        # ``_on_probed`` (once we know total_chunks) and discarded when the
+        # worker finishes.
+        self._controls: dict[str, _JobControl] = {}
+        # If /prioritize arrives before the control exists (job is still
+        # probing/downloading), stash the hint here and apply on creation.
+        self._pending_priority: dict[str, int] = {}
+        # SSE bookkeeping. ``_subscribers`` maps a job key to the live
+        # asyncio.Queues feeding each open /events stream; the worker thread
+        # pushes status snapshots onto them via the event loop.
+        # ``_last_disconnect_at`` records when a job's last subscriber dropped
+        # off, which the idle-abandon timer reads. ``_loop`` is the running
+        # asyncio loop, captured at startup so a worker thread can hand work
+        # back to it safely.
+        self._subscribers: dict[str, list[asyncio.Queue]] = {}
+        self._last_disconnect_at: dict[str, float] = {}
+        # Client interest is deliberately separate from SSE transport. A tab
+        # may pause, reconnect, or switch to status reads while its bounded
+        # lease keeps the worker alive. Values use monotonic deadlines so a
+        # wall-clock adjustment cannot retain work indefinitely.
+        self._interests: dict[str, dict[str, float]] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # Keys whose worker should stop at its next chunk boundary. Set either
+        # by the idle-abandon decision (atomically, under _lock, so a racing
+        # submit() can't reuse a job that's already given up) or by
+        # ``abandon_all`` (cache clear). The provider checks it first thing.
+        self._abandoning: set[str] = set()
+        self._lock = threading.Lock()
+        # One job runs at a time on the engine; further jobs block here.
+        self._gpu_lock = threading.Lock()
+
+    @property
+    def stopping(self) -> bool:
+        return self._closed or self._is_stopping()
+
+    # -- SSE subscription ----------------------------------------------------
+
+    def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Capture the server's event loop so worker threads can schedule
+        queue writes onto it. Called once from the FastAPI lifespan startup."""
+        with self._lock:
+            if self.stopping:
+                raise RegistryClosed("job registry is shutting down")
+            self._loop = loop
+
+    def begin_shutdown(self) -> None:
+        """Stop admissions and signal every execution, including old workers.
+
+        This phase does not wait and is safe on the event loop. Cache-clear's
+        per-key abandon marks can be reset by a replacement submission; this
+        registry-wide flag is permanent and is checked by every abort hook.
+        """
+        with self._lock:
+            self._closed = True
+
+    @property
+    def has_active_workers(self) -> bool:
+        with self._lock:
+            return any(worker.is_alive() for worker in self._worker_threads)
+
+    def shutdown(self) -> None:
+        """Signal and join all ordinary work, then detach the event loop.
+
+        Call outside the event-loop thread so worker status callbacks can
+        still run while the pipeline unwinds. This deliberately has no join
+        timeout: a normal shutdown must not release resources while a worker
+        is still using them. The CLI bounds the total drain at the process
+        boundary; this method never pretends a timed-out join stopped a worker.
+        A closed registry cannot be restarted; create a new one per lifespan.
+        """
+        self.begin_shutdown()
+        with self._lock:
+            workers = tuple(self._worker_threads)
+        for worker in workers:
+            worker.join()
+        with self._lock:
+            self._worker_threads.clear()
+            self._threads.clear()
+            self._jobs.clear()
+            self._executions.clear()
+            self._controls.clear()
+            self._pending_priority.clear()
+            self._subscribers.clear()
+            self._last_disconnect_at.clear()
+            self._interests.clear()
+            self._abandoning.clear()
+            self._loop = None
+
+    def subscribe(self, key: str) -> asyncio.Queue:
+        """Register an /events stream for ``key`` and return its queue.
+
+        Clearing ``_last_disconnect_at`` here means a returning viewer resets
+        the idle clock the instant their stream opens."""
+        q: asyncio.Queue = asyncio.Queue(maxsize=self.sse_queue_size)
+        with self._lock:
+            if self.stopping:
+                raise RegistryClosed("job registry is shutting down")
+            self._subscribers.setdefault(key, []).append(q)
+            self._last_disconnect_at.pop(key, None)
+        return q
+
+    def unsubscribe(self, key: str, q: asyncio.Queue) -> None:
+        """Drop one stream's queue. When the last subscriber for a still-live
+        job leaves, stamp the disconnect time so the idle timer can start
+        counting. We only stamp when the job is still in ``_jobs`` — there's
+        no point timing out a job that already finished."""
+        with self._lock:
+            subs = self._subscribers.get(key)
+            if not subs:
+                return
+            if q in subs:
+                subs.remove(q)
+            if not subs and key in self._jobs and not self._has_live_interest_locked(key):
+                self._last_disconnect_at[key] = time.time()
+
+    # -- explicit client interest ------------------------------------------
+
+    @staticmethod
+    def _validate_client_id(client_id: str) -> str:
+        value = str(client_id).strip()
+        if not value or len(value) > 128:
+            raise ValueError("client_id must contain 1-128 characters")
+        return value
+
+    def _purge_expired_interests_locked(self, key: str, *, now: float | None = None) -> int:
+        """Remove expired leases for one key; caller holds ``_lock``."""
+        leases = self._interests.get(key)
+        if not leases:
+            return 0
+        now = time.monotonic() if now is None else now
+        expired = [client for client, deadline in leases.items() if deadline <= now]
+        for client in expired:
+            leases.pop(client, None)
+        if not leases:
+            self._interests.pop(key, None)
+            if key in self._jobs and not self._subscribers.get(key):
+                self._last_disconnect_at.setdefault(key, time.time())
+        return len(expired)
+
+    def _has_live_interest_locked(self, key: str) -> bool:
+        self._purge_expired_interests_locked(key)
+        return bool(self._interests.get(key))
+
+    def acquire_interest(
+        self, key: str, client_id: str, lease_seconds: float | None = None
+    ) -> dict[str, object] | None:
+        """Acquire or renew one client's bounded interest in a live/ready job."""
+        client_id = self._validate_client_id(client_id)
+        requested = self.client_lease_seconds if lease_seconds is None else float(lease_seconds)
+        if requested <= 0:
+            raise ValueError("lease_seconds must be positive")
+        ttl = min(requested, self.client_lease_seconds)
+        with self._lock:
+            if self.stopping or key not in self._jobs:
+                return None
+            self._purge_expired_interests_locked(key)
+            self._interests.setdefault(key, {})[client_id] = time.monotonic() + ttl
+            # A newly renewed client supersedes the old no-subscriber clock.
+            self._last_disconnect_at.pop(key, None)
+        return {
+            "leased": True,
+            "client_id": client_id,
+            "lease_seconds": ttl,
+            "heartbeat_seconds": min(
+                SETTINGS.client_heartbeat_seconds, max(1.0, ttl / 2)
+            ),
+        }
+
+    def release_interest(self, key: str, client_id: str) -> bool:
+        """Release only ``client_id``; other clients' leases remain intact."""
+        client_id = self._validate_client_id(client_id)
+        with self._lock:
+            leases = self._interests.get(key)
+            if not leases or client_id not in leases:
+                return False
+            leases.pop(client_id, None)
+            if not leases:
+                self._interests.pop(key, None)
+                if key in self._jobs and not self._subscribers.get(key):
+                    self._last_disconnect_at[key] = time.time()
+            return True
+
+    def expire_interests(self) -> int:
+        """Expire abandoned client leases and start idle clocks where needed."""
+        with self._lock:
+            return sum(
+                self._purge_expired_interests_locked(key)
+                for key in tuple(self._interests)
+            )
+
+    # -- public --------------------------------------------------------------
+
+    def submit(
+        self,
+        url: str,
+        *,
+        model: str,
+        keep_stems: list[str],
+        client_id: str | None = None,
+    ) -> JobStatus:
+        if client_id is not None:
+            client_id = self._validate_client_id(client_id)
+        with self._lock:
+            if self.stopping:
+                raise RegistryClosed("job registry is shutting down")
+        # No probe here: the yt-dlp metadata call takes 3-6s on YouTube
+        # because of the JS challenge, and blocking /process on it made the
+        # button look stuck on "Starting". The cache key only needs (url,
+        # model, stems), all of which we have, so we can return immediately
+        # and let the worker thread do the slow probe.
+        key = self.cache.key(
+            url,
+            model,
+            list(keep_stems),
+            chunk_seconds=self.processor.chunk_seconds,
+            chunk_overlap_seconds=self.processor.chunk_overlap_seconds,
+        )
+        # Keep the slow disk read outside the registry lock so shutdown and
+        # other submissions remain responsive. A leased re-read below closes
+        # the clear/submit race for an entry that was present at this point.
+        existing_meta = self.cache.load_meta(key)
+        with self._lock:
+            if self.stopping:
+                raise RegistryClosed("job registry is shutting down")
+            existing = self._jobs.get(key)
+            if self._is_live_duplicate(existing, key):
+                # A returning/duplicate client. Restart the idle clock so the
+                # worker doesn't abandon the job in the window before this
+                # client's /events stream (re)connects, then hand back the live
+                # job. (``_is_live_duplicate`` excludes a job mid-abandon, so a
+                # /process landing during the unwind respawns a fresh worker
+                # instead of adopting one that's about to vanish.)
+                self._last_disconnect_at[key] = time.time()
+                if client_id is not None:
+                    self._interests.setdefault(key, {})[client_id] = (
+                        time.monotonic() + self.client_lease_seconds
+                    )
+                    self._last_disconnect_at.pop(key, None)
+                return existing
+
+            live_jobs = sum(
+                status.state in _LIVE_JOB_STATES
+                for status in self._jobs.values()
+            )
+            if live_jobs >= 1 + self.max_queued_jobs:
+                raise JobQueueFull(
+                    f"execution queue is full ({self.max_queued_jobs} queued job(s))"
+                )
+
+            # New job, or one superseding an abandoning predecessor: clear any
+            # stale abandon mark so the fresh worker isn't killed on its first
+            # chunk boundary.
+            self._abandoning.discard(key)
+            self._interests.pop(key, None)
+
+            cache_generation = None
+            if existing_meta is not None:
+                lease_factory = getattr(self.cache, "job_lease", None)
+                if lease_factory is not None:
+                    with lease_factory(key, shared=True):
+                        existing_meta = self.cache.load_meta(key)
+            claim_generation = getattr(self.cache, "claim_generation", None)
+            if claim_generation:
+                cache_generation = claim_generation(key)
+            status = self._build_submit_status(key, existing_meta)
+            self._jobs[key] = status
+            if client_id is not None:
+                self._interests[key] = {
+                    client_id: time.monotonic() + self.client_lease_seconds
+                }
+            self._next_generation += 1
+            execution = _Execution(key, self._next_generation, status, cache_generation)
+            self._executions[key] = execution
+            if status.state == JobState.READY:
+                return status
+
+            t = threading.Thread(
+                target=self._run,
+                args=(execution, url, model, keep_stems),
+                name=f"nomusic-job-{key[:6]}",
+                daemon=True,
+            )
+            self._threads[key] = t
+            self._worker_threads = {
+                worker for worker in self._worker_threads if worker.is_alive()
+            }
+            self._worker_threads.add(t)
+            try:
+                t.start()
+            except BaseException:
+                self._worker_threads.remove(t)
+                self._threads.pop(key, None)
+                self._jobs.pop(key, None)
+                self._executions.pop(key, None)
+                raise
+            return status
+
+    def _is_live_duplicate(self, existing: Optional[JobStatus], key: str) -> bool:
+        """True when ``existing`` is a still-running worker for ``key`` that a new
+        submit should adopt instead of replacing.
+
+        Excludes a job that has already committed to abandoning (``_abandoning``)
+        so a /process landing during an idle-unwind respawns a fresh worker
+        rather than adopting one about to vanish. Must be called under
+        ``self._lock`` (reads ``_abandoning``)."""
+        return (
+            existing is not None
+            and existing.state in _LIVE_JOB_STATES
+            and self._executions.get(key) is not None
+            and self._executions[key].status is existing
+            and key not in self._abandoning
+        )
+
+    def _build_submit_status(
+        self, key: str, existing_meta: Optional[CacheMeta]
+    ) -> JobStatus:
+        """Build the initial JobStatus for a freshly admitted job: READY when the
+        cache is already complete, else QUEUED. Must be called under ``self._lock``.
+
+        A complete cache means an instant replay; that counts as a "use" of the
+        entry, so we renew its TTL (bump meta.json's mtime) to keep the hourly
+        sweep from reaping a video the user is actively re-watching.
+        """
+        if existing_meta and existing_meta.complete:
+            self.cache.touch(key)
+            initial_state = JobState.READY
+            progress = 1.0
+        else:
+            initial_state = JobState.QUEUED
+            progress = 0.0
+        return JobStatus(
+            job_id=key,
+            cache_key=key,
+            state=initial_state,
+            phase=initial_state.value,
+            phase_progress=progress,
+            phase_label=_PHASE_LABELS[initial_state.value],
+            chunks_ready=len(existing_meta.chunks_ready) if existing_meta else 0,
+            ready_chunks=sorted(existing_meta.chunks_ready) if existing_meta else [],
+            total_chunks=existing_meta.total_chunks if existing_meta else 0,
+            duration_seconds=existing_meta.duration_seconds if existing_meta else 0.0,
+            title=existing_meta.title if existing_meta else "",
+        )
+
+    def get(self, job_id: str) -> Optional[JobStatus]:
+        with self._lock:
+            status = self._jobs.get(job_id)
+            if status is not None:
+                return status
+        # Job not in this process's memory but may be fully cached on disk —
+        # surface it as READY so the client can stream chunks anyway.
+        meta = self.cache.load_meta(job_id)
+        if meta is None:
+            return None
+        state = JobState.READY if meta.complete else JobState.QUEUED
+        return JobStatus(
+            job_id=job_id,
+            cache_key=job_id,
+            state=state,
+            phase=state.value,
+            phase_progress=1.0 if meta.complete else 0.0,
+            phase_label=_PHASE_LABELS[state.value],
+            chunks_ready=len(meta.chunks_ready),
+            ready_chunks=sorted(meta.chunks_ready),
+            total_chunks=meta.total_chunks,
+            duration_seconds=meta.duration_seconds,
+            title=meta.title,
+        )
+
+    def memory_gc(self) -> int:
+        """Drop in-memory JobStatus entries whose disk cache is already gone.
+
+        Completed and errored jobs are intentionally kept in ``_jobs`` after
+        their worker exits so ``/status`` keeps reporting the final state.
+        This bounds that retention: once the disk TTL sweep has reaped a job's
+        cache directory (or it never had one), the in-memory entry is dead
+        weight, so we reclaim it. Jobs with a live worker thread are never
+        touched. Returns the number of entries dropped.
+        """
+        with self._lock:
+            candidates = [k for k in self._jobs if k not in self._threads]
+        dropped = 0
+        for key in candidates:
+            # Disk check is I/O; do it outside the lock.
+            if self.cache.load_meta(key) is not None:
+                continue
+            with self._lock:
+                if key in self._threads:
+                    continue  # a fresh submit spawned a worker since we looked
+                current = self._jobs.pop(key, None)
+                if current is not None:
+                    execution = self._executions.get(key)
+                    if execution is not None and execution.status is current:
+                        self._executions.pop(key, None)
+                    self._subscribers.pop(key, None)
+                    self._last_disconnect_at.pop(key, None)
+                    self._interests.pop(key, None)
+                    dropped += 1
+        return dropped
+
+    def abandon_all(self) -> None:
+        """Signal every running worker to abandon at its next chunk boundary
+        and drop all in-memory job state. Used by /cache/clear so wiping the
+        cache out from under live workers doesn't leave them mid-pipeline
+        writing into directories that no longer exist — instead each worker
+        unwinds cleanly out of the GPU lock via ``WorkerAbandoned`` and runs
+        its own ``finally`` cleanup.
+
+        Each open /events stream is sent a terminal ``error`` snapshot before
+        its queue is dropped, so the stream closes itself instead of hanging on
+        keep-alives (the client never sees a ready/error event otherwise).
+        """
+        # Build terminal snapshots BEFORE clearing, so every live stream gets a
+        # final event. Mirror _update's cross-thread enqueue: abandon_all runs on
+        # the request thread, not the event loop.
+        pending: list[tuple[asyncio.Queue, dict]] = []
+        with self._lock:
+            keys = tuple(self._jobs)
+            for key, status in self._jobs.items():
+                revoke_generation = getattr(self.cache, "revoke_generation", None)
+                if revoke_generation:
+                    revoke_generation(key)
+                self._abandoning.add(key)
+                subs = self._subscribers.get(key)
+                if not subs:
+                    continue
+                status.state = JobState.ERROR
+                status.phase = JobState.ERROR.value
+                status.phase_label = _PHASE_LABELS[JobState.ERROR.value]
+                status.error = "cache cleared"
+                status.updated_at = time.time()
+                snapshot = status.to_dict()
+                for q in subs:
+                    pending.append((q, snapshot))
+            self._jobs.clear()
+            self._subscribers.clear()
+            self._last_disconnect_at.clear()
+            self._interests.clear()
+        if self.worker is not None:
+            for key in keys:
+                self.worker.cancel(key)
+        loop = self._loop
+        if pending and loop is not None and not loop.is_closed():
+            for q, snapshot in pending:
+                try:
+                    loop.call_soon_threadsafe(self._enqueue_snapshot, q, snapshot)
+                except RuntimeError:
+                    break
+
+    # -- worker --------------------------------------------------------------
+
+    def _run(
+        self,
+        execution: _Execution,
+        url: str,
+        model: str,
+        keep_stems: list[str],
+    ) -> None:
+        key = execution.key
+        abandoned = False
+        try:
+            try:
+                with self._gpu_lock:
+                    # Queued work must not begin probing/downloading after a
+                    # shutdown signal received while it waited for the lock.
+                    self._raise_if_abandoned(key, SETTINGS.idle_timeout_seconds, execution)
+                    # Stay in QUEUED while waiting for the GPU lock. Only flip
+                    # to PROBING once we actually own it, so a second
+                    # concurrent job honestly reports "Queued" instead of
+                    # falsely showing "Inspecting video" while really blocked.
+                    self._enter_phase(key, JobState.PROBING, progress=None, execution=execution)
+                    hooks = RunHooks(
+                        on_probed=lambda info, plans, meta: self._on_probed(
+                            key, info, plans, meta, execution=execution
+                        ),
+                        on_progress=lambda meta, phase: self._on_separation_progress(
+                            key, meta, phase, execution=execution
+                        ),
+                        on_download_progress=lambda p: self._on_download_progress(
+                            key, p, execution=execution
+                        ),
+                        next_chunk_provider=self._make_chunk_provider(key, execution),
+                        abort_check=lambda: self._raise_if_abandoned(
+                            key, SETTINGS.idle_timeout_seconds, execution
+                        ),
+                        on_wait_for_download=lambda frac: self._on_wait_for_download(
+                            key, frac, execution=execution
+                        ),
+                        publish_check=lambda: self._assert_publishable(execution),
+                        cache_generation=execution.cache_generation,
+                    )
+                    if self.worker is not None:
+                        self.worker.run(
+                            key,
+                            url,
+                            model=model,
+                            keep_stems=keep_stems,
+                            hooks=hooks,
+                            abort_check=lambda: self._raise_if_abandoned(
+                                key, SETTINGS.idle_timeout_seconds, execution
+                            ),
+                            publish_check=lambda: self._assert_publishable(execution),
+                            cache_generation=execution.cache_generation,
+                        )
+                    else:
+                        self.processor.run(
+                            url,
+                            model=model,
+                            keep_stems=keep_stems,
+                            hooks=hooks,
+                        )
+                    self._assert_publishable(execution)
+                meta = self.cache.load_meta(key)
+                chunks_ready = len(meta.chunks_ready) if meta else 0
+                ready_chunks = sorted(meta.chunks_ready) if meta else []
+                total = meta.total_chunks if meta else 0
+                self._enter_phase(
+                    key,
+                    JobState.READY,
+                    progress=1.0,
+                    chunks_ready=chunks_ready,
+                    ready_chunks=ready_chunks,
+                    total_chunks=total,
+                    execution=execution,
+                )
+                log.info("Job %s ready", key)
+            except SupervisedWorkerDeadlineExceeded as exc:
+                log.error("Job %s exceeded its execution deadline", key)
+                self._enter_phase(
+                    key,
+                    JobState.ERROR,
+                    progress=1.0,
+                    error=f"{type(exc).__name__}: {exc}",
+                    execution=execution,
+                )
+            except (WorkerAbandoned, SupervisedWorkerAbandoned):
+                # Listed before the generic handler so an idle-abandon isn't
+                # mistaken for a failure. The GPU lock has already released via
+                # the with-block unwind; just flag it for finally to clean up.
+                abandoned = True
+                log.info(
+                    "Job %s abandoned (idle, cache clear, or service shutdown)",
+                    key,
+                )
+            except Exception as exc:
+                # A download/decoder may translate cancellation into an ordinary
+                # exception. _update makes shutdown and failure publication
+                # mutually exclusive under the registry lock.
+                log.exception("Job %s stopped with an exception", key)
+                self._enter_phase(
+                    key,
+                    JobState.ERROR,
+                    progress=1.0,
+                    error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}",
+                    execution=execution,
+                )
+        finally:
+            self._cleanup_worker(key, execution, abandoned)
+
+    def _cleanup_worker(self, key: str, execution: _Execution, abandoned: bool) -> None:
+        """Release state only when this worker still owns the job generation."""
+        with self._lock:
+            if not self._is_current_locked(execution):
+                return
+            self._controls.pop(key, None)
+            self._pending_priority.pop(key, None)
+            # Only retract the shared bookkeeping if we're still the registered
+            # worker for this key. A replacement may have been admitted while
+            # this generation was unwinding; its state must remain untouched.
+            if self._threads.get(key) is threading.current_thread():
+                self._threads.pop(key, None)
+                self._subscribers.pop(key, None)
+                self._last_disconnect_at.pop(key, None)
+                self._abandoning.discard(key)
+                # The terminal _update(READY/ERROR) above already enqueued its
+                # snapshot to every open stream, so dropping subscribers here
+                # loses nothing. A stream that opens after this sees the
+                # terminal state from disk and short-circuits.
+                if abandoned:
+                    # Drop the JobStatus so a later /process spawns a fresh
+                    # worker (resuming from disk-cached chunks) rather than
+                    # finding a stale entry. Completed/errored jobs are kept
+                    # for /status until memory_gc reclaims them.
+                    self._jobs.pop(key, None)
+                    self._executions.pop(key, None)
+
+    def _enter_phase(
+        self,
+        key: str,
+        state: JobState,
+        *,
+        progress: float | None,
+        execution: _Execution | None = None,
+        **extra,
+    ) -> None:
+        self._update(
+            key,
+            execution=execution,
+            state=state,
+            phase=state.value,
+            phase_progress=progress,
+            phase_label=_PHASE_LABELS.get(state.value, state.value),
+            **extra,
+        )
+
+    def _on_probed(
+        self,
+        key: str,
+        info,
+        plans,
+        meta: CacheMeta,
+        *,
+        execution: _Execution | None = None,
+    ) -> None:
+        # Probe done. Surface metadata so the popup / button can show real
+        # duration + title; phase stays at PROBING until the first download
+        # tick flips it to DOWNLOADING.
+        self._update(
+            key,
+            execution=execution,
+            title=info.title,
+            duration_seconds=info.duration_seconds,
+            total_chunks=meta.total_chunks,
+            chunks_ready=len(meta.chunks_ready),
+            ready_chunks=sorted(meta.chunks_ready),
+        )
+        # Now that we know total_chunks, build the per-job control. If a
+        # /prioritize call beat us here, apply the stashed hint now.
+        with self._lock:
+            if execution is not None and not self._is_current_locked(execution):
+                return
+            control = self._controls.get(key)
+            if control is None:
+                control = _JobControl(
+                    total_chunks=meta.total_chunks,
+                    done=set(meta.chunks_ready),
+                )
+                self._controls[key] = control
+            hint = self._pending_priority.pop(key, None)
+        if hint is not None:
+            control.prioritize(hint)
+
+    def _set_downloading(
+        self,
+        key: str,
+        fraction: float | None,
+        *,
+        execution: _Execution | None = None,
+    ) -> None:
+        """Flip the job to the DOWNLOADING ("Fetching") phase at ``fraction``.
+        Shared by the two download-progress callbacks, which differ only in
+        whether they suppress this update once separation is underway."""
+        self._update(key, execution=execution, state=JobState.DOWNLOADING, phase="downloading",
+                     phase_label=_PHASE_LABELS["downloading"],
+                     phase_progress=fraction)
+
+    def _on_download_progress(
+        self,
+        key: str,
+        fraction: float | None,
+        *,
+        execution: _Execution | None = None,
+    ) -> None:
+        # In progressive mode the download runs concurrently with separation,
+        # so download ticks ("Fetching", download %) and separation ticks
+        # ("Removing", chunk %) interleave. Once separation has started, keep
+        # the UI on "Removing" — flipping back to "Fetching" every download
+        # tick just flickers the label and bounces the percentage between two
+        # different scales. The download still proceeds in the background.
+        with self._lock:
+            status = self._jobs.get(key)
+            if execution is not None and not self._is_current_locked(execution):
+                return
+            if status is not None and status.state in (
+                JobState.PROCESSING,
+                JobState.READY,
+                JobState.ERROR,
+            ):
+                return
+        self._set_downloading(key, fraction, execution=execution)
+
+    def _on_wait_for_download(
+        self,
+        key: str,
+        fraction: float | None,
+        *,
+        execution: _Execution | None = None,
+    ) -> None:
+        # Separation is blocked waiting for the download to reach this chunk —
+        # the user seeked past the downloaded point, or the download is slower
+        # than separation. This is the one case where flipping back to
+        # "Fetching" is right: playback is genuinely gated on the download, not
+        # on separation. Unlike _on_download_progress this isn't suppressed
+        # during PROCESSING, because here the download IS the bottleneck.
+        self._set_downloading(key, fraction, execution=execution)
+
+    def _on_separation_progress(
+        self,
+        key: str,
+        meta: CacheMeta,
+        phase: str,
+        *,
+        execution: _Execution | None = None,
+    ) -> None:
+        done = len(meta.chunks_ready)
+        total = max(1, meta.total_chunks)
+        # Smooth the bar inside a chunk: 'separating' = the chunk's GPU pass has
+        # started (count it partly done); 'chunk_complete' lands via the
+        # chunks_ready count itself. The processor only emits those two phases.
+        per_chunk = 0.3 if phase == "separating" else 0.0
+        progress = min(1.0, (done + per_chunk) / total)
+        self._update(
+            key,
+            execution=execution,
+            state=JobState.PROCESSING,
+            phase="processing",
+            phase_label=_PHASE_LABELS["processing"],
+            phase_progress=progress,
+            chunks_ready=done,
+            ready_chunks=sorted(meta.chunks_ready),
+            total_chunks=meta.total_chunks,
+        )
+
+    # -- prioritization ------------------------------------------------------
+
+    def _make_chunk_provider(
+        self, key: str, execution: _Execution | None = None
+    ) -> Callable[[], Optional[int]]:
+        """Build the callable that ``Processor.run`` calls between chunks.
+
+        Returns the next chunk index, ``None`` when the queue is exhausted, or
+        raises ``WorkerAbandoned`` when nobody has been streaming status for
+        longer than ``idle_timeout_seconds``. The idle check runs here — at the
+        chunk boundary — so abandoning costs at most one in-flight chunk and
+        unwinds cleanly out of the GPU lock.
+        """
+        idle_timeout = SETTINGS.idle_timeout_seconds
+
+        def provider() -> Optional[int]:
+            self._raise_if_abandoned(key, idle_timeout, execution)
+            with self._lock:
+                if execution is not None and not self._is_current_locked(execution):
+                    raise WorkerAbandoned
+                control = self._controls.get(key)
+            if control is None:
+                return None
+            return control.next_chunk()
+
+        return provider
+
+    def _raise_if_abandoned(
+        self,
+        key: str,
+        idle_timeout: float,
+        execution: _Execution | None = None,
+    ) -> None:
+        """Raise ``WorkerAbandoned`` if the job has been flagged (idle decision
+        on a prior call, or a cache clear) or has now gone idle. The whole
+        check + flag-set happens under the lock so it can't interleave with a
+        submit() deciding whether to adopt the job. Shared by the chunk
+        provider and the progressive-download abort hook so a pause that lands
+        mid-download still releases the GPU promptly."""
+        with self._lock:
+            if execution is not None and not self._is_current_locked(execution):
+                raise WorkerAbandoned
+            if self.stopping or key in self._abandoning:
+                raise WorkerAbandoned
+            if idle_timeout <= 0:
+                return
+            if self._has_live_interest_locked(key):
+                return
+            if self._subscribers.get(key):
+                return
+            # No subscriber: count from the last disconnect, or from job
+            # creation if nobody ever connected (covers a /process whose client
+            # never opened /events). Mark _abandoning before releasing the lock
+            # so a concurrent submit() sees a job that has committed to dying
+            # and respawns instead of adopting it.
+            last_disc = self._last_disconnect_at.get(key)
+            status = self._jobs.get(key)
+            created_at = status.created_at if status else time.time()
+            ref = last_disc if last_disc is not None else created_at
+            if time.time() - ref >= idle_timeout:
+                self._abandoning.add(key)
+                raise WorkerAbandoned
+
+    def _assert_publishable(self, execution: _Execution) -> None:
+        """Fence cache publication without cancelling a normal shutdown drain.
+
+        ``begin_shutdown`` stops admission and makes boundary checks abort new
+        work, but the current active batch is still allowed to drain and publish
+        its already-computed chunks. Cache clear, idle abandon and replacement
+        instead remove or invalidate the execution, so their stale writers are
+        rejected here.
+        """
+        with self._lock:
+            if (
+                not self._is_current_locked(execution)
+                or execution.key in self._abandoning
+            ):
+                raise WorkerAbandoned
+
+    def prioritize(self, key: str, from_chunk: int) -> bool:
+        """Rotate the job's pending-chunk order so ``from_chunk`` is next.
+
+        Returns False if the job is unknown or already done. If the control
+        hasn't been built yet (we're still probing/downloading), the hint
+        is stashed and applied as soon as the control comes into being.
+        """
+        with self._lock:
+            if key not in self._jobs:
+                log.info("prioritize: unknown job key=%s from_chunk=%d", key, from_chunk)
+                return False
+            control = self._controls.get(key)
+            if control is None:
+                status = self._jobs[key]
+                if status.total_chunks:
+                    from_chunk = min(from_chunk, status.total_chunks - 1)
+                self._pending_priority[key] = from_chunk
+                log.info(
+                    "prioritize: stashed (control not yet built) key=%s from_chunk=%d",
+                    key, from_chunk,
+                )
+                if self.worker is not None:
+                    self.worker.prioritize(key, from_chunk)
+                return True
+        before_size = len(control.pending)
+        before_head = list(control.pending)[:5]
+        control.prioritize(from_chunk)
+        after_head = list(control.pending)[:5]
+        log.info(
+            "prioritize: key=%s from_chunk=%d pending=%d head_before=%s head_after=%s",
+            key, from_chunk, before_size, before_head, after_head,
+        )
+        if self.worker is not None:
+            self.worker.prioritize(key, from_chunk)
+        return True
+
+    # -- internals -----------------------------------------------------------
+
+    def _is_current_locked(self, execution: _Execution) -> bool:
+        """Return whether ``execution`` still owns its content key.
+
+        Callers must hold ``self._lock``.  Checking the token object, rather
+        than only the cache key, fences a predecessor after cache-clear and
+        resubmit have installed a replacement generation.
+        """
+        return (
+            self._executions.get(execution.key) is execution
+            and self._jobs.get(execution.key) is execution.status
+        )
+
+    def _update(
+        self,
+        key: str,
+        *,
+        execution: _Execution | None = None,
+        **fields,
+    ) -> None:
+        snapshot: dict | None = None
+        subs: list[asyncio.Queue] = []
+        with self._lock:
+            if self.stopping:
+                return
+            status = self._jobs.get(key)
+            if status is None:
+                return
+            if execution is not None and not self._is_current_locked(execution):
+                return
+            for name, value in fields.items():
+                setattr(status, name, value)
+            status.updated_at = time.time()
+            # Snapshot inside the lock and hand the immutable dict — not the
+            # live JobStatus — to subscribers, so the worker can keep mutating
+            # status while an SSE coroutine serializes a past state.
+            subs = list(self._subscribers.get(key, []))
+            if subs:
+                snapshot = status.to_dict()
+        # call_soon_threadsafe hops from this worker thread to the event loop,
+        # which is the only safe way to touch an asyncio.Queue from off-loop.
+        # Guard against a loop that's closing during shutdown/teardown: a
+        # daemon worker mid-_update would otherwise raise RuntimeError("Event
+        # loop is closed") into the separation callbacks and mislabel the job
+        # ERROR. Dropping the snapshot is correct — the process is going away.
+        loop = self._loop
+        if snapshot is not None and loop is not None and not loop.is_closed():
+            for q in subs:
+                try:
+                    loop.call_soon_threadsafe(self._enqueue_snapshot, q, snapshot)
+                except RuntimeError:
+                    break
+
+    @staticmethod
+    def _enqueue_snapshot(q: asyncio.Queue, snapshot: dict) -> None:
+        """Keep only the newest bounded snapshot for a slow SSE consumer."""
+        while True:
+            try:
+                q.put_nowait(snapshot)
+                return
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    return

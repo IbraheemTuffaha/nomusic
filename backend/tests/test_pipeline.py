@@ -11,19 +11,28 @@ import math
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 import soundfile as sf
 
-from engines.base import Engine, EngineCapabilities, SeparationResult
-from pipeline.cache import JobCache
-from pipeline.export import (
+from nomusic.engines.base import Engine, EngineCapabilities, SeparationResult
+from nomusic.pipeline.cache import CacheMeta, JobCache
+from nomusic.pipeline.downloader import ResourceLimitExceeded, ResourceLimits
+from nomusic.pipeline.export import (
+    complete_manifest,
     mp3_transcode_cmd,
     mux_video_cmd,
     snapshot_chunk_files,
 )
-from pipeline.processor import Processor, plan_chunks
+from nomusic.pipeline.processor import (
+    ChunkPlan,
+    Processor,
+    RunHooks,
+    _ChunkWork,
+    plan_chunks,
+)
 
 
 def test_plan_chunks_covers_full_duration():
@@ -39,12 +48,118 @@ def test_plan_chunks_covers_full_duration():
     assert plans[1].start < plans[0].end
 
 
+def test_plan_chunks_covers_tail_shorter_than_overlap():
+    # Regression: with stride-length play windows, a duration whose remainder
+    # past the last full stride is <= overlap_seconds used to drop the final
+    # chunk (count was ceil((duration - overlap)/stride)), leaving the tail with
+    # no playback audio — and that short result got cached + spliced into every
+    # export. Production defaults: chunk=10, overlap=0.5 -> stride=9.5.
+    # 95.3 / 9.5 = 10.03, so the 11th chunk (covering 95.0..95.3) is required.
+    plans = plan_chunks(duration=95.3, chunk_seconds=10.0, overlap_seconds=0.5)
+    assert len(plans) == 11
+    assert math.isclose(plans[-1].play_end, 95.3, abs_tol=1e-6)
+    # Full, gap-free coverage of the timeline.
+    coverage = sum(p.play_end - p.play_start for p in plans)
+    assert math.isclose(coverage, 95.3, rel_tol=1e-6, abs_tol=1e-6)
+    # No degenerate (zero-length) final chunk.
+    assert plans[-1].play_end > plans[-1].play_start
+
+
+def test_plan_chunks_exact_multiple_has_no_extra_chunk():
+    # When duration is an exact multiple of the stride, the count must not gain
+    # a spurious zero-length chunk from float rounding. stride = 9.5, so 95.0 is
+    # exactly 10 strides.
+    plans = plan_chunks(duration=95.0, chunk_seconds=10.0, overlap_seconds=0.5)
+    assert len(plans) == 10
+    assert math.isclose(plans[-1].play_end, 95.0, abs_tol=1e-6)
+
+
 def test_plan_chunks_rejects_overlap_eq_chunk():
     try:
         plan_chunks(duration=10.0, chunk_seconds=2.0, overlap_seconds=2.0)
     except ValueError:
         return
     raise AssertionError("expected ValueError for overlap == chunk")
+
+
+def test_publish_check_fences_chunk_before_cache_publication(tmp_path, monkeypatch):
+    cache = JobCache(tmp_path / "cache")
+    key = "a" * 16
+    cache.save_meta(
+        key,
+        CacheMeta(
+            url="https://example.test/video",
+            model="fake",
+            keep_stems=["vocals"],
+            duration_seconds=1,
+            chunk_seconds=1,
+            chunk_overlap_seconds=0,
+            total_chunks=1,
+        ),
+    )
+    proc = Processor(None, cache, chunk_seconds=1, chunk_overlap_seconds=0)
+    audio = np.zeros((441, 2), dtype=np.float32)
+    result = SeparationResult(
+        stems={name: audio for name in ("vocals", "drums", "bass", "other")},
+        sample_rate=44100,
+        duration_seconds=0.01,
+    )
+    work = _ChunkWork(
+        plan=ChunkPlan(0, 0, 0.01, 0, 0.01),
+        prepared=None,
+        t_slice=0,
+        t_decode=0,
+        result=result,
+    )
+    writes = []
+    monkeypatch.setattr(proc, "_write_chunk", lambda *args, **kwargs: writes.append(True))
+
+    def stale():
+        raise RuntimeError("stale generation")
+
+    with pytest.raises(RuntimeError, match="stale generation"):
+        proc._finish_chunk(work, key, ["vocals"], None, stale)
+    assert writes == []
+    assert cache.load_meta(key).chunks_ready == []
+
+
+def test_mix_stems_gain_is_uniform_when_peak_would_clip():
+    # When the loudness boost would push the peak past unity, the gain must stay
+    # a single uniform factor (capped by headroom), NOT the old whole-chunk tanh
+    # that attenuated quiet samples and pumped levels at chunk seams. Here the
+    # kept stem peaks at 0.9 and the full mix is 2x as loud, so the naive 2x
+    # boost would clip; headroom caps it to 0.99/0.9 = 1.1.
+    vocals = np.array([[0.9, 0.9], [0.3, 0.3], [0.1, 0.1]], dtype=np.float32)
+    stems = {
+        "vocals": vocals,
+        "other": vocals.copy(),  # full mix = 2x vocals -> full/kept RMS = 2
+        "drums": np.zeros_like(vocals),
+        "bass": np.zeros_like(vocals),
+    }
+    out = Processor._mix_stems(stems, ["vocals"])
+    # Uniform gain: every sample scaled by the same factor (no nonlinearity).
+    ratios = out[vocals != 0] / vocals[vocals != 0]
+    assert np.allclose(ratios, ratios[0], rtol=1e-5), ratios
+    # ...and that factor parks the peak just under full scale, not below it.
+    assert abs(float(np.abs(out).max()) - 0.99) < 1e-4
+    assert np.isclose(ratios[0], 1.1, rtol=1e-4)
+
+
+def test_mix_stems_clips_only_already_hot_samples():
+    # A chunk already past full scale before any boost (boost can't help without
+    # attenuating) gets a plain per-sample clip — the hot sample is clamped, the
+    # quiet ones are left exactly as-is (no global gain change).
+    vocals = np.array([[1.5, 1.5], [0.1, 0.1]], dtype=np.float32)
+    stems = {
+        "vocals": vocals,
+        "other": np.zeros_like(vocals),  # full mix == kept -> boost = 1.0
+        "drums": np.zeros_like(vocals),
+        "bass": np.zeros_like(vocals),
+    }
+    out = Processor._mix_stems(stems, ["vocals"])
+    assert float(np.abs(out).max()) <= 0.999 + 1e-6
+    assert np.isclose(out[0, 0], 0.999, atol=1e-4)  # hot sample clamped
+    assert np.isclose(out[1, 0], 0.1, atol=1e-6)    # quiet sample untouched
 
 
 class _FakeEngine(Engine):
@@ -63,11 +178,11 @@ class _FakeEngine(Engine):
             default_model="fake",
         )
 
-    def prepare(self, audio_path: Path, *, model: str | None = None):
+    def prepare(self, audio_path: Path, *, model: str | None = None) -> Any:
         audio, sr = sf.read(str(audio_path), always_2d=True, dtype="float32")
         return (audio, sr)
 
-    def infer_batch(self, prepared) -> list[SeparationResult]:
+    def infer_batch(self, prepared: list[Any]) -> list[SeparationResult]:
         self.batch_sizes.append(len(prepared))
         out = []
         for audio, sr in prepared:
@@ -97,7 +212,7 @@ def _fake_fetcher_class(source_tone: Path, duration: float = 10.0):
     """A stand-in for downloader.SourceFetcher: extract() returns fixed
     metadata; download() drops the pre-written tone into out_dir. Patch it onto
     ``processor.SourceFetcher`` to exercise the first-run path without yt-dlp."""
-    from pipeline.downloader import VideoMetadata
+    from nomusic.pipeline.downloader import VideoMetadata
 
     class _FakeFetcher:
         def __init__(self, url, out_dir):
@@ -119,6 +234,9 @@ def _fake_fetcher_class(source_tone: Path, duration: float = 10.0):
                 progress_hook({"status": "finished", "downloaded_bytes": 1, "total_bytes": 1})
             return dst
 
+        def close(self):
+            pass
+
     return _FakeFetcher
 
 
@@ -130,9 +248,9 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     source = tmp_path / "source.wav"
     _write_tone(source, seconds=10.0)
 
-    from pipeline import processor as proc
+    from nomusic.pipeline import processor as proc
 
-    def fake_slice_source(src, out_path, *, start, end):
+    def fake_slice_source(src, out_path, *, start, end, pass_fds=()):
         audio, sr = sf.read(str(src), always_2d=True, dtype="float32")
         slice_audio = audio[int(start * sr) : int(end * sr)]
         sf.write(str(out_path), slice_audio, sr, subtype="PCM_16", format="WAV")
@@ -164,7 +282,7 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
         "fake://video",
         model="fake",
         keep_stems=["vocals", "other"],
-        on_progress=_progress,
+        hooks=RunHooks(on_progress=_progress),
     )
 
     meta = cache.load_meta(key)
@@ -180,7 +298,7 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     # accumulates offset and audio falls out of sync with the video.
     # Opus encoding may add a few extra samples of priming at the boundary;
     # tolerance is loose enough to absorb that without hiding real drift.
-    from pipeline.processor import plan_chunks
+    from nomusic.pipeline.processor import plan_chunks
 
     plans = plan_chunks(
         duration=meta.duration_seconds,
@@ -209,7 +327,7 @@ def test_processor_end_to_end_with_fake_engine(tmp_path, monkeypatch):
     # [1, gpu_batch] — a regression that passed the whole queue in one call, or
     # broke the per-call list, would land outside that bound. The batch count
     # must also account for every chunk exactly once.
-    from config import SETTINGS
+    from nomusic.config import SETTINGS
 
     cap = max(1, SETTINGS.gpu_batch)
     assert engine.batch_sizes, "infer_batch was never called"
@@ -229,9 +347,9 @@ def test_processor_progressive_produces_correct_chunks(tmp_path, monkeypatch):
     source = tmp_path / "source.wav"
     _write_tone(source, seconds=10.0)
 
-    from pipeline import processor as proc
+    from nomusic.pipeline import processor as proc
 
-    def fake_slice_source(src, out_path, *, start, end):
+    def fake_slice_source(src, out_path, *, start, end, pass_fds=()):
         audio, sr = sf.read(str(src), always_2d=True, dtype="float32")
         sf.write(str(out_path), audio[int(start * sr) : int(end * sr)], sr,
                  subtype="PCM_16", format="WAV")
@@ -259,20 +377,93 @@ def test_processor_progressive_produces_correct_chunks(tmp_path, monkeypatch):
         assert abs(info.duration - (plan.play_end - plan.play_start)) < 0.05
 
 
+def test_progressive_source_cancel_unblocks_source_for(tmp_path):
+    # An abort must release a source_for() that's blocked waiting for bytes, so
+    # an abandoned/failed run doesn't keep the GPU lock until the download lands
+    # (and the orphaned yt-dlp keeps going). cancel() makes the wait raise.
+    from nomusic.pipeline.processor import (
+        ChunkPlan,
+        _DownloadCancelled,
+        _ProgressiveSource,
+    )
+
+    dl = _ProgressiveSource(
+        "fake://v", tmp_path, duration=100.0, ui_hook=None, fetcher=None
+    )
+    # Never start the download thread: available_seconds() stays 0, so source_for
+    # would otherwise block until the (nonexistent) download advances.
+    dl.cancel()
+    plan = ChunkPlan(index=5, start=50.0, end=60.0, play_start=50.0, play_end=60.0)
+    with pytest.raises(_DownloadCancelled):
+        dl.source_for(plan, overlap=0.5)
+
+
+def test_progressive_source_rejects_and_removes_short_completed_file(tmp_path, monkeypatch):
+    from nomusic.pipeline import processor as proc
+
+    source = tmp_path / "source.wav"
+    _write_tone(source, seconds=2.0)
+    monkeypatch.setattr(
+        proc, "download_source", lambda *args, **kwargs: source
+    )
+    dl = proc._ProgressiveSource(
+        "fake://v", tmp_path, duration=9.5, ui_hook=None,
+        limits=ResourceLimits(final_chunk_tolerance_seconds=1.0),
+    )
+    dl.start()
+    dl.close()
+    with pytest.raises(ResourceLimitExceeded, match="metadata requires"):
+        dl.raise_if_error()
+    assert not source.exists()
+
+
+def test_source_fetcher_download_propagates_cancel_without_retry(tmp_path, monkeypatch):
+    # When the progress hook raises DownloadCancelled to abort an in-flight
+    # download, SourceFetcher.download must propagate it — NOT catch it in the
+    # retry-clean handler and start a fresh download of the very thing we're
+    # cancelling (which is what produced the stray re-download + traceback on a
+    # page-close mid-download).
+    from nomusic.pipeline import downloader
+    from nomusic.pipeline.downloader import DownloadCancelled, SourceFetcher
+
+    class _FakeYDL:
+        def add_progress_hook(self, hook):
+            pass
+
+        def process_ie_result(self, info, download):
+            raise DownloadCancelled()
+
+        def close(self):
+            pass
+
+    retried: list[bool] = []
+    monkeypatch.setattr(
+        downloader, "download_source", lambda *a, **k: retried.append(True)
+    )
+
+    f = SourceFetcher("https://example.com/v", tmp_path)
+    f._ydl = _FakeYDL()
+    f._info = {"id": "v"}
+    f._cached = None
+
+    with pytest.raises(DownloadCancelled):
+        f.download(progress_hook=None)
+    assert retried == []  # no clean-retry download was kicked off
+
+
 def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
     # A prior run already probed this job and processed some chunks; a resume
     # (after idle-abandon or a page refresh) must NOT pay the yt-dlp probe
     # again, and must preserve the already-completed chunks.
-    from pipeline import processor as proc
-    from pipeline.cache import CacheMeta
+    from nomusic.pipeline import processor as proc
+    from nomusic.pipeline.cache import CacheMeta
 
     class _BoomFetcher:
         def __init__(self, *a, **k):
             raise AssertionError("resume must not extract/download — no fetcher")
 
-    # Resume must reuse cached meta: no probe, no SourceFetcher construction.
-    monkeypatch.setattr(proc, "probe", lambda url: (_ for _ in ()).throw(
-        AssertionError("probe must be skipped on resume")))
+    # Resume must reuse cached meta: no SourceFetcher construction means no
+    # yt-dlp metadata extraction or download is attempted.
     monkeypatch.setattr(proc, "SourceFetcher", _BoomFetcher)
 
     cache = JobCache(tmp_path / "cache")
@@ -306,7 +497,7 @@ def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
         ),
     )
 
-    k, meta, info, returned_plans, fetcher = processor.prepare(
+    k, meta, info, returned_plans, fetcher = processor.prepare_job(
         "fake://video", model="fake", keep_stems=["vocals"]
     )
     assert k == key
@@ -351,7 +542,7 @@ def _ffprobe_duration(path: Path) -> float:
 
 
 def test_video_format_honours_height_cap():
-    from pipeline.downloader import _video_format
+    from nomusic.pipeline.downloader import _video_format
 
     capped = _video_format(720)
     assert capped == "bestvideo[height<=720]/bestvideo/best"
@@ -388,6 +579,21 @@ def test_snapshot_chunk_files_returns_contiguous_prefix(tmp_path):
     ]
     # Sizes are captured in the same pass and match what's on disk.
     assert [size for _, size in files] == [len(b"chunk0"), len(b"chunk1"), len(b"chunk2")]
+
+
+@pytest.mark.parametrize("ready, complete, expected", [
+    ([0, 1, 2], True, True),
+    ([0, 2], True, False),
+    ([0, 1, 4], True, False),
+    ([0, 1, 2], False, False),
+])
+def test_complete_manifest_requires_every_chunk(ready, complete, expected):
+    meta = CacheMeta(
+        url="fixture://video", model="fake", keep_stems=["vocals"],
+        duration_seconds=3, chunk_seconds=1, chunk_overlap_seconds=0,
+        total_chunks=3, chunks_ready=ready, complete=complete,
+    )
+    assert complete_manifest(meta) is expected
 
 
 def _make_opus_chunk(wav: Path, out: Path) -> None:
@@ -543,7 +749,7 @@ def test_mux_video_reencodes_vp9_to_h264(tmp_path):
 def test_abandon_all_signals_workers_and_clears_state():
     # /cache/clear must tell live workers to stop (so they unwind cleanly
     # instead of writing into deleted dirs) and wipe the in-memory maps.
-    from jobs import JobRegistry, JobState, JobStatus
+    from nomusic.jobs import JobRegistry, JobState, JobStatus
 
     registry = JobRegistry(processor=None, cache=None)
     registry._jobs["k1"] = JobStatus(job_id="k1", state=JobState.PROCESSING)
@@ -559,11 +765,45 @@ def test_abandon_all_signals_workers_and_clears_state():
     assert registry._abandoning == {"k1", "k2"}
 
 
+def test_abandon_all_pushes_terminal_event_to_open_streams():
+    # /cache/clear must send a terminal event to each open /events stream so the
+    # client's EventSource closes instead of hanging on keep-alives forever.
+    import asyncio
+
+    from nomusic.jobs import JobRegistry, JobState, JobStatus
+
+    registry = JobRegistry(processor=None, cache=None)
+    loop = asyncio.new_event_loop()
+    try:
+        registry.attach_loop(loop)
+        q: asyncio.Queue = asyncio.Queue()
+        registry._jobs["k1"] = JobStatus(job_id="k1", state=JobState.PROCESSING)
+        registry._subscribers["k1"] = [q]
+
+        registry.abandon_all()
+
+        # Run the loop briefly so the scheduled cross-thread put_nowait executes.
+        loop.call_soon(loop.stop)
+        loop.run_forever()
+
+        assert not q.empty(), "open stream got no terminal event"
+        snap = q.get_nowait()
+        assert snap["state"] == "error"
+        assert snap["job_id"] == "k1"
+        assert snap["error"] == "cache cleared"
+    finally:
+        loop.close()
+
+    # State maps are still wiped (same as the no-subscriber path).
+    assert registry._jobs == {}
+    assert registry._subscribers == {}
+
+
 def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):
     # The C7 race: a /process landing during a job's abandon-unwind must NOT
     # hand back the dying job (which would leave it stuck with no worker); it
     # must spawn a fresh worker instead.
-    from jobs import JobRegistry, JobState, JobStatus
+    from nomusic.jobs import JobRegistry, JobState, JobStatus
 
     class _StubCache:
         def key(self, *a, **k):
@@ -582,7 +822,11 @@ def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):
     registry._abandoning.add("k1")
 
     # Don't run the real worker; just let submit register a thread.
-    monkeypatch.setattr(registry, "_run", lambda key, url, model, keep_stems: None)
+    monkeypatch.setattr(
+        registry,
+        "_run",
+        lambda execution, url, model, keep_stems: None,
+    )
 
     status = registry.submit("fake://video", model="fake", keep_stems=["vocals"])
     # Submit refused to adopt the dying job: it created a fresh QUEUED status,
@@ -597,15 +841,15 @@ def test_submit_refuses_to_adopt_an_abandoning_job(monkeypatch):
 def test_infer_batch_matches_single_mlx(tmp_path):
     """Batched separation must produce the same per-chunk output as separate
     single calls — otherwise batching for throughput would change results.
-    Uses the real MLX engine, so it's skipped where MPS/torch isn't available."""
+    Uses the real MLX engine, so it's skipped where a GPU/torch isn't available."""
     try:
         import torch
     except Exception:
         pytest.skip("torch not installed")
-    if not torch.backends.mps.is_available():
-        pytest.skip("MPS not available")
+    if not (torch.backends.mps.is_available() or torch.cuda.is_available()):
+        pytest.skip("no GPU (MPS/CUDA) available")
 
-    from engines.mlx_engine import MLXEngine
+    from nomusic.engines.mlx_engine import MLXEngine
 
     def _tone(name: str, freq: float, seconds: float) -> Path:
         t = np.arange(int(seconds * 44100)) / 44100
@@ -652,3 +896,72 @@ def test_infer_batch_matches_single_mlx(tmp_path):
     # Lengths chosen NOT to be multiples of the segment size so the boundary is
     # exercised, not coincidentally aligned.
     _assert_batch_matches_singles([_tone("c", 220.0, 2.0), _tone("d", 330.0, 1.3)])
+
+
+def _fake_torch(capability, arch_list):
+    """A stand-in for ``torch`` exposing just what ``_cuda_is_usable`` reads."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        cuda=SimpleNamespace(
+            get_device_capability=lambda: capability,
+            get_arch_list=lambda: arch_list,
+        )
+    )
+
+
+# A modern CUDA 12.x wheel's arch list (no Pascal/Volta) — what a GTX 1050 Ti
+# (sm_61) gets matched against.
+_MODERN_ARCHS = ["sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"]
+
+
+def test_cuda_usable_rejects_too_old_gpu():
+    from nomusic.engines.mlx_engine import _cuda_is_usable
+
+    # GTX 1050 Ti is sm_61; the modern wheel ships nothing it can run.
+    assert _cuda_is_usable(_fake_torch((6, 1), _MODERN_ARCHS)) is False
+
+
+def test_cuda_usable_accepts_exact_and_minor_compatible():
+    from nomusic.engines.mlx_engine import _cuda_is_usable
+
+    # Exact real-arch match (RTX 2080, sm_75).
+    assert _cuda_is_usable(_fake_torch((7, 5), _MODERN_ARCHS)) is True
+    # Same-major, higher-minor device runs an older minor's cubin (sm_80 -> 8.6).
+    assert _cuda_is_usable(_fake_torch((8, 6), ["sm_75", "sm_80"])) is True
+    # Backward minor is NOT compatible: an sm_86-only wheel can't run on sm_80.
+    assert _cuda_is_usable(_fake_torch((8, 0), ["sm_86"])) is False
+
+
+def test_cuda_usable_accepts_forward_ptx_jit():
+    from nomusic.engines.mlx_engine import _cuda_is_usable
+
+    # A PTX (compute_) arch JIT-compiles forward to any newer device.
+    assert _cuda_is_usable(_fake_torch((9, 0), ["compute_80"])) is True
+    # ...but not backward.
+    assert _cuda_is_usable(_fake_torch((7, 0), ["compute_80"])) is False
+
+
+def test_cuda_usable_handles_arch_specific_suffixes():
+    from nomusic.engines.mlx_engine import _cuda_is_usable
+
+    # CUDA 12.x/13.x wheels emit suffixed entries (sm_90a, sm_120a, compute_90a).
+    # These must not be silently dropped, or a usable Hopper/Blackwell GPU gets
+    # wrongly demoted to CPU.
+    assert _cuda_is_usable(_fake_torch((9, 0), ["sm_75", "sm_90a"])) is True
+    assert _cuda_is_usable(_fake_torch((12, 0), ["sm_90a", "sm_120a"])) is True
+    assert _cuda_is_usable(_fake_torch((9, 0), ["sm_75", "compute_90a"])) is True
+
+
+def test_cuda_usable_defaults_true_when_undetectable():
+    from nomusic.engines.mlx_engine import _cuda_is_usable
+    from types import SimpleNamespace
+
+    def _boom():
+        raise RuntimeError("no CUDA introspection")
+
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(get_device_capability=_boom, get_arch_list=_boom)
+    )
+    # Can't introspect -> don't second-guess torch.
+    assert _cuda_is_usable(torch) is True

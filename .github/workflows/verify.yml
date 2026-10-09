@@ -1,0 +1,81 @@
+name: Verify local CPU baseline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: CPU (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            architecture: x86_64
+            suite: all
+          - os: macos-15
+            architecture: arm64
+            suite: unit
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/backend/.venv
+      HF_HOME: ${{ github.workspace }}/mds/ci-models
+      HF_HUB_CACHE: ${{ github.workspace }}/mds/ci-models/hub
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      NOMUSIC_DEVICE: cpu
+      NOMUSIC_CACHE_DIR: ${{ github.workspace }}/mds/ci-media
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.19.0'
+          package-manager-cache: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.19'
+          enable-cache: false
+      - name: Check runner architecture
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: test "$(uname -m)" = "$EXPECTED_ARCHITECTURE"
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ffmpeg
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: brew install ffmpeg
+      - name: Install locked CPU application through the user installer
+        run: NOMUSIC_UV="$(command -v uv)" ./install.sh --profile cpu --dev --skip-system-packages --skip-model-download
+      - name: Install browser test dependencies
+        if: matrix.suite == 'all'
+        run: |
+          npm ci --prefix tests/e2e
+          tests/e2e/node_modules/.bin/playwright install --with-deps chromium
+      - name: Fetch and verify pinned public model
+        run: backend/.venv/bin/nomusic models fetch
+      - name: Check installed diagnostics and real CPU inference
+        env:
+          HF_HUB_OFFLINE: '1'
+        run: backend/.venv/bin/nomusic doctor --json
+      - name: Verify installed suites (and real extension on Linux)
+        run: backend/.venv/bin/python scripts/verify.py --suite ${{ matrix.suite }}
+      # Evidence remains local: do not upload profiles, traces, caches or media.

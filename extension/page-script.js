@@ -31,19 +31,24 @@
     },
     set(v) {
       // Fast path: most calls aren't on a tracked element.
-      if (
-        this.dataset &&
-        this.dataset.nomusicVolBlock === "1" &&
-        Number.isFinite(v)
-      ) {
+      if (this.dataset?.nomusicVolBlock === "1") {
+        // Match the native setter's numeric conversion, so e.g. "0.5" cannot
+        // bypass suppression. Invalid assignments retain the native error.
+        const volume = +v;
+        if (!Number.isFinite(volume) || volume < 0 || volume > 1) {
+          origSet.call(this, volume);
+          return;
+        }
         try {
           this.dispatchEvent(
             new CustomEvent("nomusic:vol-intent", {
-              detail: { volume: v, muted: !!this.muted },
+              detail: { volume, muted: !!this.muted },
             }),
           );
-        } catch (_err) {
-          /* swallow */
+        } catch (err) {
+          // Dispatching the intent event is best-effort; a failure here must
+          // not stop us from pinning the underlying volume below.
+          console.debug("[nomusic] vol-intent dispatch failed", err);
         }
         // Pin underlying volume to 0; the audio renderer never sees v.
         origSet.call(this, 0);
@@ -51,5 +56,60 @@
       }
       origSet.call(this, v);
     },
+  });
+})();
+
+// Explicit page commands still express intent when they do not change the
+// native paused state. In particular, pause() during our buffering hold emits
+// no native pause event, but must cancel automatic resume.
+(function () {
+  if (window.__nomusicPlaybackPatched) return;
+  window.__nomusicPlaybackPatched = true;
+  const proto = HTMLMediaElement.prototype;
+  for (const method of ["play", "pause"]) {
+    const desc = Object.getOwnPropertyDescriptor(proto, method);
+    const original = desc.value;
+    Object.defineProperty(proto, method, {
+      ...desc,
+      value(...args) {
+        const result = original.apply(this, args);
+        if (
+          this.dataset?.nomusicPlaybackTrack === "1" &&
+          this.dataset.nomusicPlaybackInternal !== "1"
+        ) {
+          this.dispatchEvent(new CustomEvent("nomusic:playback-intent", {
+            detail: { playing: method === "play" },
+          }));
+        }
+        return result;
+      },
+    });
+  }
+})();
+
+// Bridge: answer the content script's request for the currently-playing
+// video's URL. The isolated content-script world can't call YouTube's player
+// API, but this MAIN-world script can. The content script dispatches
+// `nomusic:resolve-source-url` on document and reads the answer back from a
+// documentElement attribute synchronously (event dispatch runs listeners
+// inline). This is how starting nomusic from the miniplayer captures the video
+// that's playing rather than the page the user is browsing — window.location
+// points at the latter. Non-YouTube pages have no player here, so the attribute
+// is set empty and the content script falls back to the page URL.
+(function () {
+  if (window.__nomusicSourceUrlBridge) return;
+  window.__nomusicSourceUrlBridge = true;
+
+  document.addEventListener("nomusic:resolve-source-url", () => {
+    let url = "";
+    try {
+      const player = document.getElementById("movie_player");
+      const id = player && player.getVideoData && player.getVideoData().video_id;
+      if (id) url = "https://www.youtube.com/watch?v=" + id;
+      else if (player && player.getVideoUrl) url = player.getVideoUrl() || "";
+    } catch (err) {
+      console.debug("[nomusic] resolve-source-url failed", err);
+    }
+    document.documentElement.setAttribute("data-nomusic-source-url", url);
   });
 })();

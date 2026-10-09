@@ -44,7 +44,19 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["icons/button.png"],
+      "resources": [
+        "icons/button.png",
+        "main.js",
+        "settings.js",
+        "session.js",
+        "chunk-loader.js",
+        "button.js",
+        "mute-controller.js",
+        "playback-intent.js",
+        "audio-scheduler.js",
+        "stretch.js",
+        "third_party/soundtouch/*.js"
+      ],
       "matches": ["<all_urls>"]
     }
   ]
