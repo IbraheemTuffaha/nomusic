@@ -9,24 +9,28 @@ SKIP_SYSTEM=0
 SKIP_MODEL=0
 REQUESTED_PROFILE="auto"
 PROFILE_EXPLICIT=0
+SERVICE="ask"
 
 step() { printf '\n==> %s\n' "$1"; }
 die() { printf 'Error: %s\n' "$1" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--profile auto|cpu|cu126] [--dev] [--skip-system-packages] [--skip-model-download]
+Usage: ./install.sh [--profile auto|cpu|cu126] [--dev] [--skip-system-packages] [--skip-model-download] [--service|--no-service]
 
 Installs the committed Python/dependency profile into backend/.venv.
   --profile PROFILE       auto detects NVIDIA on Linux; cpu and cu126 override it.
   --dev                   Include development and test dependencies.
   --skip-system-packages  Check prerequisites without running apt or Homebrew.
   --skip-model-download   Fetch model weights on first use instead of now.
+  --service               macOS: keep the backend running in the background without asking.
+  --no-service            macOS: do not ask, and leave any background service as it is.
 
 NOMUSIC_VENV may select another dedicated, absolute virtual-environment path.
 NOMUSIC_UV may point to an existing uv 0.12.19 executable.
 NOMUSIC_JS_RUNTIME may select a supported Node.js or Deno executable.
-Stop the backend before installing. An old default backend/.venv is moved to
+Stop the backend before installing; a running macOS background service is
+turned off and on again automatically. An old default backend/.venv is moved to
 backend/.venv.bak when its Python differs; an existing backup is never replaced.
 Incompatible explicitly selected environments are left untouched.
 EOF
@@ -41,6 +45,8 @@ while [[ $# -gt 0 ]]; do
     --dev) WITH_DEV=1 ;;
     --skip-system-packages) SKIP_SYSTEM=1 ;;
     --skip-model-download) SKIP_MODEL=1 ;;
+    --service) SERVICE="yes" ;;
+    --no-service) SERVICE="no" ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option '$1'. Run ./install.sh --help." ;;
   esac
@@ -131,6 +137,10 @@ case "$OS/$ARCH" in
     ;;
   *) die "No locked installer profile for $OS/$ARCH. Supported: Linux x86_64 CPU/CUDA and macOS 14+ Apple Silicon." ;;
 esac
+if [[ "$OS" != "Darwin" ]]; then
+  [[ "$SERVICE" != "yes" ]] || die "--service is available on macOS only. Start the backend with 'nomusic serve' instead."
+  SERVICE="no"
+fi
 
 # Match the runtime by its output, so a nodejs binary or an explicitly named
 # executable works too. Detailed installed-package checks run after sync.
@@ -248,14 +258,27 @@ fi
 # Leave an old environment in place until prerequisite checks and uv setup have
 # succeeded. A failed application install keeps one backup for manual recovery.
 BACKUP_CREATED=0
+SERVICE_PAUSED=0
 restore_hint() {
   local status=$?
+  if [[ "$status" -ne 0 && "$SERVICE_PAUSED" -eq 1 ]]; then
+    printf '\nThe background service was turned off for this installation. Once the environment works again, turn it on with:\n  %q install\n' "$REPO_DIR/service.sh" >&2
+  fi
   if [[ "$status" -ne 0 && "$BACKUP_CREATED" -eq 1 ]]; then
     printf '\nInstallation failed; the previous environment is preserved at %s.\n' "$BACKUP_DIR" >&2
     printf 'To discard the incomplete new environment and restore it, run:\n  rm -rf -- %q && mv -- %q %q\n' "$ENV_DIR" "$BACKUP_DIR" "$ENV_DIR" >&2
   fi
 }
 trap restore_hint EXIT
+# launchd restarts a background backend by itself, so it cannot simply stay
+# stopped while its environment changes. Turn it off here and on again at the
+# end. A service that runs another installation is not this installer's to move.
+if [[ "$SERVICE" != "no" ]] && "$BASH" "$REPO_DIR/service.sh" status >/dev/null 2>&1; then
+  step "Turning off the background service during installation"
+  "$BASH" "$REPO_DIR/service.sh" uninstall
+  SERVICE_PAUSED=1
+  SERVICE="yes"
+fi
 if [[ "$MIGRATE_ENV" -eq 1 ]]; then
   [[ ! -e "$BACKUP_DIR" && ! -L "$BACKUP_DIR" ]] || die "$BACKUP_DIR appeared during setup; the current environment has not been changed."
   step "Preserving the previous Python environment at $BACKUP_DIR"
@@ -296,8 +319,35 @@ if [[ "$SKIP_MODEL" -eq 0 ]]; then
   "$ENV_DIR/bin/nomusic" models fetch
 fi
 
+# The environment is complete: a background-service problem below must not
+# suggest restoring the previous one.
+trap - EXIT
+if [[ "$SERVICE" == "ask" ]]; then
+  SERVICE="no"
+  # Only a person at a terminal is asked; scripted installs stay unchanged.
+  if [[ -t 0 ]]; then
+    # Keys pressed while the installation ran do not answer this question.
+    "$ENV_DIR/bin/python" - 3<&0 <<'PY' || true
+import termios
+
+termios.tcflush(3, termios.TCIFLUSH)
+PY
+    printf '\nKeep nomusic running in the background? [Y/n] '
+    read -r ANSWER || ANSWER="n"
+    case "$ANSWER" in ""|[Yy]|[Yy][Ee][Ss]) SERVICE="yes" ;; esac
+  fi
+fi
+
 printf '\nInstall complete (%s).\n' "$PROFILE"
-printf 'Start the backend:\n  %q serve\n' "$ENV_DIR/bin/nomusic"
+if [[ "$SERVICE" == "yes" ]]; then
+  "$BASH" "$REPO_DIR/service.sh" install \
+    || die "The installation finished, but the background service did not start. Start the backend with '$ENV_DIR/bin/nomusic serve' instead."
+else
+  printf 'Start the backend:\n  %q serve\n' "$ENV_DIR/bin/nomusic"
+  if [[ "$OS" == "Darwin" ]]; then
+    printf 'Or keep it running in the background:\n  %q install\n' "$REPO_DIR/service.sh"
+  fi
+fi
 printf '\nLoad the unpacked browser extension from:\n  %s/extension\n' "$REPO_DIR"
 if [[ "$SKIP_MODEL" -eq 1 ]]; then
   printf '\nModel download was skipped; first use requires internet access.\n'

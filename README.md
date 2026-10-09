@@ -56,19 +56,33 @@ From the project folder, with any existing nomusic helper stopped:
 
 ```sh
 ./install.sh
-backend/.venv/bin/nomusic doctor
 ```
 
 Installation creates the pinned Python environment, checks prerequisites and
 downloads the default model, about 84 MB. It can request permission to install
-missing system packages. Doctor runs a short, silent inference check and should
-finish with **Local checks passed.** Follow any reported remedy before continuing.
+missing system packages.
+
+On Mac the installer finishes by asking **Keep nomusic running in the
+background?** Press **Return** to start the helper now and at every login.
+The [background service](docs/background-service.md) guide covers turning it
+off or on later.
+
+When the installer has finished, check the installation:
+
+```sh
+backend/.venv/bin/nomusic doctor
+```
+
+Doctor runs a short, silent inference check and should finish with
+**Local checks passed.** Follow any reported remedy before continuing.
 
 An older default Python environment is preserved as `backend/.venv.bak` during
 migration. See [upgrading and rollback](docs/installation.md#upgrading-and-rollback)
 if you already have a backup or use a custom environment.
 
 ## 3. Start the helper
+
+Skip this step if you accepted the background service.
 
 ```sh
 backend/.venv/bin/nomusic serve
@@ -123,6 +137,8 @@ and metadata locally. Installation also contacts package and model hosts.
 
 - [Installation and development](docs/installation.md): profiles, upgrades,
   model storage and editable development.
+- [Background service](docs/background-service.md): keep the helper running
+  on a Mac without an open Terminal window.
 - [Reference](docs/reference.md): architecture, all backend settings and API.
 - [Verification](docs/verification.md): installed-package tests, CPU/extension
   smoke and their limits.

@@ -77,6 +77,9 @@ A second **Control+C** forces immediate exit. Startup model loading by itself
 does not cause a long wait. Completed media/model caches survive shutdown;
 unfinished exports may need to be requested again after a forced exit.
 
+A Mac [background service](background-service.md) has no terminal: stop it
+with `./service.sh uninstall` and start or restart it with `./service.sh install`.
+
 Start the helper again, check readiness, and toggle nomusic off/on for the
 video. Reopen the popup or reload the page if needed. The extension retries a
 lost status connection and re-submits the same job with bounded backoff. If it
