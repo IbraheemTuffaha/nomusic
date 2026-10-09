@@ -1,13 +1,13 @@
 // Button: the floating pill UI per <video> — status display, menu, MP4
 // download. Creates/disposes a Session on toggle. Split out of content.js.
-import { Session } from "./session.js";
+import { Session, newClientId } from "./session.js";
 
 // Strip characters that are illegal in filenames across Windows/macOS/Linux
 // (plus control chars), collapse whitespace, and bound the length so a very
 // long video title can't produce an unwieldy filename. Exported for unit tests.
 export function sanitizeFilename(name) {
   return (name || "")
-    .replace(/[/\\:*?"<>|\x00-\x1f]/g, " ")
+    .replace(/[/\\:*?"<>|\x00-\x1f\x7f]/g, " ")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 120);
@@ -86,8 +86,6 @@ export class Button {
     this._menuOpen = false;
     this._downloading = false;
     this._download = null;
-    this.clientId = globalThis.crypto?.randomUUID?.()
-      || `client-${Math.random().toString(16).slice(2)}-${Date.now()}`;
     this._nativeDownloads = new Set();
     this._onRuntimeMessage = (message) => {
       if (!this._nativeDownloads.has(message?.downloadId)) return;
@@ -96,7 +94,7 @@ export class Button {
       if (message.type !== "download-export-failed") return;
       if (!this._retired) this._flashDownloadError(message.error || "browser download interrupted");
     };
-    chrome.runtime.onMessage?.addListener?.(this._onRuntimeMessage);
+    chrome.runtime.onMessage.addListener(this._onRuntimeMessage);
     // A download requested before the track finished processing: {format,
     // height}. Held until the job reaches "ready", then saved automatically.
     this._pendingDownload = null;
@@ -367,7 +365,6 @@ export class Button {
     // hidden menu orphaned on document.body, one per navigation. openMenu()
     // re-appends it if this same button is later reused.
     this._cancelDownload();
-    chrome.runtime.onMessage?.removeListener?.(this._onRuntimeMessage);
     this.closeMenu();
     this.menu.remove();
     this.setIdle();
@@ -380,6 +377,8 @@ export class Button {
     this.session?.dispose({ restore: false });
     this.session = null;
     this.dispose();
+    chrome.runtime.onMessage.removeListener(this._onRuntimeMessage);
+    this._nativeDownloads.clear();
     this.el.remove();
   }
 
@@ -392,7 +391,7 @@ export class Button {
       download.controller.abort();
       if (cancelExport && download.exportId && !download.nativeStarted && !download.cancelSent) {
         download.cancelSent = true;
-        fetch(download.cancelUrl, { method: "DELETE", cache: "no-store" }).catch(() => {});
+        fetch(download.cancelUrl, { method: "DELETE", cache: "no-store", keepalive: true }).catch(() => {});
       }
     }
     this._downloading = false;
@@ -512,6 +511,7 @@ export class Button {
     this._downloading = true;
     const base = backendUrl.replace(/\/+$/, "");
     const download = {
+      clientId: newClientId(),
       controller: new AbortController(),
       pollTimer: null,
       pollResolve: null,
@@ -540,15 +540,15 @@ export class Button {
         body: JSON.stringify({
           job_id: jobId,
           format,
-          client_id: this.clientId,
+          client_id: download.clientId,
           ...(format === "mp4" && height ? { max_height: height } : {}),
         }),
       });
-      if (!current()) return;
       const submitted = await submit.json();
       if (!submit.ok) throw new Error(submitted?.detail || `HTTP ${submit.status}`);
       download.exportId = submitted.export_id;
-      download.cancelUrl = `${base}/exports/${encodeURIComponent(download.exportId)}?client_id=${encodeURIComponent(this.clientId)}`;
+      download.cancelUrl = `${base}/exports/${encodeURIComponent(download.exportId)}?client_id=${encodeURIComponent(download.clientId)}`;
+      if (!current()) return;
       let status = submitted;
       while (current() && status.state !== "ready") {
         if (["failed", "expired", "cancelled"].includes(status.state)) {
@@ -610,6 +610,10 @@ export class Button {
         this._flashDownloadError();
       }
     } finally {
+      if (!download.nativeStarted && download.exportId && !download.cancelSent) {
+        download.cancelSent = true;
+        fetch(download.cancelUrl, { method: "DELETE", cache: "no-store", keepalive: true }).catch(() => {});
+      }
       if (current()) this._cancelDownload();
     }
   }

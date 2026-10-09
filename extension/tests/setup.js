@@ -14,7 +14,7 @@ globalThis.chrome ??= {
     sendMessage: (_message, callback) => callback?.({ ok: true, downloadId: 1 }),
     lastError: null,
     onInstalled: { addListener: noop },
-    onMessage: { addListener: noop },
+    onMessage: { addListener: noop, removeListener: noop },
   },
   downloads: {
     download: (_options, callback) => callback?.(1),
