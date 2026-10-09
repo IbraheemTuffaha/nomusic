@@ -355,11 +355,11 @@ def build_export(cache, settings, spec, destination: Path, on_progress, cancel_e
     meta = cache.load_meta(spec.job_id)
     if meta is None or not complete_manifest(meta):
         raise ExportBuildError("source job is not complete")
-    lease = cache.job_lease(spec.job_id, shared=True)
     video_lease = None
     reservation = None
     with tempfile.TemporaryDirectory(dir=cache.scratch.path, prefix="export-") as work:
         work_dir = Path(work)
+        lease = cache.job_lease(spec.job_id, shared=True)
         try:
             chunk_files = snapshot_chunk_files(
                 cache, spec.job_id, meta.total_chunks, require_complete=True
@@ -399,11 +399,6 @@ def build_export(cache, settings, spec, destination: Path, on_progress, cancel_e
             final = destination / _safe_filename(meta.title, extension)
             part = work_dir / (final.name + ".part")
             video_dir = cache.video_dir(meta.url, spec.max_height)
-            cached_video = any(video_dir.glob("video.*"))
-            reservation = cache.reserve(
-                settings.max_video_bytes if not cached_video else
-                _export_reservation(chunk_files, cap=settings.max_export_bytes)
-            )
             on_progress("downloading", 0.0)
 
             def download_hook(data: dict[str, object]) -> None:
@@ -422,6 +417,11 @@ def build_export(cache, settings, spec, destination: Path, on_progress, cancel_e
                     except BlockingIOError:
                         if cancel_event.wait(0.1):
                             raise downloader.DownloadCancelled()
+                cached_video = any(video_dir.glob("video.*"))
+                reservation = cache.reserve(
+                    settings.max_video_bytes if not cached_video else
+                    _export_reservation(chunk_files, cap=settings.max_export_bytes)
+                )
                 video_path = downloader.download_video(
                     meta.url,
                     video_dir,
