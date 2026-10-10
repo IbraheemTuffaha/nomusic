@@ -1,0 +1,71 @@
+[
+  {
+    "name": "Backend",
+    "match": ["backend/**"],
+    "children": [
+      {
+        "name": "Tests",
+        "match": ["backend/tests/**"]
+      },
+      {
+        "name": "Source",
+        "fallback": true
+      }
+    ]
+  },
+  {
+    "name": "Extension",
+    "match": ["extension/**"],
+    "children": [
+      {
+        "name": "Tests",
+        "match": ["extension/tests/**"]
+      },
+      {
+        "name": "Third-party",
+        "match": ["extension/third_party/**"]
+      },
+      {
+        "name": "Source",
+        "fallback": true
+      }
+    ]
+  },
+  {
+    "name": "Browser tests",
+    "match": ["tests/**"]
+  },
+  {
+    "name": "Assets",
+    "match": ["assets/**"]
+  },
+  {
+    "name": "Docs",
+    "match": ["docs/**", "README.md", "**/*.md"]
+  },
+  {
+    "name": "Dependencies",
+    "match": [
+      "pyproject.toml",
+      "uv.lock",
+      "**/package.json",
+      "**/package-lock.json"
+    ]
+  },
+  {
+    "name": "CI",
+    "match": [".github/**"]
+  },
+  {
+    "name": "Tooling",
+    "match": ["scripts/**", "install.sh"]
+  },
+  {
+    "name": "Config",
+    "match": [".gitignore", ".python-version"]
+  },
+  {
+    "name": "Other",
+    "fallback": true
+  }
+]

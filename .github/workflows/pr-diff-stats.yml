@@ -1,0 +1,25 @@
+name: PR diff stats
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  update_comment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Update diff comment
+        uses: milkstrawai/pr-diff-stats@feat/text-report
+        with:
+          config: .github/pr-diff-groups.json
+          format: text-chart
