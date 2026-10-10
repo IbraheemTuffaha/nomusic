@@ -11,13 +11,16 @@ from nomusic import server, services
 
 @pytest.fixture
 def app(monkeypatch, tmp_path):
+    from nomusic.auth import AuthStore
     monkeypatch.setattr(server, "SETTINGS", replace(
         server.SETTINGS, cache_dir=tmp_path / "cache", cache_ttl_days=0,
         memory_gc_interval_seconds=0,
     ))
     monkeypatch.setattr(services, "check_runtime", lambda: {})
     monkeypatch.setattr(services, "check_working_storage", lambda settings: {})
-    return server.create_app()
+    return server.create_app(
+        auth_store=AuthStore(tmp_path / "keys.json", required=False)
+    )
 
 
 def join_warmup(owner):

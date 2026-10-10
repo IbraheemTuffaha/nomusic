@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nomusic import server
+from nomusic.auth import AuthStore
 from nomusic.engines.base import Engine, EngineCapabilities, SeparationResult
 from nomusic.routes.jobs import ProcessRequest
 
@@ -44,7 +45,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr("nomusic.services.check_runtime", lambda: {})
     monkeypatch.setattr(server, "get_engine", lambda name: _CapsOnlyEngine())
     monkeypatch.setattr(server, "SETTINGS", replace(server.SETTINGS, cache_dir=tmp_path))
-    app = server.create_app()
+    app = server.create_app(auth_store=AuthStore(tmp_path / "keys.json", required=False))
     with TestClient(app) as test_client:
         yield test_client
 
