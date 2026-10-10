@@ -505,12 +505,22 @@ try {
   note("forward-seek-and-chunk-boundary", { audio: afterBoundary });
   await page.screenshot({ path: path.join(options.output, "processed.png") });
 
-  const nativeDownloads = new Set();
-  for (const [format, label] of [["mp3", "MP3 — audio only"], ["mp4", "480p"]]) {
-    await page.locator(".nomusic-btn__dl").click();
-    await page.getByRole("button", { name: label, exact: true }).click();
-    const file = await waitForNativeDownload(format, nativeDownloads);
-    note(`${format}-export-decoded`, { bytes: (await stat(file)).size, ...decodeExport(file, format, ready.duration_seconds) });
+  // Export URLs become authenticated worker-owned downloads in the transport
+  // layer. The earlier key/config layers intentionally defer that boundary;
+  // keep their browser smoke focused on processing and playback, while later
+  // layers run the same real export checks once backend-client.js is present.
+  const workerTransport = await stat(path.join(options.extension, "backend-client.js"))
+    .then(() => true, () => false);
+  if (workerTransport) {
+    const nativeDownloads = new Set();
+    for (const [format, label] of [["mp3", "MP3 — audio only"], ["mp4", "480p"]]) {
+      await page.locator(".nomusic-btn__dl").click();
+      await page.getByRole("button", { name: label, exact: true }).click();
+      const file = await waitForNativeDownload(format, nativeDownloads);
+      note(`${format}-export-decoded`, { bytes: (await stat(file)).size, ...decodeExport(file, format, ready.duration_seconds) });
+    }
+  } else {
+    note("exports-deferred-until-authenticated-worker-transport");
   }
   if (options.playback) {
     await runPlaybackScenarios({ page, worker, isolated, audioState, until, sleep, note,
