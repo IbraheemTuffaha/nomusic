@@ -47,11 +47,11 @@ export class Button {
     // Lock the icon's box with inline !important. Some hosts (Telegram Web)
     // force-size every <img> in their message UI to fill its container with a
     // high-specificity !important rule; an inline !important declaration
-    // outranks any stylesheet rule, so this stops the 1008x510 wordmark from
-    // ballooning across the video. 28x14 keeps its ~2:1 ratio.
+    // outranks any stylesheet rule, so this stops the 256x256 mark from
+    // ballooning across the video. The mark is square, so the box is too.
     for (const [k, v] of Object.entries({
-      width: "28px", height: "14px",
-      "max-width": "28px", "max-height": "14px",
+      width: "16px", height: "16px",
+      "max-width": "16px", "max-height": "16px",
       "min-width": "0", "min-height": "0",
     })) {
       this.icon.style.setProperty(k, v, "important");
