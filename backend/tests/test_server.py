@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nomusic import server
+from nomusic.auth import AuthStore
 from nomusic.engines.base import Engine, EngineCapabilities, SeparationResult
 from nomusic.routes.jobs import ProcessRequest
 
@@ -44,7 +45,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr("nomusic.services.check_runtime", lambda: {})
     monkeypatch.setattr(server, "get_engine", lambda name: _CapsOnlyEngine())
     monkeypatch.setattr(server, "SETTINGS", replace(server.SETTINGS, cache_dir=tmp_path))
-    app = server.create_app()
+    app = server.create_app(auth_store=AuthStore(tmp_path / "keys.json", required=False))
     with TestClient(app) as test_client:
         yield test_client
 
@@ -237,19 +238,9 @@ def test_audio_unknown_job_is_404(client):
     assert client.get("/audio/whatever").status_code == 404
 
 
-def test_cache_stats_shape(client):
-    resp = client.get("/cache")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert "total_bytes" in body
-    assert "job_count" in body
-    assert "root" in body
-
-
-def test_cache_clear_returns_deleted_bytes(client):
-    resp = client.post("/cache/clear")
-    assert resp.status_code == 200
-    assert "deleted_bytes" in resp.json()
+def test_cache_administration_is_not_exposed(client):
+    assert client.get("/cache").status_code == 404
+    assert client.post("/cache/clear").status_code == 404
 
 
 # --- Happy path: a fully-cached job streams without any download/separation ---

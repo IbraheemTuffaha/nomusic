@@ -184,7 +184,8 @@ def unit_suites(run: Path, env: dict[str, str], timeout: float) -> dict:
     return {"backend_cases": len(cases), "skips": skips}
 
 
-def wait_ready(process: subprocess.Popen, base: str, timeout: float) -> dict:
+def wait_ready(process: subprocess.Popen, base: str, auth_key_file: Path,
+               timeout: float) -> dict:
     # Bypass ambient proxy variables for our loopback-only test server.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     deadline = time.monotonic() + timeout
@@ -192,9 +193,11 @@ def wait_ready(process: subprocess.Popen, base: str, timeout: float) -> dict:
         if process.poll() is not None:
             raise RuntimeError("Test backend exited before readiness; see backend.log")
         try:
-            with opener.open(base + "/readyz", timeout=2) as response:
+            key = auth_key_file.read_text(encoding="utf-8").strip()
+            headers = {"Authorization": f"Bearer {key}"}
+            with opener.open(urllib.request.Request(base + "/readyz", headers=headers), timeout=2) as response:
                 ready = json.load(response)
-            with opener.open(base + "/capabilities", timeout=2) as response:
+            with opener.open(urllib.request.Request(base + "/capabilities", headers=headers), timeout=2) as response:
                 capabilities = json.load(response)
             if ready.get("state") == "ready":
                 if capabilities["engine"]["device"].split()[0] != "cpu":
@@ -207,7 +210,8 @@ def wait_ready(process: subprocess.Popen, base: str, timeout: float) -> dict:
             if status.get("state") == "failed":
                 raise RuntimeError("Backend startup failed; see backend.log. "
                                    "Fetch the pinned model before the offline smoke.") from error
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
+        except (FileNotFoundError, UnicodeError, urllib.error.URLError, TimeoutError,
+                ConnectionError):
             pass
         time.sleep(0.2)
     raise RuntimeError("Backend readiness timed out; see backend.log")
@@ -230,18 +234,21 @@ def smoke(run: Path, env: dict[str, str], port: int, timeout: float, *, playback
         fixture_command += ["--duration", "180"]
     run_step("fixture", fixture_command, run, env, 60)
     events = run / "backend-events.jsonl"
+    auth_key_file = run / "operator-key"
     base = f"http://127.0.0.1:{port}"
     with (run / "backend.log").open("w") as log:
         process = subprocess.Popen(
             [sys.executable, str(E2E / "backend.py"), "--fixture", str(fixture),
-             "--cache-dir", str(run / "media"), "--events", str(events), "--port", str(port)],
+             "--cache-dir", str(run / "media"), "--events", str(events),
+             "--auth-key-file", str(auth_key_file), "--port", str(port)],
             cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
         )
         try:
-            capabilities = wait_ready(process, base, min(timeout, 180))
+            capabilities = wait_ready(process, base, auth_key_file, min(timeout, 180))
             announce("Test backend and CPU model ready")
             browser_command = ["node", str(E2E / "browser.mjs"), "--backend", base,
                                "--fixture", str(fixture), "--output", str(run / "browser"),
+                               "--auth-key-file", str(auth_key_file),
                                "--timeout-seconds", str(timeout)]
             if playback:
                 browser_command += ["--playback", "true"]

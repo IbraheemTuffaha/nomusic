@@ -124,6 +124,7 @@ not resource or authorization guarantees for a public service.
 | --- | --- | --- |
 | `NOMUSIC_HOST` | `127.0.0.1` | Listen address |
 | `NOMUSIC_PORT` | `8723` | Listen port |
+| `NOMUSIC_AUTH_FILE` | `~/.config/nomusic/operator-keys.json` | Owner-only operator-key file |
 | `NOMUSIC_ENGINE` | `mlx` | Engine name; `demucs` is an alias |
 | `NOMUSIC_DEVICE` | `auto` | Prefer available MPS, then CUDA, then CPU; explicit `cpu`, `mps`, `cuda` fail if unavailable |
 | `NOMUSIC_CACHE_DIR` | `~/.cache/nomusic` | Processed-media storage |
@@ -173,15 +174,19 @@ development commands are covered in [installation](installation.md).
 
 ## API
 
-The local API has no user authentication. Interactive schemas are available at
-`http://127.0.0.1:8723/docs` while the helper runs.
+The backend requires an operator key for every processing, status, media, cache
+and export route. Send it as `Authorization: Bearer <key>`; the key must never
+be placed in a URL. `GET /healthz` remains a minimal unauthenticated liveness
+probe. See [backend authentication](authentication.md) for key generation,
+rotation, revocation and the bounded treatment of already-open transfers.
+Remote schemas and administrative routes are not exposed.
 
 | Method | Path | Request/result |
 | --- | --- | --- |
 | GET | `/healthz` | `{ok: true}`: API reachability |
-| GET | `/readyz` | Startup readiness; 200 when ready, otherwise 503 |
-| GET | `/capabilities` | Engine/device/models/stems, defaults and cache configuration |
-| POST | `/process` | `{url, model?, keep_stems?, client_id?}` → `JobStatus`; a client id also acquires a bounded interest lease; `429` means the bounded queue is full |
+| GET | `/readyz` | Authenticated startup readiness; 200 when ready, otherwise 503 |
+| GET | `/capabilities` | Authenticated engine/device/models/stems, defaults and cache configuration |
+| POST | `/process` | Authenticated `{url, model?, keep_stems?, client_id?}` → `JobStatus`; a client id also acquires a bounded interest lease; `429` means the bounded queue is full |
 | POST | `/process/{job_id}/prioritize` | `{from_chunk}` → `{applied}`; prioritize pending chunks around a seek |
 | POST | `/process/{job_id}/interest` | `{client_id, lease_seconds?}` → lease; acquire or heartbeat one client's interest |
 | DELETE | `/process/{job_id}/interest?client_id=...` | Release only that client's interest; another client's lease is unaffected |
@@ -193,8 +198,8 @@ The local API has no user authentication. Interactive schemas are available at
 | GET | `/exports/{export_id}` | Export status; ready records include `download_url`, `filename`, size and expiry |
 | DELETE | `/exports/{export_id}?client_id=...` | Release one export owner; a queued/building export is cancelled when its last owner leaves |
 | GET | `/exports/{export_id}/download` | Leased prepared artifact; `425` while building, `409` for failed/cancelled, `410` after expiry; concurrent readers are bounded |
-| GET | `/cache` | Cache path and storage statistics |
-| POST | `/cache/clear` | Remove processed media → `{deleted_bytes}` |
+Cache administration is local: `nomusic cache stats` and `nomusic cache clear`.
+Stop the backend before a full clear; live namespace leases are retained.
 
 `JobStatus` includes `job_id`, `state`, `phase`, `phase_progress` (0–1 or null),
 `phase_label`, `chunks_ready`, `ready_chunks`, `total_chunks`, `duration_seconds`,

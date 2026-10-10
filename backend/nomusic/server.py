@@ -37,7 +37,8 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from nomusic.config import SETTINGS
+from nomusic.auth import AuthStore
+from nomusic.config import SETTINGS, Settings
 from nomusic.engines import get_engine
 from nomusic.routes.jobs import router as jobs_router
 from nomusic.routes.exports import router as exports_router
@@ -104,11 +105,14 @@ def _configure_logging() -> None:
 async def lifespan(app: FastAPI):
     _configure_logging()
     _raise_open_file_limit()
+    settings: Settings = app.state.settings
+    auth_store: AuthStore = app.state.auth_store
+    auth_store.validate()
     # The CLI selects process ownership before startup, including bind failures
     # that make Uvicorn enter lifespan shutdown without its normal drain hook.
     prepare_shutdown = getattr(app.state, "prepare_process_shutdown", None)
     services = Services(
-        SETTINGS, engine_factory=get_engine,
+        settings, engine_factory=get_engine,
         wait_for_warmup=prepare_shutdown is None,
     )
     app.state.services = services
@@ -132,8 +136,14 @@ async def lifespan(app: FastAPI):
                 delattr(app.state, name)
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="nomusic", version="0.2.0", lifespan=lifespan)
+def create_app(
+    *, settings: Settings | None = None, auth_store: AuthStore | None = None
+) -> FastAPI:
+    configured = SETTINGS if settings is None else settings
+    app = FastAPI(title="nomusic", version="0.2.0", lifespan=lifespan,
+                  docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.settings = configured
+    app.state.auth_store = auth_store or AuthStore(configured.auth_file)
 
     # Preserve the existing local browser transport. Loopback and CORS do not
     # authenticate callers; remote deployment requires separate authorization
@@ -147,7 +157,7 @@ def create_app() -> FastAPI:
     # Chrome silently drops the request even when regular CORS is correct.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=list(SETTINGS.allow_origins),
+        allow_origins=list(configured.allow_origins),
         allow_credentials=False,
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["*"],

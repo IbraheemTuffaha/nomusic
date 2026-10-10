@@ -18,13 +18,14 @@ from collections.abc import AsyncIterator
 from typing import Optional
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from nomusic.config import SETTINGS
 from nomusic.engines.base import DEMUCS_STEMS
 from nomusic.jobs import JobQueueFull, RegistryClosed
+from nomusic.security import require_operator
 
 from . import JsonDict
 
@@ -171,7 +172,9 @@ class InterestRequest(BaseModel):
 
 
 @router.post("/process")
-def process(req: ProcessRequest, request: Request) -> JsonDict:
+def process(
+    req: ProcessRequest, request: Request, _operator=Depends(require_operator)
+) -> JsonDict:
     engine = request.app.state.engine
     registry = request.app.state.registry
     caps = engine.capabilities()
@@ -214,7 +217,8 @@ def process(req: ProcessRequest, request: Request) -> JsonDict:
 
 @router.post("/process/{job_id}/interest")
 def acquire_interest(
-    job_id: str, req: InterestRequest, request: Request
+    job_id: str, req: InterestRequest, request: Request,
+    _operator=Depends(require_operator),
 ) -> dict[str, object]:
     """Acquire or renew one client's bounded processing lease.
 
@@ -236,6 +240,7 @@ def release_interest(
     job_id: str,
     request: Request,
     client_id: str = Query(..., min_length=1, max_length=128),
+    _operator=Depends(require_operator),
 ) -> dict[str, bool]:
     """Release only this client's interest; other tabs keep the job alive."""
     registry = request.app.state.registry
@@ -249,7 +254,10 @@ def release_interest(
 
 
 @router.post("/process/{job_id}/prioritize")
-def prioritize(job_id: str, req: PrioritizeRequest, request: Request) -> dict[str, bool]:
+def prioritize(
+    job_id: str, req: PrioritizeRequest, request: Request,
+    _operator=Depends(require_operator),
+) -> dict[str, bool]:
     """Re-order the worker's pending chunks so ``from_chunk`` is next.
 
     Fire-and-forget from the client's perspective. Returns ``applied``
@@ -263,7 +271,7 @@ def prioritize(job_id: str, req: PrioritizeRequest, request: Request) -> dict[st
 
 
 @router.get("/status/{job_id}")
-def status(job_id: str, request: Request) -> JsonDict:
+def status(job_id: str, request: Request, _operator=Depends(require_operator)) -> JsonDict:
     registry = request.app.state.registry
     status = registry.get(job_id)
     if status is None:
@@ -272,7 +280,9 @@ def status(job_id: str, request: Request) -> JsonDict:
 
 
 @router.get("/events/{job_id}")
-async def events(job_id: str, request: Request) -> Response:
+async def events(
+    job_id: str, request: Request, _operator=Depends(require_operator)
+) -> Response:
     """Server-Sent Events stream of a job's status.
 
     Replaces the extension's old /status polling: the client opens one

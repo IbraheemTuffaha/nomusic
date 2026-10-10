@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -16,6 +16,7 @@ from nomusic.exports import (
     ExportSourceNotReady,
     ExportState,
 )
+from nomusic.security import require_operator
 
 from . import JsonDict
 from .responses import LeasedFileResponse
@@ -45,7 +46,9 @@ def _require_export_id(export_id: str) -> str:
 
 
 @router.post("/exports")
-def submit_export(req: ExportRequest, request: Request) -> JSONResponse:
+def submit_export(
+    req: ExportRequest, request: Request, _operator=Depends(require_operator)
+) -> JSONResponse:
     registry = request.app.state.exports
     try:
         status = registry.submit(req.job_id, req.format, req.max_height, req.client_id)
@@ -71,7 +74,9 @@ def submit_export(req: ExportRequest, request: Request) -> JSONResponse:
 
 
 @router.get("/exports/{export_id}/download")
-def download_export(export_id: str, request: Request) -> Response:
+def download_export(
+    export_id: str, request: Request, _operator=Depends(require_operator)
+) -> Response:
     _require_export_id(export_id)
     registry = request.app.state.exports
     status = registry.get(export_id)
@@ -116,7 +121,9 @@ def download_export(export_id: str, request: Request) -> Response:
 
 
 @router.get("/exports/{export_id}")
-def get_export(export_id: str, request: Request) -> JsonDict:
+def get_export(
+    export_id: str, request: Request, _operator=Depends(require_operator)
+) -> JsonDict:
     _require_export_id(export_id)
     status = request.app.state.exports.get(export_id)
     if status is None:
@@ -129,6 +136,7 @@ def cancel_export(
     export_id: str,
     request: Request,
     client_id: str | None = Query(default=None, min_length=1, max_length=128),
+    _operator=Depends(require_operator),
 ) -> JsonDict:
     _require_export_id(export_id)
     status = request.app.state.exports.cancel(export_id, client_id)

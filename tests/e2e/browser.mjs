@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { copyFile, mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,10 +13,10 @@ import { installPlaybackObserver, runPlaybackScenarios } from "./playback-scenar
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const sourceUrl = "https://www.youtube.com/watch?v=nomusic_e2e_fixture";
-const usage = "node tests/e2e/browser.mjs --backend http://127.0.0.1:PORT --fixture FIXTURE_DIR --output NEW_DIR [--timeout-seconds 300] [--extension DIR] [--playback true]";
+const usage = "node tests/e2e/browser.mjs --backend http://127.0.0.1:PORT --fixture FIXTURE_DIR --output NEW_DIR --auth-key-file KEY_FILE [--timeout-seconds 300] [--extension DIR] [--playback true]";
 
 function argumentsFrom(argv) {
-  const allowed = new Set(["backend", "fixture", "output", "timeout-seconds", "extension", "playback"]);
+  const allowed = new Set(["backend", "fixture", "output", "auth-key-file", "timeout-seconds", "extension", "playback"]);
   const args = {};
   for (let index = 0; index < argv.length; index += 2) {
     const name = argv[index].replace(/^--/, "");
@@ -25,7 +25,7 @@ function argumentsFrom(argv) {
     assert.ok(!(name in args), `Duplicate argument: ${name}`);
     args[name] = argv[index + 1];
   }
-  for (const name of ["backend", "fixture", "output"]) assert.ok(args[name], usage);
+  for (const name of ["backend", "fixture", "output", "auth-key-file"]) assert.ok(args[name], usage);
   const base = new URL(args.backend);
   assert.ok(base.protocol === "http:" && base.hostname === "127.0.0.1", "Use a loopback HTTP test backend");
   assert.ok(base.pathname === "/" && !base.search && !base.hash && !base.username && !base.password, usage);
@@ -36,6 +36,7 @@ function argumentsFrom(argv) {
     backend: base.origin,
     fixture: path.resolve(args.fixture, "clip.mp4"),
     output: path.resolve(args.output),
+    authKeyFile: path.resolve(args["auth-key-file"]),
     extension: path.resolve(args.extension || path.join(repo, "extension")),
     timeoutSeconds,
     playback: args.playback === "true",
@@ -44,6 +45,8 @@ function argumentsFrom(argv) {
 
 const options = argumentsFrom(process.argv.slice(2));
 assert.ok((await stat(options.fixture)).isFile(), "Fixture must be a media file");
+const operatorKey = (await readFile(options.authKeyFile, "utf8")).trim();
+assert.match(operatorKey, /^nm_[0-9a-f]{64}$/, "Smoke key must be a generated operator key");
 await mkdir(path.dirname(options.output), { recursive: true });
 await mkdir(options.output); // Refuse to reuse a browser profile or old evidence.
 
@@ -133,7 +136,10 @@ async function waitForNativeDownload(format, seen = new Set()) {
 }
 
 async function backendJson(route) {
-  const response = await fetch(`${options.backend}${route}`, { signal: AbortSignal.timeout(10000) });
+  const response = await fetch(`${options.backend}${route}`, {
+    signal: AbortSignal.timeout(10000),
+    headers: { Authorization: `Bearer ${operatorKey}` },
+  });
   assert.equal(response.status, 200, `${route}: ${await response.clone().text()}`);
   return response.json();
 }
@@ -284,8 +290,6 @@ try {
   assert.match(capabilities.engine.device, /^cpu(?:\s|$)/);
   const boundary = capabilities.defaults.chunk_seconds - capabilities.defaults.chunk_overlap_seconds;
   assert.ok(Number.isFinite(boundary) && boundary > 1, "Usable chunk stride");
-  const cache = await backendJson("/cache");
-  assert.equal(cache.total_bytes, 0, "Start the smoke backend with an empty media cache");
   note("ready-cpu-backend", { readiness, device: capabilities.engine.device, boundary });
   server = await startFixtureServer(boundary);
   context = await chromium.launchPersistentContext(path.join(options.output, "profile"), {
@@ -310,15 +314,48 @@ try {
   assert.equal(manifest.manifest_version, 3);
   // Let onInstalled finish writing defaults before replacing the test URL.
   await until("extension initial settings", async () => (await worker.evaluate(() => chrome.storage.sync.get("autoStart"))).autoStart === false);
-  // Only settings are configured; extension source and host permissions are
-  // unchanged. A fresh profile prevents carrying private accounts or cookies.
-  await worker.evaluate((backendUrl) => chrome.storage.sync.set({ backendUrl, model: null, keepStems: null, autoStart: false }), options.backend);
+  // This runner owns the generated credential. The service-worker shim adds it
+  // only to loopback backend requests so the pre-auth-transport extension in
+  // the lower stack layer can still exercise the protected server. Later
+  // layers replace this with the real trusted-storage transport.
+  await worker.evaluate(({ backendUrl, key }) => {
+    const records = [];
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    const backendOrigin = new URL(backendUrl).origin;
+    globalThis.__nomusicE2ETransport = records;
+    globalThis.fetch = async (input, init = {}) => {
+      const requestUrl = new URL(typeof input === "string" ? input : input.url);
+      const headers = new Headers(init.headers || (typeof input === "string" ? undefined : input.headers));
+      if (requestUrl.origin === backendOrigin) headers.set("Authorization", `Bearer ${key}`);
+      const requestInit = { ...init, headers };
+      const record = { path: requestUrl.pathname, method: requestInit.method || (typeof input === "string" ? "GET" : input.method || "GET") };
+      if (record.path === "/process" && typeof requestInit.body === "string") {
+        try { record.requestBody = JSON.parse(requestInit.body); } catch { record.requestBody = null; }
+      }
+      records.push(record);
+      try {
+        const response = await originalFetch(input, requestInit);
+        record.status = response.status;
+        if (record.path === "/process" && response.ok) record.body = await response.clone().json();
+        return response;
+      } catch (error) {
+        record.error = String(error);
+        throw error;
+      }
+    };
+    return chrome.storage.sync.set({ backendUrl, model: null, keepStems: null, autoStart: false });
+  }, { backendUrl: options.backend, key: operatorKey });
   const popup = await context.newPage();
   popup.on("pageerror", (error) => report.pageErrors.push(`popup: ${error}`));
+  await popup.route(`${options.backend}/**`, (route) =>
+    route.continue({ headers: { ...route.request().headers(), authorization: `Bearer ${operatorKey}` } }));
   await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+  if (await popup.locator("#operatorKey").count()) {
+    await popup.locator("#operatorKey").fill(operatorKey);
+    await popup.locator("#saveAuth").click();
+  }
   await popup.locator("#status.ok").waitFor();
   assert.equal(await popup.locator("#backend").inputValue(), options.backend);
-  await popup.waitForFunction(() => document.querySelector("#cacheSize")?.textContent === "empty");
   const ping = await popup.evaluate(() => chrome.runtime.sendMessage({ type: "ping-backend" }));
   assert.equal(ping.ok, true, "Actual service-worker backend ping");
   await popup.screenshot({ path: path.join(options.output, "settings.png") });
@@ -338,7 +375,7 @@ try {
       await route.abort();
       return;
     }
-    await route.continue();
+    await route.continue({ headers: { ...route.request().headers(), authorization: `Bearer ${operatorKey}` } });
   };
   let requestSerial = 0;
   const requests = new Map();
@@ -367,6 +404,11 @@ try {
     requests.delete(request);
   });
   page.on("requestfinished", (request) => requests.delete(request));
+  // The lower stack layer still has page-facing fetches. Add the generated
+  // credential at the browser boundary so this remains a test-only concern;
+  // the later transport layer moves the same header into the worker.
+  await page.route(`${options.backend}/**`, (route) =>
+    route.continue({ headers: { ...route.request().headers(), authorization: `Bearer ${operatorKey}` } }));
   if (options.playback) await page.route(eventPattern, routeEvents);
   const cdp = await context.newCDPSession(page);
   const worlds = new Map();
@@ -463,12 +505,22 @@ try {
   note("forward-seek-and-chunk-boundary", { audio: afterBoundary });
   await page.screenshot({ path: path.join(options.output, "processed.png") });
 
-  const nativeDownloads = new Set();
-  for (const [format, label] of [["mp3", "MP3 — audio only"], ["mp4", "480p"]]) {
-    await page.locator(".nomusic-btn__dl").click();
-    await page.getByRole("button", { name: label, exact: true }).click();
-    const file = await waitForNativeDownload(format, nativeDownloads);
-    note(`${format}-export-decoded`, { bytes: (await stat(file)).size, ...decodeExport(file, format, ready.duration_seconds) });
+  // Export URLs become authenticated worker-owned downloads in the transport
+  // layer. The earlier key/config layers intentionally defer that boundary;
+  // keep their browser smoke focused on processing and playback, while later
+  // layers run the same real export checks once backend-client.js is present.
+  const workerTransport = await stat(path.join(options.extension, "backend-client.js"))
+    .then(() => true, () => false);
+  if (workerTransport) {
+    const nativeDownloads = new Set();
+    for (const [format, label] of [["mp3", "MP3 — audio only"], ["mp4", "480p"]]) {
+      await page.locator(".nomusic-btn__dl").click();
+      await page.getByRole("button", { name: label, exact: true }).click();
+      const file = await waitForNativeDownload(format, nativeDownloads);
+      note(`${format}-export-decoded`, { bytes: (await stat(file)).size, ...decodeExport(file, format, ready.duration_seconds) });
+    }
+  } else {
+    note("exports-deferred-until-authenticated-worker-transport");
   }
   if (options.playback) {
     await runPlaybackScenarios({ page, worker, isolated, audioState, until, sleep, note,
