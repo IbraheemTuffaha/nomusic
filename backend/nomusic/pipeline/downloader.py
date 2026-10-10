@@ -23,13 +23,16 @@ avoids the per-chunk yt-dlp / JS-challenge overhead.
 from __future__ import annotations
 
 import logging
+import ipaddress
 import math
 import os
+import socket
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from nomusic.runtime import javascript_runtime
 
@@ -47,6 +50,31 @@ class DownloadCancelled(Exception):
 
 class ResourceLimitExceeded(RuntimeError):
     """Input or output exceeds the configured finite local-use policy."""
+
+
+def validate_public_url(url: str) -> str:
+    """Recheck a delayed fetch target immediately before network access."""
+    parts = urlsplit(str(url).strip())
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("url must be a public http(s) URL")
+    host = parts.hostname.lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        raise ValueError("url host is not allowed")
+    try:
+        candidates = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            candidates = [ipaddress.ip_address(socket.inet_aton(host))]
+        except OSError:
+            try:
+                infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            except (socket.gaierror, UnicodeError, ValueError) as exc:
+                raise ValueError("url host could not be resolved") from exc
+            candidates = [ipaddress.ip_address(info[4][0]) for info in infos]
+    for ip in candidates:
+        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_unspecified or ip.is_multicast:
+            raise ValueError("url host is not allowed")
+    return str(url).strip()
 
 
 @dataclass(frozen=True)

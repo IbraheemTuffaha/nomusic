@@ -158,7 +158,11 @@ not resource or authorization guarantees for a public service.
 | `NOMUSIC_FINAL_CHUNK_TOLERANCE_SECONDS` | `1` | Allow only this measured source-duration remainder when validating a download |
 | `NOMUSIC_MAX_CACHE_BYTES` | `4 GiB` | Shared completed-media budget; leased namespaces are retained until release |
 | `NOMUSIC_MIN_FREE_BYTES` | `256 MiB` | Minimum filesystem free space required for a new reservation |
-| `NOMUSIC_MAX_EXPORT_BYTES` | `2 GiB` | Reservation held while MP3/MP4 preparation and serving are active |
+| `NOMUSIC_MAX_EXPORT_BYTES` | `2 GiB` | Reservation and final-size bound for one MP3/MP4 artifact |
+| `NOMUSIC_MAX_EXPORT_JOBS` | `2` | Maximum queued/building export preparations |
+| `NOMUSIC_EXPORT_TTL_SECONDS` | `86400` | Independent retention for completed/failed export records and files |
+| `NOMUSIC_EXPORT_SWEEP_INTERVAL_SECONDS` | `300` | Export-retention sweep interval; `0` disables the pass |
+| `NOMUSIC_MAX_EXPORT_DOWNLOADS` | `4` | Simultaneous prepared-artifact readers |
 | `NOMUSIC_JS_RUNTIME` | Auto-detected | Explicit Node.js 22+ or Deno 2.3+ executable |
 | `NOMUSIC_SHUTDOWN_GRACE_SECONDS` | `60` | Positive finite shutdown deadline for active work; second Ctrl+C exits immediately |
 | `NOMUSIC_DEBUG` | `false` | Enable debug logging |
@@ -184,9 +188,11 @@ The local API has no user authentication. Interactive schemas are available at
 | GET | `/status/{job_id}` | `JobStatus`; 404 for unknown job |
 | GET | `/events/{job_id}` | SSE `JobStatus` updates; 204 for unknown job; planned shutdown closes without a fabricated error |
 | GET | `/chunk/{job_id}/{idx}` | OGG/Opus chunk; 425 while unavailable |
-| GET | `/audio/{job_id}` | Full OGG/Opus; `?format=mp3` transcodes; 425 before completion |
-| GET | `/video/{job_id}` | Original video with processed audio in MP4; `?max_height=N` requests a height limit; 425 before completion, 413/507 when policy or storage rejects it |
-| GET | `/video/{job_id}/progress` | `{phase, percent}` for preparation; pass the same `max_height` as the export |
+| GET | `/audio/{job_id}` | Full OGG/Opus; 425 before completion |
+| POST | `/exports` | `{job_id, format, max_height?, client_id?}` → durable export status; source must be ready; `429` when the bounded export queue is full |
+| GET | `/exports/{export_id}` | Export status; ready records include `download_url`, `filename`, size and expiry |
+| DELETE | `/exports/{export_id}?client_id=...` | Release one export owner; a queued/building export is cancelled when its last owner leaves |
+| GET | `/exports/{export_id}/download` | Leased prepared artifact; `425` while building, `409` for failed/cancelled, `410` after expiry; concurrent readers are bounded |
 | GET | `/cache` | Cache path and storage statistics |
 | POST | `/cache/clear` | Remove processed media → `{deleted_bytes}` |
 
@@ -198,6 +204,7 @@ a seek. States are `queued`, `probing`, `downloading`, `processing`, `ready` and
 
 Readiness describes startup runtime/storage/default-model checks; doctor adds
 a tiny real inference. Neither establishes source availability or ongoing
-capacity. Export preparation currently occurs inside the download request;
-video fallback formats may exceed the requested height. Keep these limitations
-in mind when writing another client.
+capacity. Export preparation is asynchronous: wait for the source job to become
+ready, submit once, poll the export record, then download its leased artifact.
+The video policy still applies the configured height and byte bounds, and every
+export is revalidated before it is published.

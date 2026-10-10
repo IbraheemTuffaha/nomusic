@@ -3,9 +3,10 @@
   "name": "nomusic",
   "version": "0.1.0",
   "description": "Strip music from videos on YouTube, Facebook, and the rest of the web using a local source-separation backend.",
-  "permissions": ["storage", "activeTab"],
+  "permissions": ["storage", "activeTab", "downloads"],
   "host_permissions": [
-    "http://127.0.0.1:8723/*"
+    "http://127.0.0.1:8723/*",
+    "http://localhost:8723/*"
   ],
   "background": {
     "service_worker": "background.js"

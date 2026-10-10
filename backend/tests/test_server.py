@@ -233,23 +233,8 @@ def test_chunk_unknown_job_is_404(client):
     assert client.get("/chunk/nope/0").status_code == 404
 
 
-def test_audio_bad_format_is_400(client):
-    # Format is validated before the job lookup, so a bad format wins over 404.
-    assert client.get("/audio/whatever?format=flac").status_code == 400
-
-
 def test_audio_unknown_job_is_404(client):
     assert client.get("/audio/whatever").status_code == 404
-
-
-def test_video_unknown_job_is_404(client):
-    assert client.get("/video/whatever").status_code == 404
-
-
-def test_video_progress_defaults_to_idle(client):
-    resp = client.get("/video/whatever/progress")
-    assert resp.status_code == 200
-    assert resp.json()["phase"] == "idle"
 
 
 def test_cache_stats_shape(client):

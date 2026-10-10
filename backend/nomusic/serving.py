@@ -180,7 +180,13 @@ class LifecycleServer(uvicorn.Server):
         self._shutdown_services = services
         services.begin_shutdown()
         registry = getattr(services, "registry", None)
-        if not (registry is not None and registry.has_active_workers) and not self.server_state.tasks:
+        exports = getattr(services, "exports", None)
+        has_work = (
+            (registry is not None and registry.has_active_workers)
+            or (exports is not None and exports.has_active_workers)
+            or bool(self.server_state.tasks)
+        )
+        if not has_work:
             # Preload alone is disposable; keep the same deadline if work was
             # already draining, and never extend it between shutdown phases.
             self._start_watchdog(min(1.0, self.grace_seconds))

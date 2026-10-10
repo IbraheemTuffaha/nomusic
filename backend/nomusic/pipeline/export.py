@@ -1,6 +1,6 @@
 """Helpers for assembling a finished job's chunks into a downloadable file.
 
-These back the ``/audio?format=mp3`` and ``/video`` download endpoints. They're
+These back the asynchronous ``/exports`` workflow. They're
 kept out of ``server.py`` so they can be unit-tested without importing the
 FastAPI app (which loads the separation engine at import time).
 
@@ -28,7 +28,13 @@ counts real videos produce).
 from __future__ import annotations
 
 import logging
+import os
+import re
+import selectors
+import signal
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -41,6 +47,13 @@ _FFPROBE_TIMEOUT_SECONDS = 60.0
 # Any other video codec (VP9/AV1, which YouTube uses above 1080p) is re-encoded
 # to H.264 so the exported MP4 plays everywhere, not just in VLC/Chrome.
 MP4_COPYABLE_VCODECS = frozenset({"h264", "hevc"})
+
+_FFMPEG_TIMEOUT_SECONDS = 3600.0
+_PART_SUFFIX = ".part"
+
+
+class FFmpegOutputLimitExceeded(RuntimeError):
+    """The staged export grew beyond the configured output budget."""
 
 
 def complete_manifest(meta) -> bool:
@@ -162,6 +175,19 @@ def mp3_transcode_cmd(chunk_files: list[tuple[Path, int]], dest: Path) -> list[s
     ]
 
 
+def opus_transcode_cmd(chunk_files: list[tuple[Path, int]], dest: Path) -> list[str]:
+    """Splice chunks through the decoder and write one sample-accurate Ogg/Opus file."""
+    n = len(chunk_files)
+    return [
+        *_FFMPEG_BASE,
+        *_audio_inputs(chunk_files),
+        "-filter_complex", _concat_chain(n) + "[aout]",
+        "-map", "[aout]",
+        "-c:a", "libopus", "-b:a", "96k",
+        "-f", "ogg", str(dest),
+    ]
+
+
 def mux_video_cmd(
     video: Path,
     chunk_files: list[tuple[Path, int]],
@@ -205,5 +231,296 @@ def mux_video_cmd(
         "-c:a", "aac", "-b:a", "192k",
         "-shortest",
         "-movflags", "+faststart",
+        # The worker writes to a .mp4.part staging path. Keep the muxer
+        # explicit because ffmpeg cannot infer it from that temporary suffix.
+        "-f", "mp4",
         str(dest),
     ]
+
+
+def _export_reservation(
+    chunk_files: list[tuple[Path, int]], *, cap: int, extra_bytes: int = 0
+) -> int:
+    """Reserve a bounded estimate rather than the maximum for every export."""
+    source_bytes = sum(size for _, size in chunk_files)
+    estimate = max(1, source_bytes * 2 + max(0, extra_bytes))
+    return min(cap, estimate)
+
+
+def _run_export_ffmpeg(
+    cmd: list[str], cancel_event=None, *, on_progress=None, total_seconds: float = 0.0,
+    output_path: Path | None = None, max_output_bytes: int | None = None,
+) -> None:
+    """Run ffmpeg without pipe deadlocks and with cancellable progress."""
+    report_progress = on_progress is not None and total_seconds > 0
+    full = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]] if report_progress else cmd
+    stdout = subprocess.PIPE if report_progress else subprocess.DEVNULL
+    stderr_file = tempfile.TemporaryFile()
+    proc = subprocess.Popen(
+        full,
+        stdout=stdout,
+        stderr=stderr_file,
+        start_new_session=True,
+    )
+
+    def stop(force: bool = False) -> None:
+        if proc.poll() is not None:
+            return
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            try:
+                (proc.kill if force else proc.terminate)()
+            except ProcessLookupError:
+                pass
+
+    deadline = time.monotonic() + _FFMPEG_TIMEOUT_SECONDS
+    selector = selectors.DefaultSelector()
+    if proc.stdout is not None:
+        os.set_blocking(proc.stdout.fileno(), False)
+        selector.register(proc.stdout, selectors.EVENT_READ)
+    output = b""
+    try:
+        while proc.poll() is None or selector.get_map():
+            if cancel_event is not None and cancel_event.is_set():
+                stop()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    stop(force=True)
+                    proc.wait(timeout=2)
+                raise RuntimeError("cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop(force=True)
+                proc.wait(timeout=2)
+                proc.communicate()
+                drained = True
+                raise RuntimeError(
+                    f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS:.0f}s"
+                )
+            for key, _ in selector.select(timeout=min(0.2, remaining)):
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                output += chunk
+                if report_progress:
+                    for line in output.splitlines(keepends=True):
+                        if not line.endswith((b"\n", b"\r")):
+                            continue
+                        text = line.decode("utf-8", "replace").strip()
+                        if text.startswith("out_time_us="):
+                            try:
+                                fraction = int(text.split("=", 1)[1]) / 1e6 / total_seconds
+                                on_progress(max(0.0, min(1.0, fraction)))
+                            except (ValueError, ZeroDivisionError):
+                                log.debug("unparseable ffmpeg progress: %r", text)
+                    output = output.split(b"\n")[-1]
+            if output_path is not None and max_output_bytes is not None:
+                try:
+                    if output_path.stat().st_size > max_output_bytes:
+                        stop(force=True)
+                        proc.wait(timeout=2)
+                        raise FFmpegOutputLimitExceeded(
+                            f"ffmpeg output exceeds the {max_output_bytes}-byte limit"
+                        )
+                except FileNotFoundError:
+                    pass
+            if proc.poll() is not None and not selector.get_map():
+                break
+        proc.wait(timeout=2)
+    except BaseException:
+        if proc.poll() is None:
+            stop(force=True)
+            proc.wait(timeout=2)
+        selector.close()
+        stderr_file.close()
+        raise
+    finally:
+        selector.close()
+        if proc.stdout is not None:
+            proc.stdout.close()
+    stderr_file.seek(0)
+    stderr = stderr_file.read()
+    stderr_file.close()
+    if proc.returncode:
+        detail = stderr.decode("utf-8", "replace").strip() or "(no stderr)"
+        raise RuntimeError(f"ffmpeg failed: {detail[-2000:]}")
+
+
+def _safe_filename(title: str, extension: str) -> str:
+    value = re.sub(r"[/\\:*?\"<>|\x00-\x1f\x7f]", " ", title or "nomusic")
+    value = value.strip(" .")
+    value = re.sub(r"\s+", " ", value)[:120] or "nomusic"
+    return f"{value}.{extension}"
+
+
+def build_export(cache, settings, spec, destination: Path, on_progress, cancel_event):
+    """Build one export in scratch, then publish one complete file."""
+    from nomusic.exports import ExportArtifact, ExportBuildError
+    from nomusic.pipeline import downloader
+    from nomusic.pipeline.cache import StorageLimitExceeded
+    from nomusic.pipeline.downloader import ResourceLimitExceeded
+
+    meta = cache.load_meta(spec.job_id)
+    if meta is None or not complete_manifest(meta):
+        raise ExportBuildError("source job is not complete")
+    video_lease = None
+    reservation = None
+    with tempfile.TemporaryDirectory(dir=cache.scratch.path, prefix="export-") as work:
+        work_dir = Path(work)
+        lease = cache.job_lease(spec.job_id, shared=True)
+        try:
+            chunk_files = snapshot_chunk_files(
+                cache, spec.job_id, meta.total_chunks, require_complete=True
+            )
+            if not chunk_files:
+                raise ExportBuildError("source chunks are unavailable")
+            if cancel_event.is_set():
+                raise ExportBuildError("cancelled")
+
+            format_details = {
+                "opus": ("opus", "audio/ogg", opus_transcode_cmd),
+                "mp3": ("mp3", "audio/mpeg", mp3_transcode_cmd),
+            }
+            if spec.format in format_details:
+                extension, media_type, command = format_details[spec.format]
+                final = destination / _safe_filename(meta.title, extension)
+                part = work_dir / (final.name + ".part")
+                reservation = cache.reserve(
+                    _export_reservation(chunk_files, cap=settings.max_export_bytes)
+                )
+                on_progress("encoding", 0.0)
+                _run_export_ffmpeg(
+                    command(chunk_files, part), cancel_event,
+                    output_path=part, max_output_bytes=settings.max_export_bytes,
+                )
+                if cancel_event.is_set():
+                    raise ExportBuildError("cancelled")
+                size = part.stat().st_size
+                if size <= 0 or size > settings.max_export_bytes:
+                    raise ExportBuildError("export artifact exceeds the configured size limit")
+                reservation.resize(size)
+                os.replace(part, final)
+                on_progress("encoding", 1.0)
+                return ExportArtifact(final, final.name, media_type, size)
+
+            if spec.format != "mp4":
+                raise ExportBuildError(f"unsupported export format: {spec.format}")
+
+            extension, media_type = "mp4", "video/mp4"
+            final = destination / _safe_filename(meta.title, extension)
+            part = work_dir / (final.name + ".part")
+            video_dir = cache.video_dir(meta.url, spec.max_height)
+            on_progress("downloading", 0.0)
+
+            def download_hook(data: dict[str, object]) -> None:
+                if cancel_event.is_set():
+                    raise downloader.DownloadCancelled()
+                _download_progress(data, on_progress)
+
+            try:
+                downloader.validate_public_url(meta.url)
+                while True:
+                    try:
+                        video_lease = cache.video_lease(
+                            meta.url, spec.max_height, blocking=False
+                        )
+                        break
+                    except BlockingIOError:
+                        if cancel_event.wait(0.1):
+                            raise downloader.DownloadCancelled()
+                cached_video = any(video_dir.glob("video.*"))
+                reservation = cache.reserve(
+                    settings.max_video_bytes if not cached_video else
+                    _export_reservation(chunk_files, cap=settings.max_export_bytes)
+                )
+                video_path = downloader.download_video(
+                    meta.url,
+                    video_dir,
+                    max_height=spec.max_height,
+                    limits=downloader.limits_from_settings(settings),
+                    progress_hook=download_hook,
+                )
+            except downloader.DownloadCancelled as exc:
+                raise ExportBuildError("cancelled") from exc
+            except (StorageLimitExceeded, ResourceLimitExceeded) as exc:
+                raise ExportBuildError(str(exc)) from exc
+            except Exception as exc:
+                raise ExportBuildError(f"video download failed: {exc}") from exc
+            if cancel_event.is_set():
+                raise ExportBuildError("cancelled")
+            if video_lease is not None:
+                video_lease.close()
+                while True:
+                    try:
+                        video_lease = cache.video_lease(
+                            meta.url, spec.max_height, shared=True, blocking=False
+                        )
+                        break
+                    except BlockingIOError:
+                        if cancel_event.wait(0.1):
+                            raise ExportBuildError("cancelled")
+            reservation.resize(
+                _export_reservation(chunk_files, cap=settings.max_export_bytes)
+            )
+            on_progress("encoding", 0.0)
+            duration = video_duration(video_path)
+            reencode = video_codec(video_path) not in MP4_COPYABLE_VCODECS
+
+            def encode() -> None:
+                _run_export_ffmpeg(
+                    mux_video_cmd(
+                        video_path, chunk_files, part, reencode_video=reencode
+                    ),
+                    cancel_event,
+                    on_progress=lambda fraction: on_progress("encoding", fraction),
+                    total_seconds=duration,
+                    output_path=part,
+                    max_output_bytes=settings.max_export_bytes,
+                )
+
+            try:
+                encode()
+            except FFmpegOutputLimitExceeded:
+                raise
+            except RuntimeError:
+                if reencode or cancel_event.is_set():
+                    raise
+                reencode = True
+                on_progress("encoding", 0.0)
+                encode()
+            if cancel_event.is_set():
+                raise ExportBuildError("cancelled")
+            size = part.stat().st_size
+            if size <= 0 or size > settings.max_export_bytes:
+                raise ExportBuildError("export artifact exceeds the configured size limit")
+            reservation.resize(size)
+            os.replace(part, final)
+            on_progress("encoding", 1.0)
+            return ExportArtifact(final, final.name, media_type, size)
+        except StorageLimitExceeded as exc:
+            raise ExportBuildError(str(exc)) from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ExportBuildError(str(exc)) from exc
+        finally:
+            if reservation is not None:
+                reservation.release()
+            if video_lease is not None:
+                video_lease.close()
+            lease.close()
+
+
+def _download_progress(data: dict[str, object], on_progress) -> None:
+    if data.get("status") == "downloading":
+        total = data.get("total_bytes") or data.get("total_bytes_estimate")
+        got = data.get("downloaded_bytes")
+        if total and got is not None:
+            on_progress("downloading", max(0.0, min(1.0, float(got) / float(total))))
+    elif data.get("status") == "finished":
+        on_progress("downloading", 1.0)

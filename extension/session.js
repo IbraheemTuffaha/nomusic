@@ -16,7 +16,7 @@ const MAX_END_TAIL_SECONDS = 10;
 const FALLBACK_CLIENT_LEASE_SECONDS = 30;
 const FALLBACK_CLIENT_HEARTBEAT_SECONDS = 10;
 
-function newClientId() {
+export function newClientId() {
   try {
     if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
   } catch {

@@ -17,9 +17,11 @@ The endpoints live in :mod:`nomusic.routes` (system / jobs / media):
   GET  /status/{job_id}      -> JobStatus
   GET  /events/{job_id}      -> text/event-stream (SSE status updates)
   GET  /chunk/{job_id}/{idx} -> audio/ogg (425 if not yet ready)
-  GET  /audio/{job_id}       -> audio/ogg (concatenated track; ?format=mp3 transcodes)
-  GET  /video/{job_id}       -> video/mp4 (original video, stripped audio muxed in)
-  GET  /video/{job_id}/progress -> {phase, percent} for the export in flight
+  GET  /audio/{job_id}       -> audio/ogg (concatenated track)
+  POST /exports              -> asynchronous export preparation
+  GET  /exports/{export_id}  -> export status
+  DELETE /exports/{export_id} -> cancel an export
+  GET  /exports/{export_id}/download -> prepared artifact
   GET  /cache                -> cache stats
   POST /cache/clear          -> {deleted_bytes}
 """
@@ -38,7 +40,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from nomusic.config import SETTINGS
 from nomusic.engines import get_engine
 from nomusic.routes.jobs import router as jobs_router
-from nomusic.routes.media import _ExportProgress, router as media_router
+from nomusic.routes.exports import router as exports_router
+from nomusic.routes.media import router as media_router
 from nomusic.routes.system import router as system_router
 from nomusic.services import Services
 
@@ -114,7 +117,7 @@ async def lifespan(app: FastAPI):
         app.state.engine = services.engine
         app.state.cache = services.cache
         app.state.registry = services.registry
-        app.state.export_progress = _ExportProgress()
+        app.state.exports = services.exports
         yield
     finally:
         if prepare_shutdown is not None:
@@ -122,7 +125,9 @@ async def lifespan(app: FastAPI):
         services.begin_shutdown()
         # Joining synchronously here would block final worker-to-SSE callbacks.
         await asyncio.to_thread(services.shutdown)
-        for name in ("engine", "cache", "registry", "export_progress", "services"):
+        for name in (
+            "engine", "cache", "registry", "exports", "services"
+        ):
             if hasattr(app.state, name):
                 delattr(app.state, name)
 
@@ -152,6 +157,7 @@ def create_app() -> FastAPI:
     app.include_router(system_router)
     app.include_router(jobs_router)
     app.include_router(media_router)
+    app.include_router(exports_router)
     return app
 
 

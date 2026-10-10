@@ -10,6 +10,9 @@ import json
 import math
 import shutil
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +24,11 @@ from nomusic.engines.base import Engine, EngineCapabilities, SeparationResult
 from nomusic.pipeline.cache import CacheMeta, JobCache
 from nomusic.pipeline.downloader import ResourceLimitExceeded, ResourceLimits
 from nomusic.pipeline.export import (
+    _run_export_ffmpeg,
     complete_manifest,
     mp3_transcode_cmd,
     mux_video_cmd,
+    opus_transcode_cmd,
     snapshot_chunk_files,
 )
 from nomusic.pipeline.processor import (
@@ -33,6 +38,43 @@ from nomusic.pipeline.processor import (
     _ChunkWork,
     plan_chunks,
 )
+
+
+def test_export_ffmpeg_cancellation_terminates_process():
+    cancel = threading.Event()
+    errors = []
+
+    def run():
+        try:
+            _run_export_ffmpeg([sys.executable, "-c", "import time; time.sleep(30)"], cancel)
+        except RuntimeError as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=run)
+    started = time.monotonic()
+    worker.start()
+    time.sleep(0.1)
+    cancel.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert [str(error) for error in errors] == ["cancelled"]
+    assert time.monotonic() - started < 5
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_export_ffmpeg_stops_when_staged_output_exceeds_limit(tmp_path):
+    output = tmp_path / "too-large.wav"
+    with pytest.raises(RuntimeError, match="output exceeds"):
+        _run_export_ffmpeg(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                "-c:a", "pcm_s16le", str(output),
+            ],
+            output_path=output,
+            max_output_bytes=1,
+        )
 
 
 def test_plan_chunks_covers_full_duration():
@@ -507,7 +549,7 @@ def test_prepare_skips_reprobe_on_resume(tmp_path, monkeypatch):
     assert len(returned_plans) == len(plans)
 
 
-# --- Download export helpers (back the /audio?format=mp3 and /video endpoints) ---
+# --- Format helpers used by asynchronous exports ---
 
 
 def _has(*bins: str) -> bool:
@@ -568,7 +610,7 @@ def test_snapshot_chunk_files_returns_contiguous_prefix(tmp_path):
     # A gap in the chunk sequence must truncate the snapshot — the export must
     # never advertise/serve chunks past the first hole.
     cache = JobCache(tmp_path / "cache")
-    key = "job0"
+    key = "0" * 16
     cache.dir_for(key)  # create the dir without going through the processor
     for idx in (0, 1, 2, 4):  # note: 3 is missing
         cache.chunk_path(key, idx).write_bytes(f"chunk{idx}".encode())
@@ -610,8 +652,8 @@ def _make_opus_chunk(wav: Path, out: Path) -> None:
     reason="needs ffmpeg with libopus + libmp3lame and ffprobe",
 )
 def test_mp3_transcode_produces_playable_mp3(tmp_path):
-    # The /audio?format=mp3 path: concatenated Opus chunks must transcode to a
-    # single MP3 of the combined duration.
+    # The MP3 export path: concatenated Opus chunks must transcode to a single
+    # MP3 of the combined duration.
     tone = tmp_path / "tone.wav"
     _write_tone(tone, seconds=2.0)
     chunk_files = []
@@ -630,6 +672,26 @@ def test_mp3_transcode_produces_playable_mp3(tmp_path):
     # timeline, so the duration reflects all of them (a regression guard against
     # byte-concatenation, which left the file unseekable).
     assert abs(_ffprobe_duration(out) - 6.0) < 0.3
+
+
+@pytest.mark.skipif(
+    not (_ffmpeg_has_encoder("libopus") and _has("ffprobe")),
+    reason="needs ffmpeg with libopus and ffprobe",
+)
+def test_opus_transcode_decodes_and_reencodes_one_complete_stream(tmp_path):
+    tone = tmp_path / "tone.wav"
+    _write_tone(tone, seconds=0.45)
+    chunk_files = []
+    for i in range(3):
+        c = tmp_path / f"chunk_{i:03d}.opus"
+        _make_opus_chunk(tone, c)
+        chunk_files.append((c, c.stat().st_size))
+
+    out = tmp_path / "full.opus"
+    subprocess.run(opus_transcode_cmd(chunk_files, out), check=True, capture_output=True)
+    streams = _ffprobe_streams(out)
+    assert streams == [{"codec_name": "opus", "codec_type": "audio"}]
+    assert abs(_ffprobe_duration(out) - 1.35) < 0.1
 
 
 @pytest.mark.skipif(
@@ -689,7 +751,9 @@ def test_mux_video_replaces_audio_with_stripped_track(tmp_path):
         check=True, capture_output=True,
     )
 
-    out = tmp_path / "out.mp4"
+    # Export workers write to a .mp4.part path before atomically publishing it;
+    # the explicit muxer format keeps ffmpeg independent of that temp suffix.
+    out = tmp_path / "out.mp4.part"
     subprocess.run(mux_video_cmd(video, chunk_files, out), check=True, capture_output=True)
 
     streams = _ffprobe_streams(out)

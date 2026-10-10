@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -88,6 +88,48 @@ async function until(description, fn, timeoutMs = 30000) {
     await sleep(100);
   }
   throw new Error(`Timed out: ${description}`);
+}
+
+async function waitForNativeDownload(format, seen = new Set()) {
+  const destination = path.join(options.output, `export.${format}`);
+  const roots = [
+    path.join(options.output, "downloads"),
+    path.join(options.output, "profile", "Downloads"),
+  ];
+  return until(`native ${format} download`, async () => {
+    for (const root of roots) {
+      let entries;
+      try {
+        entries = await readdir(root, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      // chrome.downloads may assign a UUID filename in headless Chromium
+      // even when the extension supplies a friendly name. The test owns a
+      // fresh directory, so any completed regular file is the requested
+      // artifact; a .crdownload remains in-flight.
+      const candidate = entries.find((entry) =>
+        entry.isFile() && !entry.name.endsWith(".crdownload") && !seen.has(`${root}/${entry.name}`));
+      if (candidate) {
+        const source = path.join(root, candidate.name);
+        try {
+          const first = await stat(source);
+          if (first.size === 0) continue;
+          await sleep(100);
+          const second = await stat(source);
+          if (first.size !== second.size) continue;
+          await copyFile(source, destination);
+          seen.add(`${root}/${candidate.name}`);
+          return destination;
+        } catch {
+          // Chrome can publish the directory entry before the file is ready.
+          // Retry on the next poll instead of treating that transient state as
+          // the requested export.
+        }
+      }
+    }
+    return false;
+  }, 120000);
 }
 
 async function backendJson(route) {
@@ -252,7 +294,9 @@ try {
       env: { ...process.env, NOMUSIC_VERIFY_BROWSER_HELPER: String(process.pid),
         NOMUSIC_VERIFY_CHROMIUM: chromium.executablePath() },
     } : {}),
-    channel: "chromium", headless: true, acceptDownloads: true, viewport: { width: 1280, height: 800 },
+    channel: "chromium", headless: true, acceptDownloads: true,
+    downloadsPath: path.join(options.output, "downloads"),
+    viewport: { width: 1280, height: 800 },
     args: ["--mute-audio", `--disable-extensions-except=${options.extension}`, `--load-extension=${options.extension}`],
   });
   context.setDefaultTimeout(20000);
@@ -419,14 +463,11 @@ try {
   note("forward-seek-and-chunk-boundary", { audio: afterBoundary });
   await page.screenshot({ path: path.join(options.output, "processed.png") });
 
+  const nativeDownloads = new Set();
   for (const [format, label] of [["mp3", "MP3 — audio only"], ["mp4", "480p"]]) {
     await page.locator(".nomusic-btn__dl").click();
-    const downloading = page.waitForEvent("download", { timeout: 120000 });
     await page.getByRole("button", { name: label, exact: true }).click();
-    const download = await downloading;
-    const file = path.join(options.output, `export.${format}`);
-    await download.saveAs(file);
-    assert.equal(await download.failure(), null);
+    const file = await waitForNativeDownload(format, nativeDownloads);
     note(`${format}-export-decoded`, { bytes: (await stat(file)).size, ...decodeExport(file, format, ready.duration_seconds) });
   }
   if (options.playback) {

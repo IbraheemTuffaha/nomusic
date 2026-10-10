@@ -18,8 +18,10 @@ from nomusic.config import Settings
 from nomusic.diagnostics import check_working_storage
 from nomusic.engines.base import Engine
 from nomusic.jobs import JobRegistry
+from nomusic.exports import ExportRegistry
 from nomusic.pipeline.cache import JobCache
 from nomusic.pipeline.downloader import limits_from_settings
+from nomusic.pipeline.export import build_export
 from nomusic.pipeline.processor import Processor
 from nomusic.runtime import check_runtime
 from nomusic.worker import SupervisedModelWorker
@@ -37,6 +39,7 @@ class Services:
         self.engine: Engine | None = None
         self.cache: JobCache | None = None
         self.registry: JobRegistry | None = None
+        self.exports: ExportRegistry | None = None
         self.worker: SupervisedModelWorker | None = None
         self._stop = threading.Event()
         self.shutdown_requested = False
@@ -89,6 +92,20 @@ class Services:
             max_queued_jobs=settings.max_queued_jobs,
         )
         self.registry.attach_loop(loop)
+        # Export workers prepare a durable artifact behind their own cache lease.
+        # The source must already be READY, which keeps export admission bounded
+        # and avoids retaining abandoned source jobs for hours.
+        self.exports = ExportRegistry(
+            self.cache,
+            self.registry,
+            lambda spec, destination, progress, cancel: build_export(
+                self.cache, settings, spec, destination, progress, cancel
+            ),
+            max_jobs=settings.max_export_jobs,
+            ttl_seconds=settings.export_ttl_seconds,
+            max_artifact_bytes=settings.max_export_bytes,
+            max_downloads=settings.max_export_downloads,
+        )
 
         if settings.cache_ttl_days > 0 and settings.cache_sweep_interval_seconds > 0:
             self._spawn(
@@ -107,6 +124,13 @@ class Services:
                 "nomusic-interest-gc",
                 lambda: self._repeat(
                     self._expire_interests, settings.interest_sweep_interval_seconds
+                ),
+            )
+        if settings.export_sweep_interval_seconds > 0:
+            self._spawn(
+                "nomusic-export-gc",
+                lambda: self._repeat(
+                    self._sweep_exports, settings.export_sweep_interval_seconds
                 ),
             )
         self._spawn("nomusic-engine-warmup", self._warmup)
@@ -145,6 +169,12 @@ class Services:
         expired = self.registry.expire_interests()
         if expired:
             log.info("Interest GC expired %d abandoned client lease(s)", expired)
+
+    def _sweep_exports(self) -> None:
+        assert self.exports is not None
+        expired = self.exports.cleanup()
+        if expired:
+            log.info("Export TTL sweep expired %d artifact(s)", expired)
 
     def _warmup(self) -> None:
         engine = self.engine
@@ -199,10 +229,14 @@ class Services:
             self._readiness = {"ok": False, "state": "stopping"}
         if self.registry is not None:
             self.registry.begin_shutdown()
+        if self.exports is not None:
+            self.exports.begin_shutdown()
 
     def shutdown(self) -> None:
         """Join from outside the event loop so final queue callbacks can run."""
         self.begin_shutdown()
+        if self.exports is not None:
+            self.exports.shutdown()
         if self.registry is not None:
             self.registry.shutdown()
         if self.worker is not None:
@@ -217,6 +251,7 @@ class Services:
         if self.cache is not None:
             self.cache.close()
         self.registry = None
+        self.exports = None
         self.worker = None
         self.cache = None
         self.engine = None
