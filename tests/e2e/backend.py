@@ -115,11 +115,16 @@ def main() -> None:
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--cache-dir", type=Path, required=True, help="New or empty job cache")
     parser.add_argument("--events", type=Path, required=True, help="New JSONL lifecycle event file")
+    parser.add_argument("--auth-key-file", type=Path, required=True,
+                        help="Write the generated test-only operator key here")
     parser.add_argument("--port", type=int, default=8723)
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
-    fixture, cache, events = args.fixture.resolve(), args.cache_dir.resolve(), args.events.resolve()
+    fixture = args.fixture.resolve()
+    cache = args.cache_dir.resolve()
+    events = args.events.resolve()
+    auth_key_file = args.auth_key_file.resolve()
     try:
         duration = verify_fixture(fixture)
         cache.mkdir(parents=True, exist_ok=True)
@@ -129,6 +134,9 @@ def main() -> None:
             raise ValueError("Keep --events outside --cache-dir")
         events.parent.mkdir(parents=True, exist_ok=True)
         events.touch(exist_ok=False)
+        if auth_key_file.exists():
+            raise ValueError("Refusing to overwrite the test operator key file")
+        auth_key_file.parent.mkdir(parents=True, exist_ok=True)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"Smoke backend setup failed: {exc}\n")
 
@@ -146,6 +154,7 @@ def main() -> None:
         if name.startswith("NOMUSIC_"):
             del os.environ[name]
     with tempfile.TemporaryDirectory(prefix="backend-tmp-", dir=cache.parent) as scratch:
+        auth_file = cache.parent / "operator-keys.json"
         os.environ.update({
             "NOMUSIC_HOST": "127.0.0.1",
             "NOMUSIC_PORT": str(args.port),
@@ -167,12 +176,19 @@ def main() -> None:
             "HF_HUB_DISABLE_TELEMETRY": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": scratch,
+            "NOMUSIC_AUTH_FILE": str(auth_file),
         })
         if js_runtime:
             os.environ["NOMUSIC_JS_RUNTIME"] = js_runtime
         sys.dont_write_bytecode = True
         # TemporaryDirectory above initialized tempfile's cache before TMPDIR.
         tempfile.tempdir = scratch
+        from nomusic.auth import AuthStore
+
+        operator_key, _ = AuthStore(auth_file).generate(label="controlled smoke")
+        auth_key_file.write_text(operator_key + "\n", encoding="utf-8")
+        if os.name == "posix":
+            os.chmod(auth_key_file, 0o600)
         install_adapter(fixture, duration, record)
 
         # Processor imports acquisition symbols directly, so the adapter must
