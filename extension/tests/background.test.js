@@ -7,11 +7,12 @@ import { OPERATOR_KEY_PATTERN, normalizeBackendUrl } from "../config.js";
 
 let loadCounter = 0;
 
-async function loadBackground({ stored }) {
+async function loadBackground({ stored, sessionStored = {} }) {
   const captured = {};
   let written = null;
   const local = {};
   const session = {};
+  Object.assign(session, sessionStored);
   let accessLevel = null;
   let sessionAccessLevel = null;
   const messages = [];
@@ -77,7 +78,12 @@ test("backend URL validation keeps loopback HTTP and rejects remote HTTP", () =>
 
 test("download-export delegates the response body to chrome downloads", async () => {
   const { captured, local } = await loadBackground({ stored: { backendUrl: "http://127.0.0.1:8723" } });
-  local.operatorKey = `nm_${"e".repeat(64)}`;
+  local.trustedBackend = {
+    version: 1,
+    backendUrl: "http://127.0.0.1:8723",
+    operatorKey: `nm_${"e".repeat(64)}`,
+    generation: "test-e",
+  };
   let response;
   const keepOpen = captured.onMessage(
     {
@@ -93,7 +99,7 @@ test("download-export delegates the response body to chrome downloads", async ()
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.deepEqual(captured.downloadOptions, {
     url: `http://127.0.0.1:8723/exports/${"a".repeat(32)}/download`,
-    headers: [{ name: "Authorization", value: `Bearer ${local.operatorKey}` }],
+    headers: [{ name: "Authorization", value: `Bearer ${local.trustedBackend.operatorKey}` }],
     filename: "sample.mp3",
     conflictAction: "uniquify",
     saveAs: false,
@@ -103,7 +109,12 @@ test("download-export delegates the response body to chrome downloads", async ()
 
 test("an interrupted native download cancels its export and notifies its tab", async () => {
   const { captured, messages, local } = await loadBackground({ stored: { backendUrl: "http://127.0.0.1:8723" } });
-  local.operatorKey = `nm_${"f".repeat(64)}`;
+  local.trustedBackend = {
+    version: 1,
+    backendUrl: "http://127.0.0.1:8723",
+    operatorKey: `nm_${"f".repeat(64)}`,
+    generation: "test-f",
+  };
   const requests = [];
   globalThis.fetch = async (url, options) => {
     requests.push({ url, options });
@@ -131,7 +142,7 @@ test("an interrupted native download cancels its export and notifies its tab", a
   assert.equal(requests.length, 1);
   assert.equal(requests[0].url, `http://127.0.0.1:8723/exports/${"b".repeat(32)}?client_id=client-1`);
   assert.equal(requests[0].options.method, "DELETE");
-  assert.equal(requests[0].options.headers.Authorization, `Bearer ${local.operatorKey}`);
+  assert.equal(requests[0].options.headers.Authorization, `Bearer ${local.trustedBackend.operatorKey}`);
   assert.deepEqual(messages, [{
     tabId: 9,
     message: {
@@ -261,4 +272,44 @@ test("backend-request exposes only validated operations and keeps auth in the wo
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(rejected.code, "invalid_request");
   assert.equal(requests.length, 1);
+});
+
+test("job routes keep their backend credential after the active configuration changes", async () => {
+  const jobId = "e".repeat(16);
+  const oldKey = `nm_${"1".repeat(64)}`;
+  const newKey = `nm_${"2".repeat(64)}`;
+  const { captured, local } = await loadBackground({
+    stored: {},
+    sessionStored: {
+      nomusicJobBackendRoutes: {
+        [jobId]: {
+          version: 1,
+          backendUrl: "https://old.example",
+          operatorKey: oldKey,
+          generation: "old",
+        },
+      },
+    },
+  });
+  local.trustedBackend = {
+    version: 1,
+    backendUrl: "https://new.example",
+    operatorKey: newKey,
+    generation: "new",
+  };
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return { ok: true, status: 200, json: async () => ({ state: "processing" }) };
+  };
+  let response;
+  captured.onMessage(
+    { type: "backend-request", operation: "status", jobId },
+    { tab: { id: 1 }, url: "https://video.example/" },
+    (value) => (response = value),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(response.ok, true);
+  assert.equal(requests[0].url, `https://old.example/status/${jobId}`);
+  assert.equal(requests[0].options.headers.Authorization, `Bearer ${oldKey}`);
 });

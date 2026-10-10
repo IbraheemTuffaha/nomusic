@@ -37,6 +37,19 @@ const REQUEST_TIMEOUTS_MS = {
 const ID_RE = /^[0-9a-f]{16}$/;
 const EXPORT_ID_RE = /^[0-9a-f]{32}$/;
 const STEMS = new Set(["vocals", "drums", "bass", "other"]);
+const MAX_BACKEND_ROUTES = 256;
+const JOB_ROUTE_STORAGE_KEY = "nomusicJobBackendRoutes";
+const EXPORT_ROUTE_STORAGE_KEY = "nomusicExportBackendRoutes";
+const ACTIVE_DOWNLOAD_STORAGE_KEY = "nomusicActiveDownloads";
+const activeDownloads = new Map();
+let activeDownloadsLoaded = false;
+let activeDownloadsLoad = null;
+let activeDownloadsWrite = Promise.resolve();
+const jobBackendRoutes = new Map();
+const exportBackendRoutes = new Map();
+let backendRoutesLoaded = false;
+let backendRoutesLoad = null;
+let backendRoutesWrite = Promise.resolve();
 const OPERATIONS = new Set([
   "capabilities", "process", "interest-renew", "interest-release",
   "prioritize", "status", "chunk", "export-submit", "export-status",
@@ -114,6 +127,151 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+function authRoute(auth) {
+  if (!auth || typeof auth.backendUrl !== "string" ||
+      typeof auth.operatorKey !== "string" ||
+      !OPERATOR_KEY_PATTERN.test(auth.operatorKey)) return null;
+  return {
+    version: AUTH_CONFIG_VERSION,
+    backendUrl: auth.backendUrl,
+    operatorKey: auth.operatorKey,
+    generation: auth.generation || "legacy",
+  };
+}
+
+function normalizeRoute(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      value.version !== AUTH_CONFIG_VERSION ||
+      typeof value.backendUrl !== "string" ||
+      typeof value.operatorKey !== "string" ||
+      !OPERATOR_KEY_PATTERN.test(value.operatorKey)) return null;
+  try {
+    return authRoute({
+      backendUrl: normalizeBackendUrl(value.backendUrl),
+      operatorKey: value.operatorKey,
+      generation: value.generation,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function routeSnapshot() {
+  return {
+    [JOB_ROUTE_STORAGE_KEY]: Object.fromEntries(jobBackendRoutes),
+    [EXPORT_ROUTE_STORAGE_KEY]: Object.fromEntries(exportBackendRoutes),
+  };
+}
+
+function rememberBackendRoute(routes, id, auth) {
+  const route = authRoute(auth);
+  if (!id || !route) return;
+  routes.delete(id);
+  routes.set(id, route);
+  while (routes.size > MAX_BACKEND_ROUTES) routes.delete(routes.keys().next().value);
+  const session = chrome.storage.session;
+  if (!session?.set) return;
+  backendRoutesWrite = backendRoutesWrite
+    .catch(() => {})
+    .then(() => session.set(routeSnapshot()))
+    .catch(() => {});
+}
+
+async function loadBackendRoutes() {
+  if (backendRoutesLoaded) return;
+  if (!backendRoutesLoad) {
+    backendRoutesLoad = (async () => {
+      const session = chrome.storage.session;
+      if (session?.get) {
+        try {
+          const stored = await session.get([JOB_ROUTE_STORAGE_KEY, EXPORT_ROUTE_STORAGE_KEY]);
+          for (const [id, value] of Object.entries(stored?.[JOB_ROUTE_STORAGE_KEY] || {})) {
+            if (ID_RE.test(id)) {
+              const route = normalizeRoute(value);
+              if (route) jobBackendRoutes.set(id, route);
+            }
+          }
+          for (const [id, value] of Object.entries(stored?.[EXPORT_ROUTE_STORAGE_KEY] || {})) {
+            if (EXPORT_ID_RE.test(id)) {
+              const route = normalizeRoute(value);
+              if (route) exportBackendRoutes.set(id, route);
+            }
+          }
+        } catch {
+          // A browser without session storage can still use in-memory routes.
+        }
+      }
+      backendRoutesLoaded = true;
+    })();
+  }
+  await backendRoutesLoad;
+}
+
+function routeFor(operation, data, configuredAuth) {
+  if (["interest-renew", "interest-release", "prioritize", "status", "chunk"].includes(operation)) {
+    return jobBackendRoutes.get(data.jobId) || configuredAuth;
+  }
+  if (operation === "export-submit") {
+    return jobBackendRoutes.get(data.jobId) || configuredAuth;
+  }
+  if (["export-status", "export-cancel", "export-download"].includes(operation)) {
+    return exportBackendRoutes.get(data.exportId) || configuredAuth;
+  }
+  return configuredAuth;
+}
+
+function clearBackendRoutes() {
+  jobBackendRoutes.clear();
+  exportBackendRoutes.clear();
+  const session = chrome.storage.session;
+  if (!session?.set) return;
+  backendRoutesWrite = backendRoutesWrite
+    .catch(() => {})
+    .then(() => session.set(routeSnapshot()))
+    .catch(() => {});
+}
+
+function rememberActiveDownloads() {
+  const session = chrome.storage.session;
+  if (!session?.set) return;
+  activeDownloadsWrite = activeDownloadsWrite
+    .catch(() => {})
+    .then(() => session.set({
+      [ACTIVE_DOWNLOAD_STORAGE_KEY]: Object.fromEntries(activeDownloads),
+    }))
+    .catch(() => {});
+}
+
+async function loadActiveDownloads() {
+  if (activeDownloadsLoaded) return;
+  if (!activeDownloadsLoad) {
+    activeDownloadsLoad = (async () => {
+      const session = chrome.storage.session;
+      if (session?.get) {
+        try {
+          const stored = await session.get(ACTIVE_DOWNLOAD_STORAGE_KEY);
+          for (const [id, entry] of Object.entries(stored?.[ACTIVE_DOWNLOAD_STORAGE_KEY] || {})) {
+            const downloadId = Number(id);
+            if (!Number.isInteger(downloadId) || downloadId < 0 ||
+                !entry || typeof entry !== "object" ||
+                !EXPORT_ID_RE.test(entry.exportId) ||
+                typeof entry.clientId !== "string") continue;
+            activeDownloads.set(downloadId, {
+              tabId: Number.isInteger(entry.tabId) ? entry.tabId : undefined,
+              exportId: entry.exportId,
+              clientId: entry.clientId,
+            });
+          }
+        } catch {
+          // A browser without session storage can still track live downloads.
+        }
+      }
+      activeDownloadsLoaded = true;
+    })();
+  }
+  await activeDownloadsLoad;
 }
 
 async function fetchCapabilities(backendUrl, operatorKey) {
@@ -303,8 +461,11 @@ function errorCode(status, detail) {
 }
 
 async function backendRequest(operation, input) {
+  await loadBackendRoutes();
   const data = validateOperation(operation, input);
-  const auth = await readTrustedAuth();
+  const configuredAuth = await readTrustedAuth();
+  if (!configuredAuth) return responseError("not_configured", "Configure a trusted backend and operator key first.");
+  const auth = routeFor(operation, data, configuredAuth);
   if (!auth) return responseError("not_configured", "Configure a trusted backend and operator key first.");
   const request = operationRequest(operation, data, auth.backendUrl);
   let response;
@@ -337,10 +498,13 @@ async function backendRequest(operation, input) {
   }
   let dataBody = null;
   try { dataBody = await response.json(); } catch { return responseError("backend_error", "The backend returned invalid JSON.", response.status); }
+  if (operation === "process" && dataBody?.job_id) {
+    rememberBackendRoute(jobBackendRoutes, dataBody.job_id, auth);
+  } else if (operation === "export-submit" && dataBody?.export_id) {
+    rememberBackendRoute(exportBackendRoutes, dataBody.export_id, auth);
+  }
   return { ok: true, status: response.status, data: dataBody };
 }
-
-const activeDownloads = new Map();
 
 chrome.runtime.onInstalled.addListener(async () => {
   const current = await readSync();
@@ -352,33 +516,38 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.downloads.onChanged?.addListener((delta) => {
-  const entry = activeDownloads.get(delta.id);
-  if (!entry) return;
-  const state = delta.state?.current;
-  if (state === "complete") {
-    activeDownloads.delete(delta.id);
-    if (entry.tabId != null) {
-      chrome.tabs?.sendMessage?.(entry.tabId, {
-        type: "download-export-complete",
-        downloadId: delta.id,
-      });
+  (async () => {
+    await loadActiveDownloads();
+    const entry = activeDownloads.get(delta.id);
+    if (!entry) return;
+    const state = delta.state?.current;
+    if (state === "complete") {
+      activeDownloads.delete(delta.id);
+      rememberActiveDownloads();
+      if (entry.tabId != null) {
+        chrome.tabs?.sendMessage?.(entry.tabId, {
+          type: "download-export-complete",
+          downloadId: delta.id,
+        });
+      }
+    } else if (state === "interrupted") {
+      activeDownloads.delete(delta.id);
+      rememberActiveDownloads();
+      if (entry.exportId && entry.clientId) {
+        backendRequest("export-cancel", {
+          exportId: entry.exportId,
+          clientId: entry.clientId,
+        }).catch(() => {});
+      }
+      if (entry.tabId != null) {
+        chrome.tabs?.sendMessage?.(entry.tabId, {
+          type: "download-export-failed",
+          downloadId: delta.id,
+          error: delta.error?.current || "browser download interrupted",
+        });
+      }
     }
-  } else if (state === "interrupted") {
-    activeDownloads.delete(delta.id);
-    if (entry.exportId && entry.clientId) {
-      backendRequest("export-cancel", {
-        exportId: entry.exportId,
-        clientId: entry.clientId,
-      }).catch(() => {});
-    }
-    if (entry.tabId != null) {
-      chrome.tabs?.sendMessage?.(entry.tabId, {
-        type: "download-export-failed",
-        downloadId: delta.id,
-        error: delta.error?.current || "browser download interrupted",
-      });
-    }
-  }
+  })().catch(() => {});
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -417,7 +586,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.storage.local.remove(AUTH_CONFIG_STORAGE_KEY),
       chrome.storage.local.remove(LEGACY_AUTH_STORAGE_KEY),
     ])
-      .then(() => sendResponse({ ok: true }))
+      .then(() => {
+        clearBackendRoutes();
+        sendResponse({ ok: true });
+      })
       .catch(() => sendResponse(responseError("storage_error", "Could not clear the operator key.")));
     return true;
   }
@@ -500,18 +672,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     (async () => {
       try {
-        const stored = await readSync(["backendUrl"]);
-        const backendUrl = normalizeBackendUrl(stored.backendUrl || DEFAULT_BACKEND);
-        const key = await readOperatorKey();
-        if (!key) {
-          sendResponse(responseError("not_configured", "Configure an operator key first."));
+        await Promise.all([loadBackendRoutes(), loadActiveDownloads()]);
+        const configuredAuth = await readTrustedAuth();
+        const auth = routeFor("export-download", { exportId }, configuredAuth);
+        if (!auth) {
+          sendResponse(responseError("not_configured", "Configure a trusted backend and operator key first."));
           return;
         }
-        const url = `${backendUrl}/exports/${encodeURIComponent(exportId)}/download`;
+        const url = `${auth.backendUrl}/exports/${encodeURIComponent(exportId)}/download`;
         chrome.downloads.download(
           {
             url,
-            headers: [{ name: "Authorization", value: `Bearer ${key}` }],
+            headers: [{ name: "Authorization", value: `Bearer ${auth.operatorKey}` }],
             filename,
             conflictAction: "uniquify",
             saveAs: false,
@@ -526,6 +698,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 exportId,
                 clientId,
               });
+              rememberActiveDownloads();
               sendResponse({ ok: true, downloadId });
             }
           },
