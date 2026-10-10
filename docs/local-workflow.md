@@ -104,7 +104,7 @@ completed audio can be reused.
 | Installation or doctor fails | Follow the displayed remedy; see [installation](installation.md). |
 | Readiness remains failed | Inspect the helper log, fix the cause and restart. |
 | CUDA runs out of memory | Stop the helper and retry with `NOMUSIC_GPU_BATCH=1`. Keep `NOMUSIC_DEVICE=cuda` to require GPU execution; see [NVIDIA profile and device selection](installation.md#platforms-and-profiles). |
-| Popup works but video says “backend unreachable” | Allow the site's **Local network access** permission in Chrome site settings, then reload. |
+| Popup works but video says “backend unreachable” | Confirm the backend URL and trusted operator key in the popup, restart the backend if needed, then reload the extension and video tab. |
 | YouTube returns HTTP 429 or human verification | Acquisition is blocked independently of local readiness, even if browser playback works. Retry later or on a network where downloads are available. |
 | Music remains or effects disappear | Adjust retained stems; results depend on the recording. |
 | Playback stalls or drifts | Mute the site/browser, toggle nomusic off/on, and retry; long-session recovery still has limitations. |

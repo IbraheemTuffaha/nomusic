@@ -97,13 +97,15 @@ not abandon work. An ordinary pause stops the heartbeat and
 retains the job for the client lease plus the idle timeout (30 seconds and 10
 seconds by default); resuming re-submits the same cache key and reuses completed
 chunks. Disabling nomusic releases only that
-session's lease. If another tab has a lease, its work continues. The legacy
-authenticated `/events` endpoint remains available for compatibility, but the
-shipped extension uses `/status` polling.
+session's lease. If another tab has a lease, its work continues. The shipped
+extension uses authenticated `/status` polling; the backend SSE route is kept
+as an internal diagnostic surface and is not part of the extension contract.
 
-Status polling retries three failures with 0.5, 1 and 2 second delays. Each
-recovery re-submits the job, allowing a restarted backend to resume cached work.
-A valid status for that job resets the retry budget. Status and capabilities
+Status polling retries ordinary failures with 0.5, 1 and 2 second delays. A
+404, timeout, offline response or server error immediately enters bounded
+recovery and re-submits the job, allowing a restarted backend to resume cached
+work. A valid status for that job resets the retry budget; authentication
+errors fail immediately with an actionable message. Status and capabilities
 requests have five-second timeouts; processing requests have 30 seconds. User
 pause cancels polling recovery unless a queued export still needs processing.
 

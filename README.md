@@ -96,12 +96,8 @@ Next time, open Terminal in the project folder and run the same serve command.
    key, and click **Connect**. After the authenticated check succeeds, choose
    model **htdemucs** and **vocals**. The key stays in trusted extension
    storage and is never synced with normal preferences.
-4. Open a public YouTube video. If Chrome requests **Local network access**,
-   allow it for the video site so the page can reach the helper.
-
-If permission was denied, open the site's settings beside the address bar,
-allow **Local network access**, and reload. After updating extension files,
-reload the extension on `chrome://extensions`, then reload your video tabs.
+4. Open a public YouTube video. After updating extension files, reload the
+   extension on `chrome://extensions`, then reload your video tabs.
 
 ## 5. Watch and save
 
