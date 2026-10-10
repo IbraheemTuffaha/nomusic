@@ -97,6 +97,23 @@ test("selection suppresses before a pending POST and setup failure stays silent"
   assert.equal(f.streams.length, 0);
 });
 
+test("production transport polls authenticated status through the worker API", async (t) => {
+  const previous = globalThis.__nomusicLegacySseTests;
+  globalThis.__nomusicLegacySseTests = false;
+  t.after(() => { globalThis.__nomusicLegacySseTests = previous; });
+  const f = fixture(t, { fetch: ({ path }) => {
+    if (path === "/status/JOB") return json(job("JOB"));
+  } });
+  await f.session.start();
+  await settle();
+  assert.equal(f.session.eventSource, null);
+  assert.ok(f.requests.some(({ path }) => path === "/status/JOB"));
+  const firstCount = f.requests.filter(({ path }) => path === "/status/JOB").length;
+  t.mock.timers.tick(500);
+  await settle();
+  assert.ok(f.requests.filter(({ path }) => path === "/status/JOB").length > firstCount);
+});
+
 test("audio initialization failure closes the graph and preserves suppression", async (t) => {
   const f = fixture(t, { init: async () => { throw new Error("audio unavailable"); } });
   await f.session.start();

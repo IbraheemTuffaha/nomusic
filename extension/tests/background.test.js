@@ -197,3 +197,33 @@ test("content-script messages cannot write the operator key", async () => {
   assert.equal(response.code, "forbidden");
   assert.equal(local.operatorKey, undefined);
 });
+
+test("backend-request exposes only validated operations and keeps auth in the worker", async () => {
+  const { captured, local } = await loadBackground({ stored: { backendUrl: "http://127.0.0.1:8723" } });
+  local.operatorKey = `nm_${"d".repeat(64)}`;
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return { ok: true, status: 200, json: async () => ({ state: "processing" }) };
+  };
+  let response;
+  captured.onMessage(
+    { type: "backend-request", operation: "status", jobId: "a".repeat(16) },
+    { tab: { id: 5 }, url: "https://video.example/" },
+    (value) => (response = value),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(response, { ok: true, status: 200, data: { state: "processing" } });
+  assert.equal(requests[0].url, `http://127.0.0.1:8723/status/${"a".repeat(16)}`);
+  assert.equal(requests[0].options.headers.Authorization, `Bearer ${local.operatorKey}`);
+
+  let rejected;
+  captured.onMessage(
+    { type: "backend-request", operation: "fetch-arbitrary", url: "https://secret.example" },
+    { tab: { id: 5 } },
+    (value) => (rejected = value),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(rejected.code, "invalid_request");
+  assert.equal(requests.length, 1);
+});

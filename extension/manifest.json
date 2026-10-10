@@ -54,6 +54,7 @@
         "main.js",
         "settings.js",
         "config.js",
+        "backend-client.js",
         "session.js",
         "chunk-loader.js",
         "button.js",
