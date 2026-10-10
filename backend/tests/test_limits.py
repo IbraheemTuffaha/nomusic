@@ -47,6 +47,16 @@ def test_download_progress_rejects_known_total_before_bytes_finish():
     assert seen == []
 
 
+def test_extractor_media_targets_are_revalidated():
+    assert downloader._validate_media_targets(
+        {"url": "https://93.184.216.34/media"}, False
+    ) is None
+    reason = downloader._validate_media_targets(
+        {"formats": [{"url": "http://127.0.0.1:8723/private"}]}, False
+    )
+    assert reason == "url host is not allowed"
+
+
 def test_short_completed_source_cannot_be_reused(monkeypatch, tmp_path):
     source = tmp_path / "source.wav"
     source.write_bytes(b"source")

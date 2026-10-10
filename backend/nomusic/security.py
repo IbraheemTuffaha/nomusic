@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import Depends, Header, HTTPException, Request
 
 from .auth import (
@@ -10,6 +12,9 @@ from .auth import (
     InvalidCredential,
     RevokedCredential,
 )
+
+
+log = logging.getLogger("nomusic.auth")
 
 
 def _auth_response(code: str, message: str) -> HTTPException:
@@ -44,9 +49,10 @@ def require_operator(
     except InvalidCredential as exc:
         raise _auth_response("authentication_required", str(exc)) from exc
     except AuthConfigurationError as exc:
+        log.error("operator authentication is not configured: %s", exc)
         raise HTTPException(status_code=503, detail={
             "code": "auth_not_configured",
-            "message": str(exc),
+            "message": "Authentication is not configured. Run 'nomusic auth generate'.",
         }) from exc
 
 
