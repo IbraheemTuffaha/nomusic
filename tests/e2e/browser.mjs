@@ -314,55 +314,79 @@ try {
   assert.equal(manifest.manifest_version, 3);
   // Let onInstalled finish writing defaults before replacing the test URL.
   await until("extension initial settings", async () => (await worker.evaluate(() => chrome.storage.sync.get("autoStart"))).autoStart === false);
-  // This runner owns the generated credential. The service-worker shim adds it
-  // only to loopback backend requests so the pre-auth-transport extension in
-  // the lower stack layer can still exercise the protected server. Later
-  // layers replace this with the real trusted-storage transport.
-  await worker.evaluate(({ backendUrl, key }) => {
+  await worker.evaluate(() => {
     const records = [];
+    const control = { fault: null, delayed: null };
     const originalFetch = globalThis.fetch.bind(globalThis);
-    const backendOrigin = new URL(backendUrl).origin;
     globalThis.__nomusicE2ETransport = records;
-    globalThis.fetch = async (input, init = {}) => {
-      const requestUrl = new URL(typeof input === "string" ? input : input.url);
-      const headers = new Headers(init.headers || (typeof input === "string" ? undefined : input.headers));
-      if (requestUrl.origin === backendOrigin) headers.set("Authorization", `Bearer ${key}`);
-      const requestInit = { ...init, headers };
-      const record = { path: requestUrl.pathname, method: requestInit.method || (typeof input === "string" ? "GET" : input.method || "GET") };
-      if (record.path === "/process" && typeof requestInit.body === "string") {
-        try { record.requestBody = JSON.parse(requestInit.body); } catch { record.requestBody = null; }
+    globalThis.__nomusicE2EControl = control;
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(typeof input === "string" ? input : input.url);
+      const record = { path: url.pathname, method: init?.method || (typeof input === "string" ? "GET" : input.method || "GET") };
+      if (record.path === "/process" && typeof init?.body === "string") {
+        try { record.requestBody = JSON.parse(init.body); } catch { record.requestBody = null; }
       }
       records.push(record);
+      const chunkMatch = /^\/chunk\/[^/]+\/(\d+)$/.exec(record.path);
+      const chunkIndex = chunkMatch ? Number(chunkMatch[1]) : null;
+      const held = chunkIndex !== null && control.delayed?.index === chunkIndex && !control.delayed.entered
+        ? control.delayed : null;
+      if (held) {
+        held.entered = true;
+        try {
+          const response = await originalFetch(input, init);
+          held.fetched = true;
+          await new Promise((resolve) => {
+            const timer = setInterval(() => {
+              if (held.released) {
+                clearInterval(timer);
+                resolve();
+              }
+            }, 10);
+          });
+          held.delivered = true;
+          return response;
+        } catch (error) {
+          held.fetched = true;
+          throw error;
+        }
+      }
+      if (chunkIndex !== null && control.fault?.index === chunkIndex && control.fault.remaining > 0) {
+        control.fault.remaining--;
+        record.status = 503;
+        record.faultName = control.fault.name;
+        return new Response("Injected playback regression fault", {
+          status: 503,
+          headers: { "Cache-Control": "no-store" },
+        });
+      }
       try {
-        const response = await originalFetch(input, requestInit);
+        const response = await originalFetch(input, init);
         record.status = response.status;
-        if (record.path === "/process" && response.ok) record.body = await response.clone().json();
+        if (record.path === "/process" && response.ok) {
+          record.body = await response.clone().json();
+        }
         return response;
       } catch (error) {
         record.error = String(error);
         throw error;
       }
     };
-    return chrome.storage.sync.set({ backendUrl, model: null, keepStems: null, autoStart: false });
-  }, { backendUrl: options.backend, key: operatorKey });
+  });
   const popup = await context.newPage();
   popup.on("pageerror", (error) => report.pageErrors.push(`popup: ${error}`));
-  await popup.route(`${options.backend}/**`, (route) =>
-    route.continue({ headers: { ...route.request().headers(), authorization: `Bearer ${operatorKey}` } }));
   await popup.goto(`chrome-extension://${extensionId}/popup.html`);
-  const hasAuthSetup = await popup.locator("#operatorKey").count();
-  if (hasAuthSetup) {
-    await popup.locator("#operatorKey").fill(operatorKey);
-    await popup.locator("#saveAuth").click();
-    await until("trusted popup connects", async () => {
-      const error = await popup.locator("#err").textContent();
-      assert.equal(error, "", error || "Popup setup failed");
-      return await popup.locator("#status").evaluate((element) => element.classList.contains("ok"));
-    });
-  } else {
-    await popup.locator("#status.ok").waitFor();
-  }
+  await popup.getByText("operator key required", { exact: true }).waitFor();
+  await popup.locator("#backend").fill(options.backend);
+  await popup.locator("#operatorKey").fill(operatorKey);
+  await popup.locator("#saveAuth").click();
+  await until("trusted popup connects", async () => {
+    const error = await popup.locator("#err").textContent();
+    assert.equal(error, "", error || "Popup setup failed");
+    return await popup.locator("#status").evaluate((element) => element.classList.contains("ok"));
+  });
   assert.equal(await popup.locator("#backend").inputValue(), options.backend);
+  assert.equal(await popup.locator("#operatorKey").inputValue(), "");
   const ping = await popup.evaluate(() => chrome.runtime.sendMessage({ type: "ping-backend" }));
   assert.equal(ping.ok, true, "Actual service-worker backend ping");
   await popup.screenshot({ path: path.join(options.output, "settings.png") });
@@ -371,19 +395,6 @@ try {
 
   page = await context.newPage();
   page.on("pageerror", (error) => report.pageErrors.push(String(error)));
-  const sseRecovery = { armed: options.playback, aborted: false, requests: 0, processResponses: 0 };
-  const eventPattern = `${options.backend}/events/**`;
-  const routeEvents = async (route) => {
-    sseRecovery.requests++;
-    if (sseRecovery.armed && !sseRecovery.aborted) {
-      sseRecovery.aborted = true;
-      const record = requests.get(route.request());
-      if (record) record.expectedAbort = "browser SSE interruption";
-      await route.abort();
-      return;
-    }
-    await route.continue({ headers: { ...route.request().headers(), authorization: `Bearer ${operatorKey}` } });
-  };
   let requestSerial = 0;
   const requests = new Map();
   page.on("request", (request) => {
@@ -402,7 +413,6 @@ try {
   page.on("response", (response) => {
     if (response.url().startsWith(`${options.backend}/`)) {
       const path = new URL(response.url()).pathname;
-      if (path === "/process" && response.status() === 200) sseRecovery.processResponses++;
       report.network.push({ ...requests.get(response.request()), path, status: response.status() });
     }
   });
@@ -411,12 +421,6 @@ try {
     requests.delete(request);
   });
   page.on("requestfinished", (request) => requests.delete(request));
-  // The lower stack layer still has page-facing fetches. Add the generated
-  // credential at the browser boundary so this remains a test-only concern;
-  // the later transport layer moves the same header into the worker.
-  await page.route(`${options.backend}/**`, (route) =>
-    route.continue({ headers: { ...route.request().headers(), authorization: `Bearer ${operatorKey}` } }));
-  if (options.playback) await page.route(eventPattern, routeEvents);
   const cdp = await context.newCDPSession(page);
   const worlds = new Map();
   cdp.on("Runtime.executionContextCreated", ({ context: world }) => worlds.set(world.id, world));
@@ -440,13 +444,15 @@ try {
   assert.deepEqual(bridge, { volume: true, source: true });
   note("actual-content-scripts", { bridge, duration });
   await page.locator("#play").click();
-  const submittedPromise = page.waitForResponse((response) => response.url() === `${options.backend}/process` && response.request().method() === "POST");
   const clickedAt = performance.now();
   await page.locator(".nomusic-btn").click();
-  const submitted = await submittedPromise;
-  assert.equal(submitted.status(), 200, await submitted.text());
-  assert.equal(submitted.request().postDataJSON().url, sourceUrl, "Actual page bridge resolved the controlled source");
-  const job = await submitted.json();
+  const submitted = await until("authenticated process request", async () => {
+    const record = (await worker.evaluate(() => globalThis.__nomusicE2ETransport || []))
+      .find((item) => item.path === "/process" && item.status === 200 && item.body);
+    return record || false;
+  });
+  assert.equal(submitted.requestBody?.url, sourceUrl, "Actual page bridge resolved the controlled source");
+  const job = submitted.body;
   assert.equal(job.chunks_ready, 0, "Fresh job must require real inference");
   report.jobId = job.job_id;
   note("extension-submitted-fresh-job", { jobId: job.job_id });
@@ -469,13 +475,10 @@ try {
   }, options.timeoutSeconds * 1000);
   assert.ok(ready.chunks_ready >= 2, "At least two real chunks");
   assert.ok(Math.abs(ready.duration_seconds - duration) < 0.3);
-  if (options.playback) {
-    await until("browser SSE interruption recovery", () =>
-      sseRecovery.aborted && sseRecovery.processResponses >= 2, options.timeoutSeconds * 1000);
-    note("browser-sse-interruption-recovery", {
-      eventRequests: sseRecovery.requests, processPosts: sseRecovery.processResponses,
-    });
-  }
+  if (options.playback) note("authenticated-status-polling", {
+    statusRequests: (await worker.evaluate(() => globalThis.__nomusicE2ETransport || []))
+      .filter((item) => item.path.startsWith("/status/")).length,
+  });
   await page.waitForFunction(() => document.querySelector(".nomusic-btn__label")?.textContent === "nomusic on");
   note("all-chunks-ready", { chunks: ready.chunks_ready, duration: ready.duration_seconds });
 
@@ -516,9 +519,9 @@ try {
   // layer. The earlier key/config layers intentionally defer that boundary;
   // keep their browser smoke focused on processing and playback, while later
   // layers run the same real export checks once backend-client.js is present.
-  const workerTransport = await stat(path.join(options.extension, "backend-client.js"))
-    .then(() => true, () => false);
-  if (workerTransport) {
+  const exportTransport = await readFile(path.join(options.extension, "button.js"), "utf8")
+    .then((source) => source.includes('backendRequest("export-submit"'), () => false);
+  if (exportTransport) {
     const nativeDownloads = new Set();
     for (const [format, label] of [["mp3", "MP3 — audio only"], ["mp4", "480p"]]) {
       await page.locator(".nomusic-btn__dl").click();
@@ -527,7 +530,7 @@ try {
       note(`${format}-export-decoded`, { bytes: (await stat(file)).size, ...decodeExport(file, format, ready.duration_seconds) });
     }
   } else {
-    note("exports-deferred-until-authenticated-worker-transport");
+    note("exports-deferred-until-authenticated-export-transport");
   }
   if (options.playback) {
     await runPlaybackScenarios({ page, worker, isolated, audioState, until, sleep, note,
@@ -540,28 +543,15 @@ try {
     note("toggle-off-restores-source-and-closes-audio");
   }
   await isolated("__nomusicSmoke.restore()");
-  assert.ok(report.network.some((item) => item.path.startsWith("/chunk/") && item.status === 200));
-  const eventPath = `/events/${job.job_id}`;
-  assert.ok(report.network.some((item) => item.path === eventPath && item.status === 200), "Real progress stream opened");
-  // EventSource.close() on ready/pause/disposal can appear as ERR_ABORTED.
-  // The stream opened successfully and this job already reached ready above.
-  // Keep HTTP errors and failures of every other request fatal.
-  const expectedStreamClose = (item) => item.path === eventPath
-    && item.failed?.errorText === "net::ERR_ABORTED";
-  const intentionalAbort = (item) => {
-    if (!item.expectedAbort || !item.failed) return false;
-    // EventSource.close() and the deliberate SSE route abort are the only
-    // failures this scenario owns. Keep unrelated transport failures fatal,
-    // even when they happen while a session is replacing its window.
-    return item.failed.errorText === "net::ERR_ABORTED" ||
-      (item.expectedAbort === "browser SSE interruption" &&
-        item.failed.errorText === "net::ERR_FAILED");
-  };
+  const transport = await worker.evaluate(() => globalThis.__nomusicE2ETransport || []);
+  assert.ok(transport.some((item) => item.path.startsWith("/process") && item.status === 200));
+  assert.ok(transport.some((item) => item.path.startsWith("/status/") && item.status === 200), "Authenticated status polling ran");
+  assert.ok(transport.some((item) => item.path.startsWith("/chunk/") && item.status === 200), "Authenticated chunk transport ran");
+  assert.ok(transport.every((item) => !item.path.includes(operatorKey)), "Operator key never entered a request URL");
   const injectedHttpFault = (item) => item.expectedHttp?.status === item.status;
   assert.deepEqual(report.network.filter((item) =>
-    (item.status >= 400 && !injectedHttpFault(item)) ||
-    (item.failed && !expectedStreamClose(item) && !intentionalAbort(item))), [],
-  "Only explicitly injected faults or owned request cancellations may fail");
+    (item.status >= 400 && !injectedHttpFault(item)) || item.failed), [],
+  "The fixture page must not have unexpected backend failures");
   assert.deepEqual(report.pageErrors, [], "No fixture or extension page errors");
   assert.equal(timedOut, false);
   report.passed = true;

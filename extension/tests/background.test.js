@@ -11,7 +11,9 @@ async function loadBackground({ stored }) {
   const captured = {};
   let written = null;
   const local = {};
+  const session = {};
   let accessLevel = null;
+  let sessionAccessLevel = null;
   const messages = [];
   globalThis.chrome = {
     runtime: {
@@ -41,12 +43,28 @@ async function loadBackground({ stored }) {
         remove: async (key) => delete local[key],
         setAccessLevel: async (value) => (accessLevel = value),
       },
+      session: {
+        get: async (key) => typeof key === "string" ? { [key]: session[key] } : { ...session },
+        set: async (patch) => Object.assign(session, patch),
+        remove: async (key) => {
+          for (const name of Array.isArray(key) ? key : [key]) delete session[name];
+        },
+        setAccessLevel: async (value) => (sessionAccessLevel = value),
+      },
     },
   };
   // Unique query each call so the module's top-level listener registration
   // re-runs against this call's capturing stubs (ESM caches by specifier).
   await import(`../background.js?load=${++loadCounter}`);
-  return { captured, getWritten: () => written, messages, local, getAccessLevel: () => accessLevel };
+  return {
+    captured,
+    getWritten: () => written,
+    messages,
+    local,
+    session,
+    getAccessLevel: () => accessLevel,
+    getSessionAccessLevel: () => sessionAccessLevel,
+  };
 }
 
 test("backend URL validation keeps loopback HTTP and rejects remote HTTP", () => {
@@ -146,9 +164,14 @@ test("onInstalled writes nothing when all defaults are present", async () => {
 
 test("ping-backend reports reachability from a capabilities fetch", async () => {
   const { captured, local } = await loadBackground({ stored: {} });
-  local.operatorKey = `nm_${"a".repeat(64)}`;
+  local.trustedBackend = {
+    version: 1,
+    backendUrl: "http://127.0.0.1:8723",
+    operatorKey: `nm_${"a".repeat(64)}`,
+    generation: "test-a",
+  };
   globalThis.fetch = async (_url, options) => {
-    assert.equal(options.headers.Authorization, `Bearer ${local.operatorKey}`);
+    assert.equal(options.headers.Authorization, `Bearer ${local.trustedBackend.operatorKey}`);
     return { ok: true, status: 200, json: async () => ({ engine: {} }) };
   };
   let response;
@@ -180,7 +203,8 @@ test("configure-auth commits only after an authenticated capabilities check", as
   assert.equal(open, true);
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(response.ok, true);
-  assert.equal(local.operatorKey, key);
+  assert.equal(local.trustedBackend.operatorKey, key);
+  assert.equal(local.trustedBackend.backendUrl, "http://127.0.0.1:8723");
   assert.equal(getWritten().backendUrl, "http://127.0.0.1:8723");
   assert.deepEqual(getAccessLevel(), { accessLevel: "TRUSTED_CONTEXTS" });
 });
@@ -196,4 +220,39 @@ test("content-script messages cannot write the operator key", async () => {
   assert.equal(open, false);
   assert.equal(response.code, "forbidden");
   assert.equal(local.operatorKey, undefined);
+});
+
+test("backend-request exposes only validated operations and keeps auth in the worker", async () => {
+  const { captured, local } = await loadBackground({ stored: { backendUrl: "http://127.0.0.1:8723" } });
+  local.trustedBackend = {
+    version: 1,
+    backendUrl: "http://127.0.0.1:8723",
+    operatorKey: `nm_${"d".repeat(64)}`,
+    generation: "test-d",
+  };
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return { ok: true, status: 200, json: async () => ({ state: "processing" }) };
+  };
+  let response;
+  captured.onMessage(
+    { type: "backend-request", operation: "status", jobId: "a".repeat(16) },
+    { tab: { id: 5 }, url: "https://video.example/" },
+    (value) => (response = value),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(response, { ok: true, status: 200, data: { state: "processing" } });
+  assert.equal(requests[0].url, `http://127.0.0.1:8723/status/${"a".repeat(16)}`);
+  assert.equal(requests[0].options.headers.Authorization, `Bearer ${local.trustedBackend.operatorKey}`);
+
+  let rejected;
+  captured.onMessage(
+    { type: "backend-request", operation: "fetch-arbitrary", url: "https://secret.example" },
+    { tab: { id: 5 } },
+    (value) => (rejected = value),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(rejected.code, "invalid_request");
+  assert.equal(requests.length, 1);
 });

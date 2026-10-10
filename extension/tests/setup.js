@@ -4,6 +4,11 @@
 // exist here; per-test browser behavior is mocked in the individual tests.
 const noop = () => {};
 
+// Content-module tests use a hermetic fetch stub. Production content scripts
+// leave this flag unset and therefore always route through the service worker.
+globalThis.__nomusicTestDirectBackend = true;
+globalThis.__nomusicLegacySseTests = true;
+
 globalThis.chrome ??= {
   storage: {
     sync: { get: async () => ({}), set: async () => {} },

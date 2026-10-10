@@ -9,10 +9,10 @@ const MAX_ATTEMPTS = 4;
 const RETRY_DELAY_MS = 500;
 
 export class ChunkLoader {
-  constructor({ chunks, getTime, getStride, getTotalChunks, getChunkUrl,
+  constructor({ chunks, getTime, getStride, getTotalChunks, getChunk, getChunkUrl,
     decode, onChunk, onError, onWindowChange }) {
     Object.assign(this, { chunks, getTime, getStride, getTotalChunks,
-      getChunkUrl, decode, onChunk, onError, onWindowChange });
+      getChunk, getChunkUrl, decode, onChunk, onError, onWindowChange });
     this.available = new Set();
     this.active = new Map();
     this.retries = new Map();
@@ -131,21 +131,29 @@ export class ChunkLoader {
     this.active.set(id, request);
     // Capture the URL before any await so a later session transition cannot
     // combine the old chunk index with a replacement artifact's identity.
-    const url = this.getChunkUrl(idx);
-    this._run(id, request, retry, url);
+    const requestTarget = this.getChunk
+      ? (signal) => this.getChunk(idx, signal)
+      : () => this.getChunkUrl(idx);
+    this._run(id, request, retry, requestTarget);
   }
 
-  async _run(id, request, retry, url) {
+  async _run(id, request, retry, requestTarget) {
     request.timeout = setTimeout(() => request.controller.abort(), NETWORK_TIMEOUT_MS);
     try {
-      // Honor HTTP cache headers: force-cache could permanently retain a 425.
-      const response = await fetch(url, {
-        cache: "default", signal: request.controller.signal,
-      });
+      let encoded;
+      if (this.getChunk) {
+        encoded = await requestTarget(request.controller.signal);
+      } else {
+        // Legacy unit-test adapter; production sessions use the worker-owned
+        // getChunk operation above and never fetch from the page context.
+        const response = await fetch(requestTarget(), {
+          cache: "default", signal: request.controller.signal,
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        encoded = await response.arrayBuffer();
+      }
       if (!this._current(request)) return;
       if (request.controller.signal.aborted) throw new Error("Audio request timed out");
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const encoded = await response.arrayBuffer();
       if (!this._current(request)) return;
       if (request.controller.signal.aborted) throw new Error("Audio request timed out");
       clearTimeout(request.timeout);
