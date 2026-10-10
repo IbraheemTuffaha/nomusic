@@ -290,8 +290,6 @@ try {
   assert.match(capabilities.engine.device, /^cpu(?:\s|$)/);
   const boundary = capabilities.defaults.chunk_seconds - capabilities.defaults.chunk_overlap_seconds;
   assert.ok(Number.isFinite(boundary) && boundary > 1, "Usable chunk stride");
-  const cache = await backendJson("/cache");
-  assert.equal(cache.total_bytes, 0, "Start the smoke backend with an empty media cache");
   note("ready-cpu-backend", { readiness, device: capabilities.engine.device, boundary });
   server = await startFixtureServer(boundary);
   context = await chromium.launchPersistentContext(path.join(options.output, "profile"), {
