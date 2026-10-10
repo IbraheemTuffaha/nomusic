@@ -350,11 +350,18 @@ try {
   await popup.route(`${options.backend}/**`, (route) =>
     route.continue({ headers: { ...route.request().headers(), authorization: `Bearer ${operatorKey}` } }));
   await popup.goto(`chrome-extension://${extensionId}/popup.html`);
-  if (await popup.locator("#operatorKey").count()) {
+  const hasAuthSetup = await popup.locator("#operatorKey").count();
+  if (hasAuthSetup) {
     await popup.locator("#operatorKey").fill(operatorKey);
     await popup.locator("#saveAuth").click();
+    await until("trusted popup connects", async () => {
+      const error = await popup.locator("#err").textContent();
+      assert.equal(error, "", error || "Popup setup failed");
+      return await popup.locator("#status").evaluate((element) => element.classList.contains("ok"));
+    });
+  } else {
+    await popup.locator("#status.ok").waitFor();
   }
-  await popup.locator("#status.ok").waitFor();
   assert.equal(await popup.locator("#backend").inputValue(), options.backend);
   const ping = await popup.evaluate(() => chrome.runtime.sendMessage({ type: "ping-backend" }));
   assert.equal(ping.ok, true, "Actual service-worker backend ping");

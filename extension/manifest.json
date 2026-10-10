@@ -53,6 +53,7 @@
         "icons/button.png",
         "main.js",
         "settings.js",
+        "config.js",
         "session.js",
         "chunk-loader.js",
         "button.js",

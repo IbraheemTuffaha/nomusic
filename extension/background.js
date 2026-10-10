@@ -43,14 +43,17 @@ async function readOperatorKey() {
 function trustedSender(sender) {
   // Content-script messages carry a tab. A page can otherwise manufacture a
   // runtime message, so configuration writes require an extension page/worker
-  // sender and are never accepted from a tab.
-  if (sender?.tab) return false;
-  if (!sender?.url) return true; // unit tests and extension-internal callers
-  try {
-    return sender.url.startsWith(chrome.runtime.getURL(""));
-  } catch {
-    return false;
+  // sender. Chromium may include the active tab on a popup sender too, so
+  // validate the sender origin before applying the content-script guard.
+  if (sender?.url) {
+    try {
+      return sender.url.startsWith(chrome.runtime.getURL(""));
+    } catch {
+      return false;
+    }
   }
+  if (sender?.tab) return false;
+  return true; // unit tests and extension-internal callers
 }
 
 function responseError(code, message, status = undefined) {
