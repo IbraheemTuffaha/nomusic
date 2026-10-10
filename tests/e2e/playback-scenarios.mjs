@@ -275,7 +275,7 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
     fault = { name: "final-ready-chunk-first-attempt", index: lastIndex, remaining: 1 };
     const beforeFinal = await live();
     await seek(lastIndex * boundary + 0.2);
-    const finalAudio = await freshAudio("final chunk retries without another SSE update");
+    const finalAudio = await freshAudio("final chunk retries without another status poll");
     const finalState = await settledWindow();
     const finalFault = evidence.injectedFaults.find((item) => item.name === fault.name);
     assert.ok(finalFault, "Injected the final-chunk failure");

@@ -130,6 +130,32 @@ def test_health_is_public_but_capabilities_require_a_key(authenticated_client):
     assert response.json()["engine"]["name"] == "fake"
 
 
+def test_only_healthz_is_public_and_cache_administration_is_local(authenticated_client):
+    client = authenticated_client
+    assert client.get("/healthz").status_code == 200
+    protected = [
+        ("GET", "/readyz", None),
+        ("GET", "/capabilities", None),
+        ("POST", "/process", {"url": "https://example.com/video"}),
+        ("POST", "/process/" + "a" * 16 + "/prioritize", {"from_chunk": 0}),
+        ("POST", "/process/" + "a" * 16 + "/interest", {"client_id": "client"}),
+        ("DELETE", "/process/" + "a" * 16 + "/interest?client_id=client", None),
+        ("GET", "/status/" + "a" * 16, None),
+        ("GET", "/events/" + "a" * 16, None),
+        ("GET", "/chunk/" + "a" * 16 + "/0", None),
+        ("GET", "/audio/" + "a" * 16, None),
+        ("POST", "/exports", {"job_id": "a" * 16, "format": "mp3"}),
+        ("GET", "/exports/" + "b" * 32, None),
+        ("DELETE", "/exports/" + "b" * 32, None),
+        ("GET", "/exports/" + "b" * 32 + "/download", None),
+    ]
+    for method, path, payload in protected:
+        response = client.request(method, path, json=payload)
+        assert response.status_code == 401, (method, path, response.text)
+    assert client.get("/cache").status_code == 404
+    assert client.post("/cache/clear").status_code == 404
+
+
 def test_rejected_requests_do_not_reach_processing(authenticated_client):
     client = authenticated_client
     response = client.post(

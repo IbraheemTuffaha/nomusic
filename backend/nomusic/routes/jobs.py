@@ -285,8 +285,8 @@ async def events(
 ) -> Response:
     """Server-Sent Events stream of a job's status.
 
-    Replaces the extension's old /status polling: the client opens one
-    EventSource and receives a snapshot on connect plus a push on every
+    Legacy alternative to /status polling: a client opens one EventSource and
+    receives a snapshot on connect plus a push on every
     state change, ending with a terminal ``ready``/``error`` event.
 
     Three response shapes:
