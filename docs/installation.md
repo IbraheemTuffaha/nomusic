@@ -89,6 +89,8 @@ provide FFmpeg, a JS runtime and either uv or Python with venv support themselve
 | `--dev` | Include test/development dependencies |
 | `--skip-system-packages` | Check prerequisites without calling apt/Homebrew |
 | `--skip-model-download` | Defer weights until `models fetch` or first use |
+| `--service` | macOS: turn the [background service](background-service.md) on without asking |
+| `--no-service` | macOS: do not ask, and leave an existing background service as it is |
 | `NOMUSIC_UV=/absolute/path/to/uv` | Use an exact-version uv executable |
 | `NOMUSIC_VENV=/absolute/path` | Use a dedicated custom environment |
 
@@ -139,6 +141,8 @@ processed media only.
 Stop the helper and keep the previous checkout until the replacement works.
 Update the project files, run `./install.sh`, then run doctor and the
 [local workflow](local-workflow.md). Reload the extension and video tabs.
+On Mac the installer itself turns a running
+[background service](background-service.md) off and on again.
 
 If the default `backend/.venv` uses another Python version, the installer moves
 it to **`backend/.venv.bak`** after checking prerequisites and creates the pinned

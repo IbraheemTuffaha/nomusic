@@ -82,6 +82,9 @@ does not cause a long wait. Completed media/model caches and ready export
 artifacts survive a normal restart; an interrupted queued/building export is
 reconciled and can simply be requested again after startup.
 
+A Mac [background service](background-service.md) has no terminal: stop it
+with `./service.sh uninstall` and start or restart it with `./service.sh install`.
+
 Start the helper again, check readiness, and toggle nomusic off/on for the
 video. Reopen the popup or reload the page if needed. The extension retries a
 lost status connection and re-submits the same job with bounded backoff. If it
