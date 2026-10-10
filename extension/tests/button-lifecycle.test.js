@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { Button } from "../button.js";
 import { domFixture } from "./dom-fixture.js";
 
+globalThis.__nomusicTestDirectBackend = true;
+
 function response(body, ok = true, status = ok ? 200 : 500) {
   return { ok, status, json: async () => body };
 }

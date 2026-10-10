@@ -7,6 +7,13 @@ import { Session, resolveSourceUrl, normalizeWatchUrl } from "../session.js";
 import { AudioScheduler } from "../audio-scheduler.js";
 import { settings } from "../settings.js";
 
+// This suite asserts page-side cancellation and stale-result isolation. The
+// production worker transport is covered explicitly in session-recovery.test.
+globalThis.__nomusicTestDirectBackend = true;
+// These cases intentionally exercise the compatibility EventSource adapter;
+// production uses the worker-backed polling path.
+globalThis.__nomusicLegacySseTests = true;
+
 // Run `fn` with a mocked MAIN-world bridge: dispatching the resolve event makes
 // `document` answer with `bridgeUrl` on the documentElement attribute, exactly
 // as page-script.js does in the browser. Restores globals afterwards.

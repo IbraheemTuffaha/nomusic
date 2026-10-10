@@ -19,6 +19,7 @@ export function explainBackendError(error, fallback = "Backend request failed") 
     case "revoked": return "Operator key revoked. Update the key in nomusic settings.";
     case "unauthorized": return "Operator key rejected. Check the key in nomusic settings.";
     case "not_configured": return "Configure an operator key in nomusic settings.";
+    case "auth_not_configured": return "Backend authentication is not configured. Run nomusic auth generate, then reconnect.";
     case "offline":
     case "timeout": return "Backend unavailable. Start it and retry.";
     case "busy": return "Backend is busy. Retry in a moment.";

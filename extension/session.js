@@ -95,7 +95,7 @@ export class Session {
     // Owns host-video muting + volume mirroring; created in start().
     this.muteController = null;
     this.jobId = null;
-    // One session owns one interest lease. It survives an SSE reconnect and
+    // One session owns one interest lease. It survives a status reconnect and
     // the ordinary pause retention window, so transport changes never cancel
     // another tab's work.
     this.clientId = newClientId();
@@ -119,18 +119,17 @@ export class Session {
     this.chunks = new Map();
     this.failed = false;
     this.loader = this._createLoader();
-    // SSE stream of backend status (replaces /status polling). Opened in
-    // start(); closed in dispose() and when a terminal state arrives.
-    this.eventSource = null; // only used by the Node legacy-SSE test adapter
-    // True when we closed the stream because the user paused (not a buffer
-    // pause). While closed, the backend sees no subscriber and starts its
-    // idle-abandon clock; we re-establish the worker + stream on play.
+    // Status transport is short polling in production. The eventSource field
+    // exists only for the explicit legacy-SSE test adapter.
+    this.eventSource = null;
+    // True when we closed status transport because the user paused (not a
+    // buffer pause). We re-establish the worker + polling on play.
     this._streamPausedClosed = false;
     this.bufferTimer = null;
     this.disposed = false;
-    // Flipped true once the SSE stream ends (state == ready/error, or the
-    // server closed it). Tells _resumeAfterBuffer that no future status
-    // event will repaint the label, so it has to restore "nomusic on".
+    // Flipped true once status transport ends (state == ready/error, or the
+    // server closes it). Tells _resumeAfterBuffer that no future status
+    // update will repaint the label, so it has to restore "nomusic on".
     this._streamEnded = false;
     this._statusState = null;
     // Debounce timer for the /prioritize POST on seek so scrubbing a
@@ -358,8 +357,8 @@ export class Session {
       .catch((err) => dlog("interest release failed", err?.name || err));
   }
 
-  /** Own reconnection so CONNECTING and CLOSED failures both have a budget.
-   *  Re-POST before reopening: a restarted backend may need to respawn work. */
+  /** Own reconnection so transport failures have a bounded recovery budget.
+   * Re-POST before polling again: a restarted backend may need to respawn work. */
   _openEventStream() {
     if (globalThis.__nomusicLegacySseTests) {
       this._openLegacyEventStream();
@@ -397,7 +396,19 @@ export class Session {
         this.fail(error.code === "revoked" ? "Operator key revoked. Update the extension key." : "Operator key rejected. Check extension settings.");
         return;
       }
+      if (error?.code === "auth_not_configured") {
+        this.fail("Backend authentication is not configured. Run nomusic auth generate, then reconnect.");
+        return;
+      }
       if (error?.status === 404) {
+        this._recoverStream();
+        return;
+      }
+      if (error?.code === "offline" || error?.code === "timeout" ||
+          (Number.isInteger(error?.status) && error.status >= 500)) {
+        // A transport failure can mean the helper restarted between polls.
+        // Re-submit the captured job before reopening status so the backend
+        // can respawn work and restore the same job identity where possible.
         this._recoverStream();
         return;
       }
