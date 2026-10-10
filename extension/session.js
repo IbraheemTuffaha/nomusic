@@ -6,7 +6,7 @@ import { MuteController } from "./mute-controller.js";
 import { AudioScheduler } from "./audio-scheduler.js";
 import { ChunkLoader } from "./chunk-loader.js";
 import { PlaybackIntent } from "./playback-intent.js";
-import { backendRequest } from "./backend-client.js";
+import { backendRequest, explainBackendError } from "./backend-client.js";
 
 // The source metadata can round down by almost one processing chunk while the
 // native player reports the container's full duration. Keep the host muted
@@ -203,7 +203,7 @@ export class Session {
     } catch (err) {
       if (!signal.aborted && !this.disposed) {
         dlog("playback setup failed", err?.name || err);
-        this.fail("Could not start playback. Check the backend and site permissions.");
+        this.fail(explainBackendError(err, "Could not start playback. Check the backend and site permissions."));
       }
     } finally {
       if (this._starting === attempt) this._starting = null;
@@ -555,7 +555,13 @@ export class Session {
     try {
       info = await this.requestJob();
     } catch (err) {
-      if (!signal.aborted) this._recoverStream();
+      if (!signal.aborted) {
+        if (err?.status === 401 || err?.code === "unauthorized" || err?.code === "revoked") {
+          this.fail(explainBackendError(err));
+        } else {
+          this._recoverStream();
+        }
+      }
       return;
     }
     if (signal.aborted || this.disposed || this.failed) return;

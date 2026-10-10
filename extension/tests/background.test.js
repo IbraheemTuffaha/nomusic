@@ -76,20 +76,24 @@ test("backend URL validation keeps loopback HTTP and rejects remote HTTP", () =>
 });
 
 test("download-export delegates the response body to chrome downloads", async () => {
-  const { captured } = await loadBackground({ stored: {} });
+  const { captured, local } = await loadBackground({ stored: { backendUrl: "http://127.0.0.1:8723" } });
+  local.operatorKey = `nm_${"e".repeat(64)}`;
   let response;
   const keepOpen = captured.onMessage(
     {
       type: "download-export",
-      url: "http://127.0.0.1:8723/exports/id/download",
+      exportId: "a".repeat(32),
+      clientId: "client-1",
       filename: "sample.mp3",
     },
     {},
     (value) => { response = value; },
   );
   assert.equal(keepOpen, true);
+  await new Promise((resolve) => setTimeout(resolve, 5));
   assert.deepEqual(captured.downloadOptions, {
-    url: "http://127.0.0.1:8723/exports/id/download",
+    url: `http://127.0.0.1:8723/exports/${"a".repeat(32)}/download`,
+    headers: [{ name: "Authorization", value: `Bearer ${local.operatorKey}` }],
     filename: "sample.mp3",
     conflictAction: "uniquify",
     saveAs: false,
@@ -98,7 +102,8 @@ test("download-export delegates the response body to chrome downloads", async ()
 });
 
 test("an interrupted native download cancels its export and notifies its tab", async () => {
-  const { captured, messages } = await loadBackground({ stored: {} });
+  const { captured, messages, local } = await loadBackground({ stored: { backendUrl: "http://127.0.0.1:8723" } });
+  local.operatorKey = `nm_${"f".repeat(64)}`;
   const requests = [];
   globalThis.fetch = async (url, options) => {
     requests.push({ url, options });
@@ -108,13 +113,14 @@ test("an interrupted native download cancels its export and notifies its tab", a
   captured.onMessage(
     {
       type: "download-export",
-      url: "http://127.0.0.1:8723/exports/export-1/download",
+      exportId: "b".repeat(32),
+      clientId: "client-1",
       filename: "sample.mp3",
-      cancelUrl: "http://127.0.0.1:8723/exports/export-1?client_id=client-1",
     },
     { tab: { id: 9 } },
     (value) => { response = value; },
   );
+  await new Promise((resolve) => setTimeout(resolve, 5));
   assert.deepEqual(response, { ok: true, downloadId: 42 });
   captured.onChanged({
     id: 42,
@@ -122,10 +128,10 @@ test("an interrupted native download cancels its export and notifies its tab", a
     error: { current: "NETWORK_FAILED" },
   });
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.deepEqual(requests, [{
-    url: "http://127.0.0.1:8723/exports/export-1?client_id=client-1",
-    options: { method: "DELETE", cache: "no-store", keepalive: true },
-  }]);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, `http://127.0.0.1:8723/exports/${"b".repeat(32)}?client_id=client-1`);
+  assert.equal(requests[0].options.method, "DELETE");
+  assert.equal(requests[0].options.headers.Authorization, `Bearer ${local.operatorKey}`);
   assert.deepEqual(messages, [{
     tabId: 9,
     message: {

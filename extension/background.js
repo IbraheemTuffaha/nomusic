@@ -365,9 +365,11 @@ chrome.downloads.onChanged?.addListener((delta) => {
     }
   } else if (state === "interrupted") {
     activeDownloads.delete(delta.id);
-    if (entry.cancelUrl) {
-      fetch(entry.cancelUrl, { method: "DELETE", cache: "no-store", keepalive: true })
-        .catch(() => {});
+    if (entry.exportId && entry.clientId) {
+      backendRequest("export-cancel", {
+        exportId: entry.exportId,
+        clientId: entry.clientId,
+      }).catch(() => {});
     }
     if (entry.tabId != null) {
       chrome.tabs?.sendMessage?.(entry.tabId, {
@@ -482,27 +484,56 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg?.type === "download-export") {
-    const url = typeof msg.url === "string" ? msg.url : "";
     const filename = typeof msg.filename === "string" ? msg.filename : "";
-    if (!url || !filename) {
-      sendResponse({ ok: false, error: "download URL and filename are required" });
+    if (!filename || filename.length > 180 || filename.includes("\0")) {
+      sendResponse({ ok: false, error: "download filename is invalid" });
       return false;
     }
-    chrome.downloads.download(
-      { url, filename, conflictAction: "uniquify", saveAs: false },
-      (downloadId) => {
-        const error = chrome.runtime.lastError;
-        if (error) {
-          sendResponse({ ok: false, error: error.message || String(error) });
-        } else {
-          activeDownloads.set(downloadId, {
-            tabId: sender?.tab?.id,
-            cancelUrl: typeof msg.cancelUrl === "string" ? msg.cancelUrl : "",
-          });
-          sendResponse({ ok: true, downloadId });
+    let exportId;
+    let clientId;
+    try {
+      exportId = safeExportId(msg.exportId);
+      clientId = safeClientId(msg.clientId);
+    } catch (error) {
+      sendResponse({ ok: false, error: error.message });
+      return false;
+    }
+    (async () => {
+      try {
+        const stored = await readSync(["backendUrl"]);
+        const backendUrl = normalizeBackendUrl(stored.backendUrl || DEFAULT_BACKEND);
+        const key = await readOperatorKey();
+        if (!key) {
+          sendResponse(responseError("not_configured", "Configure an operator key first."));
+          return;
         }
-      },
-    );
+        const url = `${backendUrl}/exports/${encodeURIComponent(exportId)}/download`;
+        chrome.downloads.download(
+          {
+            url,
+            headers: [{ name: "Authorization", value: `Bearer ${key}` }],
+            filename,
+            conflictAction: "uniquify",
+            saveAs: false,
+          },
+          (downloadId) => {
+            const error = chrome.runtime.lastError;
+            if (error) {
+              sendResponse({ ok: false, error: error.message || String(error) });
+            } else {
+              activeDownloads.set(downloadId, {
+                tabId: sender?.tab?.id,
+                exportId,
+                clientId,
+              });
+              sendResponse({ ok: true, downloadId });
+            }
+          },
+        );
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message || "Could not start download" });
+      }
+    })();
     return true;
   }
   return false;

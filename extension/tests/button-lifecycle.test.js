@@ -14,7 +14,7 @@ function deferred() {
 }
 
 async function settle() {
-  for (let i = 0; i < 4; i++) await Promise.resolve();
+  for (let i = 0; i < 12; i++) await Promise.resolve();
 }
 
 function setup(t) {
@@ -57,14 +57,14 @@ test("ready export uses the native downloads API without reading a Blob", async 
   assert.equal(fetch.mock.callCount(), 1);
   assert.equal(messages.length, 1);
   assert.deepEqual(
-    { type: messages[0].type, url: messages[0].url, filename: messages[0].filename },
+    { type: messages[0].type, exportId: messages[0].exportId, clientId: messages[0].clientId, filename: messages[0].filename },
     {
       type: "download-export",
-      url: "http://localhost:8723/exports/export-1/download",
+      exportId: "export-1",
+      clientId: messages[0].clientId,
       filename: "A song.mp3",
     },
   );
-  assert.match(messages[0].cancelUrl, /client_id=/);
   assert.equal(elements.filter((element) => element.tagName === "A").length, 0);
   assert.equal(button._downloading, false);
   assert.equal(button.label.textContent, "nomusic on");
