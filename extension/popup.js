@@ -97,6 +97,7 @@ async function load() {
 
   let auth;
   try { auth = await send({ type: "get-auth-state" }); } catch { auth = null; }
+  if (auth?.backendUrl) $("backend").value = auth.backendUrl;
   if (!auth?.ok || !auth.configured) {
     setStatus("bad", "operator key required");
     $("device").textContent = "";
@@ -147,7 +148,7 @@ async function saveAuth() {
       backendUrl,
       operatorKey,
       model: capsLoaded ? ($("model").value || null) : undefined,
-      keepStems,
+      keepStems: keepStems?.length ? keepStems : null,
     });
     if (!result?.ok) {
       showError(result?.message || "The backend rejected this configuration; previous settings were kept.");
@@ -182,7 +183,6 @@ async function clearAuth() {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
-  await load();
   $("saveAuth").addEventListener("click", saveAuth);
   $("model").addEventListener("change", savePreferences);
   $("stems").addEventListener("change", savePreferences);
@@ -190,4 +190,5 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (event.key === "Enter") saveAuth();
   });
   $("clearAuth").addEventListener("click", clearAuth);
+  await load();
 });

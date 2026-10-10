@@ -17,8 +17,23 @@ const DEFAULTS = {
   keepStems: null,
   autoStart: false,
 };
-const AUTH_STORAGE_KEY = "operatorKey";
+const AUTH_CONFIG_STORAGE_KEY = "trustedBackend";
+const LEGACY_AUTH_STORAGE_KEY = "operatorKey";
+const AUTH_CONFIG_VERSION = 1;
 const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
+const REQUEST_TIMEOUTS_MS = {
+  capabilities: 5_000,
+  process: 30_000,
+  "interest-renew": 5_000,
+  "interest-release": 5_000,
+  prioritize: 5_000,
+  status: 5_000,
+  chunk: 15_000,
+  "export-submit": 10_000,
+  "export-status": 5_000,
+  "export-cancel": 5_000,
+  "export-download": 30_000,
+};
 const ID_RE = /^[0-9a-f]{16}$/;
 const EXPORT_ID_RE = /^[0-9a-f]{32}$/;
 const STEMS = new Set(["vocals", "drums", "bass", "other"]);
@@ -35,6 +50,10 @@ try {
     accessLevel: "TRUSTED_CONTEXTS",
   });
   access?.catch?.(() => {});
+  const sessionAccess = chrome.storage.session?.setAccessLevel?.({
+    accessLevel: "TRUSTED_CONTEXTS",
+  });
+  sessionAccess?.catch?.(() => {});
 } catch {
   // Storage errors are reported when a setup operation is attempted.
 }
@@ -43,10 +62,28 @@ async function readSync(keys = Object.keys(DEFAULTS)) {
   return chrome.storage.sync.get(keys);
 }
 
-async function readOperatorKey() {
-  const stored = await chrome.storage.local.get(AUTH_STORAGE_KEY);
-  const key = stored?.[AUTH_STORAGE_KEY];
-  return typeof key === "string" && OPERATOR_KEY_PATTERN.test(key) ? key : null;
+async function readTrustedAuth() {
+  const stored = await chrome.storage.local.get(AUTH_CONFIG_STORAGE_KEY);
+  const config = stored?.[AUTH_CONFIG_STORAGE_KEY];
+  if (!config || typeof config !== "object" || Array.isArray(config) ||
+      config.version !== AUTH_CONFIG_VERSION ||
+      typeof config.backendUrl !== "string" ||
+      typeof config.operatorKey !== "string" ||
+      !OPERATOR_KEY_PATTERN.test(config.operatorKey)) {
+    return null;
+  }
+  let backendUrl;
+  try {
+    backendUrl = normalizeBackendUrl(config.backendUrl);
+  } catch {
+    return null;
+  }
+  return {
+    backendUrl,
+    operatorKey: config.operatorKey,
+    generation: typeof config.generation === "string" && config.generation
+      ? config.generation : "legacy",
+  };
 }
 
 function trustedSender(sender) {
@@ -69,11 +106,21 @@ function responseError(code, message, status = undefined) {
   return { ok: false, code, message, ...(status === undefined ? {} : { status }) };
 }
 
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchCapabilities(backendUrl, operatorKey) {
-  const response = await fetch(`${backendUrl}/capabilities`, {
+  const response = await fetchWithTimeout(`${backendUrl}/capabilities`, {
     cache: "no-store",
     headers: { Authorization: `Bearer ${operatorKey}` },
-  });
+  }, REQUEST_TIMEOUTS_MS.capabilities);
   if (!response.ok) {
     if (response.status === 401) {
       return responseError("unauthorized", "The operator key was rejected.", response.status);
@@ -108,18 +155,34 @@ async function configureAuth(message) {
     responseError("offline", "The backend could not be reached."));
   if (!checked.ok) return checked;
 
-  const previousKey = await readOperatorKey();
+  const previousAuth = await readTrustedAuth();
   const previousSync = await readSync(["backendUrl", "model", "keepStems"]);
   const nextSync = { backendUrl };
   if (Array.isArray(message.keepStems)) nextSync.keepStems = message.keepStems.slice(0, 4);
   if (typeof message.model === "string" && message.model.length <= 80) nextSync.model = message.model;
+  const generation = globalThis.crypto?.randomUUID?.() ||
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  const nextAuth = {
+    version: AUTH_CONFIG_VERSION,
+    backendUrl,
+    operatorKey,
+    generation,
+  };
   try {
-    await chrome.storage.local.set({ [AUTH_STORAGE_KEY]: operatorKey });
+    await chrome.storage.local.set({ [AUTH_CONFIG_STORAGE_KEY]: nextAuth });
+    await chrome.storage.local.remove(LEGACY_AUTH_STORAGE_KEY);
     await chrome.storage.sync.set(nextSync);
   } catch {
     try {
-      if (previousKey) await chrome.storage.local.set({ [AUTH_STORAGE_KEY]: previousKey });
-      else await chrome.storage.local.remove(AUTH_STORAGE_KEY);
+      if (previousAuth) await chrome.storage.local.set({
+        [AUTH_CONFIG_STORAGE_KEY]: {
+          version: AUTH_CONFIG_VERSION,
+          backendUrl: previousAuth.backendUrl,
+          operatorKey: previousAuth.operatorKey,
+          generation: previousAuth.generation,
+        },
+      });
+      else await chrome.storage.local.remove(AUTH_CONFIG_STORAGE_KEY);
       await chrome.storage.sync.set(previousSync);
     } catch {
       // Keep the response free of credential material even if rollback fails.
@@ -233,6 +296,7 @@ function operationRequest(operation, data, backendUrl) {
 function errorCode(status, detail) {
   if (status === 401 && detail?.code === "credential_revoked") return "revoked";
   if (status === 401) return "unauthorized";
+  if (status === 503 && detail?.code === "auth_not_configured") return "auth_not_configured";
   if (status === 503) return "backend_not_ready";
   if (status === 429) return "busy";
   return "backend_error";
@@ -240,19 +304,17 @@ function errorCode(status, detail) {
 
 async function backendRequest(operation, input) {
   const data = validateOperation(operation, input);
-  const stored = await readSync(["backendUrl"]);
-  const backendUrl = normalizeBackendUrl(stored.backendUrl || DEFAULT_BACKEND);
-  const key = await readOperatorKey();
-  if (!key) return responseError("not_configured", "Configure an operator key first.");
-  const request = operationRequest(operation, data, backendUrl);
+  const auth = await readTrustedAuth();
+  if (!auth) return responseError("not_configured", "Configure a trusted backend and operator key first.");
+  const request = operationRequest(operation, data, auth.backendUrl);
   let response;
   try {
-    response = await fetch(request.url, {
+    response = await fetchWithTimeout(request.url, {
       method: request.method,
-      headers: { ...(request.headers || {}), Authorization: `Bearer ${key}` },
+      headers: { ...(request.headers || {}), Authorization: `Bearer ${auth.operatorKey}` },
       body: request.body,
       cache: "no-store",
-    });
+    }, REQUEST_TIMEOUTS_MS[operation] || 10_000);
   } catch {
     return responseError("offline", "The backend could not be reached.");
   }
@@ -321,7 +383,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "get-auth-state") {
     (async () => {
       try {
-        sendResponse({ ok: true, configured: Boolean(await readOperatorKey()) });
+        const auth = await readTrustedAuth();
+        sendResponse({
+          ok: true,
+          configured: Boolean(auth),
+          ...(auth ? { backendUrl: auth.backendUrl } : {}),
+        });
       } catch {
         sendResponse(responseError("storage_error", "Trusted storage is unavailable."));
       }
@@ -344,7 +411,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse(responseError("forbidden", "Only the extension settings page may clear auth."));
       return false;
     }
-    chrome.storage.local.remove(AUTH_STORAGE_KEY)
+    Promise.all([
+      chrome.storage.local.remove(AUTH_CONFIG_STORAGE_KEY),
+      chrome.storage.local.remove(LEGACY_AUTH_STORAGE_KEY),
+    ])
       .then(() => sendResponse({ ok: true }))
       .catch(() => sendResponse(responseError("storage_error", "Could not clear the operator key.")));
     return true;
@@ -367,14 +437,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "backend-capabilities") {
     (async () => {
       try {
-        const stored = await readSync(["backendUrl"]);
-        const backendUrl = normalizeBackendUrl(stored.backendUrl || DEFAULT_BACKEND);
-        const key = await readOperatorKey();
-        if (!key) {
-          sendResponse(responseError("not_configured", "Configure an operator key first."));
+        const auth = await readTrustedAuth();
+        if (!auth) {
+          sendResponse(responseError("not_configured", "Configure a trusted backend and operator key first."));
           return;
         }
-        sendResponse(await fetchCapabilities(backendUrl, key));
+        sendResponse(await fetchCapabilities(auth.backendUrl, auth.operatorKey));
       } catch {
         sendResponse(responseError("offline", "The backend could not be reached."));
       }
@@ -385,14 +453,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "ping-backend") {
     (async () => {
       try {
-        const stored = await readSync(["backendUrl"]);
-        const backendUrl = normalizeBackendUrl(stored.backendUrl || DEFAULT_BACKEND);
-        const key = await readOperatorKey();
-        if (!key) {
-          sendResponse(responseError("not_configured", "Configure an operator key first."));
+        const auth = await readTrustedAuth();
+        if (!auth) {
+          sendResponse(responseError("not_configured", "Configure a trusted backend and operator key first."));
           return;
         }
-        const result = await fetchCapabilities(backendUrl, key);
+        const result = await fetchCapabilities(auth.backendUrl, auth.operatorKey);
         sendResponse({
           ok: result.ok,
           ...(result.status === undefined ? {} : { status: result.status }),
