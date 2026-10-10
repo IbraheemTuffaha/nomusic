@@ -7,6 +7,10 @@ const noop = () => {};
 globalThis.chrome ??= {
   storage: {
     sync: { get: async () => ({}), set: async () => {} },
+    local: {
+      get: async () => ({}), set: async () => {}, remove: async () => {},
+      setAccessLevel: async () => {},
+    },
     onChanged: { addListener: noop, removeListener: noop },
   },
   runtime: {

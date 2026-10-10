@@ -8,8 +8,12 @@
     "http://127.0.0.1:8723/*",
     "http://localhost:8723/*"
   ],
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "content_scripts": [
     {

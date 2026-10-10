@@ -3,17 +3,21 @@
 // import time, so we install capturing stubs and dynamic-import it.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { OPERATOR_KEY_PATTERN, normalizeBackendUrl } from "../config.js";
 
 let loadCounter = 0;
 
 async function loadBackground({ stored }) {
   const captured = {};
   let written = null;
+  const local = {};
+  let accessLevel = null;
   const messages = [];
   globalThis.chrome = {
     runtime: {
       onInstalled: { addListener: (cb) => (captured.onInstalled = cb) },
       onMessage: { addListener: (cb) => (captured.onMessage = cb) },
+      getURL: (path) => `chrome-extension://test/${path}`,
       lastError: null,
     },
     downloads: {
@@ -31,13 +35,27 @@ async function loadBackground({ stored }) {
         get: async () => stored,
         set: async (patch) => (written = patch),
       },
+      local: {
+        get: async (key) => typeof key === "string" ? { [key]: local[key] } : { ...local },
+        set: async (patch) => Object.assign(local, patch),
+        remove: async (key) => delete local[key],
+        setAccessLevel: async (value) => (accessLevel = value),
+      },
     },
   };
   // Unique query each call so the module's top-level listener registration
   // re-runs against this call's capturing stubs (ESM caches by specifier).
   await import(`../background.js?load=${++loadCounter}`);
-  return { captured, getWritten: () => written, messages };
+  return { captured, getWritten: () => written, messages, local, getAccessLevel: () => accessLevel };
 }
+
+test("backend URL validation keeps loopback HTTP and rejects remote HTTP", () => {
+  assert.equal(normalizeBackendUrl("http://127.0.0.1:8723/"), "http://127.0.0.1:8723");
+  assert.equal(normalizeBackendUrl("https://backend.example/"), "https://backend.example");
+  assert.throws(() => normalizeBackendUrl("http://backend.example"), /HTTPS/);
+  assert.throws(() => normalizeBackendUrl("https://user:pass@backend.example"), /credentials/);
+  assert.ok(OPERATOR_KEY_PATTERN.test(`nm_${"a".repeat(64)}`));
+});
 
 test("download-export delegates the response body to chrome downloads", async () => {
   const { captured } = await loadBackground({ stored: {} });
@@ -127,8 +145,12 @@ test("onInstalled writes nothing when all defaults are present", async () => {
 });
 
 test("ping-backend reports reachability from a capabilities fetch", async () => {
-  const { captured } = await loadBackground({ stored: {} });
-  globalThis.fetch = async () => ({ ok: true, status: 200 });
+  const { captured, local } = await loadBackground({ stored: {} });
+  local.operatorKey = `nm_${"a".repeat(64)}`;
+  globalThis.fetch = async (_url, options) => {
+    assert.equal(options.headers.Authorization, `Bearer ${local.operatorKey}`);
+    return { ok: true, status: 200, json: async () => ({ engine: {} }) };
+  };
   let response;
   const keepOpen = captured.onMessage(
     { type: "ping-backend" },
@@ -138,4 +160,40 @@ test("ping-backend reports reachability from a capabilities fetch", async () => 
   assert.equal(keepOpen, true); // async response -> channel kept open
   await new Promise((r) => setTimeout(r, 5));
   assert.deepEqual(response, { ok: true, status: 200 });
+});
+
+test("configure-auth commits only after an authenticated capabilities check", async () => {
+  const { captured, local, getWritten, getAccessLevel } = await loadBackground({
+    stored: { backendUrl: "http://127.0.0.1:8723", model: null, keepStems: null },
+  });
+  const key = `nm_${"b".repeat(64)}`;
+  globalThis.fetch = async (_url, options) => {
+    assert.equal(options.headers.Authorization, `Bearer ${key}`);
+    return { ok: true, status: 200, json: async () => ({ engine: { name: "fake" } }) };
+  };
+  let response;
+  const open = captured.onMessage(
+    { type: "configure-auth", backendUrl: "http://127.0.0.1:8723/", operatorKey: key },
+    { url: "chrome-extension://test/popup.html" },
+    (value) => (response = value),
+  );
+  assert.equal(open, true);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(response.ok, true);
+  assert.equal(local.operatorKey, key);
+  assert.equal(getWritten().backendUrl, "http://127.0.0.1:8723");
+  assert.deepEqual(getAccessLevel(), { accessLevel: "TRUSTED_CONTEXTS" });
+});
+
+test("content-script messages cannot write the operator key", async () => {
+  const { captured, local } = await loadBackground({ stored: {} });
+  let response;
+  const open = captured.onMessage(
+    { type: "configure-auth", backendUrl: "http://127.0.0.1:8723", operatorKey: `nm_${"c".repeat(64)}` },
+    { tab: { id: 1 }, url: "https://video.example/" },
+    (value) => (response = value),
+  );
+  assert.equal(open, false);
+  assert.equal(response.code, "forbidden");
+  assert.equal(local.operatorKey, undefined);
 });

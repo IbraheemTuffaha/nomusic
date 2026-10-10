@@ -1,8 +1,11 @@
-// Shared config + the in-memory settings cache that mirrors chrome.storage.
+// Shared non-secret config + the in-memory settings cache that mirrors
+// chrome.storage.sync. The operator key is intentionally absent: content
+// scripts run in page-facing contexts and must never be able to read it.
 // chrome.storage drives the popup; each new Session snapshots this cache.
 // Active sessions keep one backend/model/stem identity until toggled off/on.
 
-export const DEFAULT_BACKEND = "http://127.0.0.1:8723";
+export { DEFAULT_BACKEND } from "./config.js";
+import { DEFAULT_BACKEND } from "./config.js";
 export const SYNC_TOLERANCE_S = 0.08;
 export const SYNC_CHECK_MS = 250;
 

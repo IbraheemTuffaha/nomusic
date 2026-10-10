@@ -1,28 +1,132 @@
-// Background service worker.
+// Trusted extension service worker.
 //
-// The content script talks to the local backend directly. The worker owns
-// storage defaults, answers the backend health probe, and hands prepared export
-// responses to chrome.downloads so page memory never holds a whole file.
+// Page-facing content scripts never receive the operator key and never make
+// backend requests directly. This worker owns the key in storage.local,
+// validates the small message surface, and performs authenticated setup and
+// capability checks. Processing transport is added in the next stack layer.
+
+import {
+  DEFAULT_BACKEND,
+  OPERATOR_KEY_PATTERN,
+  normalizeBackendUrl,
+} from "./config.js";
 
 const DEFAULTS = {
-  backendUrl: "http://127.0.0.1:8723",
-  model: null, // null -> backend's default
-  keepStems: null, // null -> backend's default
+  backendUrl: DEFAULT_BACKEND,
+  model: null,
+  keepStems: null,
   autoStart: false,
 };
+const AUTH_STORAGE_KEY = "operatorKey";
 
-chrome.runtime.onInstalled.addListener(async () => {
-  const current = await chrome.storage.sync.get(Object.keys(DEFAULTS));
-  const patched = {};
-  for (const [k, v] of Object.entries(DEFAULTS)) {
-    if (current[k] === undefined) patched[k] = v;
+// Content scripts are page-facing contexts. Restrict the local area so they
+// cannot read the operator key even though they share the extension's origin.
+try {
+  const access = chrome.storage.local?.setAccessLevel?.({
+    accessLevel: "TRUSTED_CONTEXTS",
+  });
+  access?.catch?.(() => {});
+} catch {
+  // Storage errors are reported when a setup operation is attempted.
+}
+
+async function readSync(keys = Object.keys(DEFAULTS)) {
+  return chrome.storage.sync.get(keys);
+}
+
+async function readOperatorKey() {
+  const stored = await chrome.storage.local.get(AUTH_STORAGE_KEY);
+  const key = stored?.[AUTH_STORAGE_KEY];
+  return typeof key === "string" && OPERATOR_KEY_PATTERN.test(key) ? key : null;
+}
+
+function trustedSender(sender) {
+  // Content-script messages carry a tab. A page can otherwise manufacture a
+  // runtime message, so configuration writes require an extension page/worker
+  // sender and are never accepted from a tab.
+  if (sender?.tab) return false;
+  if (!sender?.url) return true; // unit tests and extension-internal callers
+  try {
+    return sender.url.startsWith(chrome.runtime.getURL(""));
+  } catch {
+    return false;
   }
-  if (Object.keys(patched).length) {
-    await chrome.storage.sync.set(patched);
+}
+
+function responseError(code, message, status = undefined) {
+  return { ok: false, code, message, ...(status === undefined ? {} : { status }) };
+}
+
+async function fetchCapabilities(backendUrl, operatorKey) {
+  const response = await fetch(`${backendUrl}/capabilities`, {
+    cache: "no-store",
+    headers: { Authorization: `Bearer ${operatorKey}` },
+  });
+  if (!response.ok) {
+    if (response.status === 401) {
+      return responseError("unauthorized", "The operator key was rejected.", response.status);
+    }
+    if (response.status === 503) {
+      return responseError("backend_not_ready", "The backend is not configured or ready.", response.status);
+    }
+    return responseError("backend_error", `Backend returned HTTP ${response.status}.`, response.status);
   }
-});
+  let capabilities;
+  try {
+    capabilities = await response.json();
+  } catch {
+    return responseError("backend_error", "The backend returned invalid capabilities.", response.status);
+  }
+  return { ok: true, status: response.status, capabilities };
+}
+
+async function configureAuth(message) {
+  let backendUrl;
+  try {
+    backendUrl = normalizeBackendUrl(message.backendUrl);
+  } catch (error) {
+    return responseError("invalid_backend", error.message);
+  }
+  const operatorKey = typeof message.operatorKey === "string"
+    ? message.operatorKey.trim() : "";
+  if (!OPERATOR_KEY_PATTERN.test(operatorKey)) {
+    return responseError("invalid_key", "Enter the complete operator key.");
+  }
+  const checked = await fetchCapabilities(backendUrl, operatorKey).catch(() =>
+    responseError("offline", "The backend could not be reached."));
+  if (!checked.ok) return checked;
+
+  const previousKey = await readOperatorKey();
+  const previousSync = await readSync(["backendUrl", "model", "keepStems"]);
+  const nextSync = { backendUrl };
+  if (Array.isArray(message.keepStems)) nextSync.keepStems = message.keepStems.slice(0, 4);
+  if (typeof message.model === "string" && message.model.length <= 80) nextSync.model = message.model;
+  try {
+    await chrome.storage.local.set({ [AUTH_STORAGE_KEY]: operatorKey });
+    await chrome.storage.sync.set(nextSync);
+  } catch {
+    try {
+      if (previousKey) await chrome.storage.local.set({ [AUTH_STORAGE_KEY]: previousKey });
+      else await chrome.storage.local.remove(AUTH_STORAGE_KEY);
+      await chrome.storage.sync.set(previousSync);
+    } catch {
+      // Keep the response free of credential material even if rollback fails.
+    }
+    return responseError("storage_error", "Could not save the trusted backend settings.");
+  }
+  return { ok: true, status: checked.status, capabilities: checked.capabilities };
+}
 
 const activeDownloads = new Map();
+
+chrome.runtime.onInstalled.addListener(async () => {
+  const current = await readSync();
+  const patched = {};
+  for (const [key, value] of Object.entries(DEFAULTS)) {
+    if (current[key] === undefined) patched[key] = value;
+  }
+  if (Object.keys(patched).length) await chrome.storage.sync.set(patched);
+});
 
 chrome.downloads.onChanged?.addListener((delta) => {
   const entry = activeDownloads.get(delta.id);
@@ -53,19 +157,93 @@ chrome.downloads.onChanged?.addListener((delta) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "get-auth-state") {
+    (async () => {
+      try {
+        sendResponse({ ok: true, configured: Boolean(await readOperatorKey()) });
+      } catch {
+        sendResponse(responseError("storage_error", "Trusted storage is unavailable."));
+      }
+    })();
+    return true;
+  }
+
+  if (msg?.type === "configure-auth") {
+    if (!trustedSender(sender)) {
+      sendResponse(responseError("forbidden", "Only the extension settings page may configure auth."));
+      return false;
+    }
+    configureAuth(msg).then(sendResponse).catch(() =>
+      sendResponse(responseError("backend_error", "Backend setup failed.")));
+    return true;
+  }
+
+  if (msg?.type === "clear-auth") {
+    if (!trustedSender(sender)) {
+      sendResponse(responseError("forbidden", "Only the extension settings page may clear auth."));
+      return false;
+    }
+    chrome.storage.local.remove(AUTH_STORAGE_KEY)
+      .then(() => sendResponse({ ok: true }))
+      .catch(() => sendResponse(responseError("storage_error", "Could not clear the operator key.")));
+    return true;
+  }
+
+  if (msg?.type === "save-preferences") {
+    if (!trustedSender(sender)) {
+      sendResponse(responseError("forbidden", "Only the extension settings page may save preferences."));
+      return false;
+    }
+    const patch = {};
+    if (typeof msg.model === "string" || msg.model === null) patch.model = msg.model;
+    if (Array.isArray(msg.keepStems)) patch.keepStems = msg.keepStems.slice(0, 4);
+    chrome.storage.sync.set(patch)
+      .then(() => sendResponse({ ok: true }))
+      .catch(() => sendResponse(responseError("storage_error", "Could not save preferences.")));
+    return true;
+  }
+
+  if (msg?.type === "backend-capabilities") {
+    (async () => {
+      try {
+        const stored = await readSync(["backendUrl"]);
+        const backendUrl = normalizeBackendUrl(stored.backendUrl || DEFAULT_BACKEND);
+        const key = await readOperatorKey();
+        if (!key) {
+          sendResponse(responseError("not_configured", "Configure an operator key first."));
+          return;
+        }
+        sendResponse(await fetchCapabilities(backendUrl, key));
+      } catch {
+        sendResponse(responseError("offline", "The backend could not be reached."));
+      }
+    })();
+    return true;
+  }
+
   if (msg?.type === "ping-backend") {
     (async () => {
       try {
-        const settings = await chrome.storage.sync.get(["backendUrl"]);
-        const base = settings.backendUrl || DEFAULTS.backendUrl;
-        const resp = await fetch(`${base}/capabilities`, { cache: "no-store" });
-        sendResponse({ ok: resp.ok, status: resp.status });
-      } catch (err) {
-        sendResponse({ ok: false, error: String(err) });
+        const stored = await readSync(["backendUrl"]);
+        const backendUrl = normalizeBackendUrl(stored.backendUrl || DEFAULT_BACKEND);
+        const key = await readOperatorKey();
+        if (!key) {
+          sendResponse(responseError("not_configured", "Configure an operator key first."));
+          return;
+        }
+        const result = await fetchCapabilities(backendUrl, key);
+        sendResponse({
+          ok: result.ok,
+          ...(result.status === undefined ? {} : { status: result.status }),
+          ...(result.code === undefined ? {} : { code: result.code }),
+        });
+      } catch {
+        sendResponse(responseError("offline", "The backend could not be reached."));
       }
     })();
-    return true; // keep the message channel open for the async response
+    return true;
   }
+
   if (msg?.type === "download-export") {
     const url = typeof msg.url === "string" ? msg.url : "";
     const filename = typeof msg.filename === "string" ? msg.filename : "";
