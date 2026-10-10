@@ -23,8 +23,13 @@ let capsLoaded = false;
 let saved = {};
 let savedTimer = null;
 
-function send(message) {
-  return chrome.runtime.sendMessage(message);
+function send(message, timeoutMs = 8_000) {
+  let timer;
+  const request = Promise.resolve().then(() => chrome.runtime.sendMessage(message));
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("The extension worker did not respond.")), timeoutMs);
+  });
+  return Promise.race([request, timeout]).finally(() => clearTimeout(timer));
 }
 
 function setStatus(kind, text) {

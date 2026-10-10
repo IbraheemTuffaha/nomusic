@@ -3,9 +3,11 @@
 ## Architecture
 
 The Manifest V3 extension discovers videos, submits processing jobs and follows
-their progress over Server-Sent Events (SSE). It fetches Opus chunks and schedules
-decoded audio against the video's clock. A page bridge suppresses original
-audio; the scheduler handles drift and pitch-preserving speed changes.
+their progress with authenticated short polling through its service worker. The
+worker is the only production backend transport and keeps the operator key out
+of page contexts. It fetches Opus chunks and schedules decoded audio against
+the video's clock. A page bridge suppresses original audio; the scheduler
+handles drift and pitch-preserving speed changes.
 
 FastAPI owns an engine, cache, job registry and maintenance work per application
 lifespan. By default, one supervised child process owns model loading and native
@@ -27,6 +29,7 @@ until all readers and the processor release it.
 | `engines/` | Engine interface, PyTorch implementation and pinned model store |
 | `pipeline/` | Source download, chunk processing, cache and export assembly |
 | `extension/main.js`, `button.js`, `session.js` | Video discovery, controls and per-video networking |
+| `extension/backend-client.js` | Fixed-operation service-worker transport and backend error mapping |
 | `extension/chunk-loader.js` | Bounded chunk acquisition, retries and decoded-audio retention |
 | `audio-scheduler.js`, `mute-controller.js`, `stretch.js` within the extension | Audio scheduling, volume mirroring and time-stretch |
 | `settings.js`, `background.js`, `popup.js`, `page-script.js` within the extension | Saved settings, service worker, popup and page bridge |
@@ -50,7 +53,7 @@ The chunk loader keeps server availability separate from pending requests and
 decoded buffers. It fetches at most three chunks concurrently, including their
 decode work. Network/body reads time out after 15 seconds. Failed chunks have
 four attempts with 0.5, 1 and 2 second backoffs; retries continue independently
-after the final SSE status. Browser decoding cannot be cancelled, so an obsolete
+after the final status poll. Browser decoding cannot be cancelled, so an obsolete
 decode still occupies its slot until it settles, and its result is discarded.
 A decode exceeding 15 seconds reports a terminal error if it is still needed
 or blocks acquisition; it does not silently free a slot for more work.
@@ -88,23 +91,23 @@ second later may finish with original audio still suppressed. A larger or unknow
 uncovered tail reports a persistent playback error instead of buffering forever.
 This tolerance does not stretch audio or correct larger source-duration mismatches.
 
-The session owns a bounded processing lease as well as SSE reconnection. The
-lease is renewed independently of status transport, so switching between SSE
-and `/status` does not abandon work. An ordinary pause stops the heartbeat and
+The session owns a bounded processing lease as well as status-poll recovery. The
+lease is renewed independently of status transport, so a polling failure does
+not abandon work. An ordinary pause stops the heartbeat and
 retains the job for the client lease plus the idle timeout (30 seconds and 10
 seconds by default); resuming re-submits the same cache key and reuses completed
 chunks. Disabling nomusic releases only that
-session's lease. If another tab has a lease, its work continues. Servers from
-before the interest protocol are supported temporarily through the existing
-SSE subscriber idle clock.
+session's lease. If another tab has a lease, its work continues. The shipped
+extension uses authenticated `/status` polling; the backend SSE route is kept
+as an internal diagnostic surface and is not part of the extension contract.
 
-SSE errors in either connecting or closed state
-receive three retries with 0.5, 1 and 2 second delays. Each retry re-submits the
-job before opening its stream, allowing a restarted backend to resume cached
-work. A valid status for that job resets the retry budget. An initial stream
-snapshot has a 15-second deadline; processing requests have 30 seconds, and
-the required capabilities request has a five-second timeout. User pause cancels reconnect work
-unless a queued export still needs processing.
+Status polling retries ordinary failures with 0.5, 1 and 2 second delays. A
+404, timeout, offline response or server error immediately enters bounded
+recovery and re-submits the job, allowing a restarted backend to resume cached
+work. A valid status for that job resets the retry budget; authentication
+errors fail immediately with an actionable message. Status and capabilities
+requests have five-second timeouts; processing requests have 30 seconds. User
+pause cancels polling recovery unless a queued export still needs processing.
 
 Discovery reconciles mutation batches against the final DOM. Reparenting a
 connected player preserves its session; removing a video retires its button,
@@ -140,11 +143,11 @@ not resource or authorization guarantees for a public service.
 | `NOMUSIC_EXECUTION_TIMEOUT_SECONDS` | `1800` | Maximum wall time for one supervised execution before a clear error |
 | `NOMUSIC_WORKER_CANCEL_GRACE_SECONDS` | `5` | Cooperative cancellation grace before a stuck child is replaced |
 | `NOMUSIC_WORKER_WARMUP_TIMEOUT_SECONDS` | `300` | Startup model-warmup deadline for the supervised child |
-| `NOMUSIC_SSE_KEEPALIVE_SECONDS` | `15` | Interval between SSE keep-alive comments |
+| `NOMUSIC_SSE_KEEPALIVE_SECONDS` | `15` | Keep-alive interval for the legacy authenticated `/events` endpoint |
 | `NOMUSIC_CLIENT_LEASE_SECONDS` | `30` | Maximum processing-interest lease; pause retention ends when it expires |
 | `NOMUSIC_CLIENT_HEARTBEAT_SECONDS` | `10` | Extension heartbeat interval while a session is active |
 | `NOMUSIC_INTEREST_SWEEP_INTERVAL_SECONDS` | `5` | Expire abandoned client leases; `0` disables the maintenance pass |
-| `NOMUSIC_SSE_QUEUE_SIZE` | `64` | Maximum pending status snapshots per SSE subscriber; older snapshots coalesce |
+| `NOMUSIC_SSE_QUEUE_SIZE` | `64` | Maximum pending snapshots for the legacy `/events` subscriber; older snapshots coalesce |
 | `NOMUSIC_MEMORY_GC_INTERVAL_SECONDS` | `3600` | Reclaim in-memory entries whose disk cache disappeared; `0` disables |
 | `NOMUSIC_PROGRESSIVE` | `true` | Process decodable early audio while its download continues |
 | `NOMUSIC_DOWNLOAD_RATELIMIT` | Unset | Test download cap in bytes/sec, with optional `K`/`M` suffix |
@@ -174,8 +177,8 @@ development commands are covered in [installation](installation.md).
 
 ## API
 
-The backend requires an operator key for every processing, status, media, cache
-and export route. Send it as `Authorization: Bearer <key>`; the key must never
+The backend requires an operator key for every processing, status, media and
+export route. Send it as `Authorization: Bearer <key>`; the key must never
 be placed in a URL. `GET /healthz` remains a minimal unauthenticated liveness
 probe. See [backend authentication](authentication.md) for key generation,
 rotation, revocation and the bounded treatment of already-open transfers.
@@ -191,7 +194,7 @@ Remote schemas and administrative routes are not exposed.
 | POST | `/process/{job_id}/interest` | `{client_id, lease_seconds?}` → lease; acquire or heartbeat one client's interest |
 | DELETE | `/process/{job_id}/interest?client_id=...` | Release only that client's interest; another client's lease is unaffected |
 | GET | `/status/{job_id}` | `JobStatus`; 404 for unknown job |
-| GET | `/events/{job_id}` | SSE `JobStatus` updates; 204 for unknown job; planned shutdown closes without a fabricated error |
+| GET | `/events/{job_id}` | Legacy authenticated SSE `JobStatus` updates; production extension transport uses `/status` polling |
 | GET | `/chunk/{job_id}/{idx}` | OGG/Opus chunk; 425 while unavailable |
 | GET | `/audio/{job_id}` | Full OGG/Opus; 425 before completion |
 | POST | `/exports` | `{job_id, format, max_height?, client_id?}` → durable export status; source must be ready; `429` when the bounded export queue is full |

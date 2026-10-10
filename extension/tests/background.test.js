@@ -263,6 +263,22 @@ test("backend-request exposes only validated operations and keeps auth in the wo
   assert.equal(requests[0].url, `http://127.0.0.1:8723/status/${"a".repeat(16)}`);
   assert.equal(requests[0].options.headers.Authorization, `Bearer ${local.trustedBackend.operatorKey}`);
 
+  captured.onMessage(
+    {
+      type: "backend-request",
+      operation: "process",
+      url: "https://www.youtube.com/watch?v=abc",
+      keep_stems: ["vocals", "vocals"],
+    },
+    { tab: { id: 5 }, url: "https://video.example/" },
+    (value) => (response = value),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(JSON.parse(requests[1].options.body), {
+    url: "https://www.youtube.com/watch?v=abc",
+    keep_stems: ["vocals"],
+  });
+
   let rejected;
   captured.onMessage(
     { type: "backend-request", operation: "fetch-arbitrary", url: "https://secret.example" },
@@ -271,7 +287,7 @@ test("backend-request exposes only validated operations and keeps auth in the wo
   );
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(rejected.code, "invalid_request");
-  assert.equal(requests.length, 1);
+  assert.equal(requests.length, 2);
 });
 
 test("job routes keep their backend credential after the active configuration changes", async () => {

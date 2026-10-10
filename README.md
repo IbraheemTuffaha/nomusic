@@ -12,8 +12,9 @@ The default keeps **vocals**, including speech and singing. Some music may
 remain, and some wanted sounds may be removed. Start with a **public YouTube
 video with a fixed duration**; other sites are experimental.
 
-This version is for local use and has no user authentication. Keep the backend
-on its default loopback address; authenticated internet sharing is not ready.
+This version uses an operator key for every processing, playback and export
+request. The key is generated locally and kept in the extension's trusted
+storage; the default backend still listens only on loopback.
 
 ## What you need
 
@@ -70,7 +71,10 @@ if you already have a backup or use a custom environment.
 
 ## 3. Start the helper
 
+Generate a key once, copy it into the extension settings, then start the helper:
+
 ```sh
+backend/.venv/bin/nomusic auth generate --label "this computer"
 backend/.venv/bin/nomusic serve
 ```
 
@@ -88,14 +92,12 @@ Next time, open Terminal in the project folder and run the same serve command.
 1. Open `chrome://extensions` in Chrome and turn on **Developer mode**.
 2. Click **Load unpacked** and select the project's `extension` folder.
 3. Open nomusic from the toolbar, possibly under the puzzle-piece icon.
-   Keep the backend URL `http://127.0.0.1:8723`, model **htdemucs** and
-   **vocals** selected. Settings save automatically.
-4. Open a public YouTube video. If Chrome requests **Local network access**,
-   allow it for the video site so the page can reach the helper.
-
-If permission was denied, open the site's settings beside the address bar,
-allow **Local network access**, and reload. After updating extension files,
-reload the extension on `chrome://extensions`, then reload your video tabs.
+   Keep the backend URL `http://127.0.0.1:8723`, paste the generated operator
+   key, and click **Connect**. After the authenticated check succeeds, choose
+   model **htdemucs** and **vocals**. The key stays in trusted extension
+   storage and is never synced with normal preferences.
+4. Open a public YouTube video. After updating extension files, reload the
+   extension on `chrome://extensions`, then reload your video tabs.
 
 ## 5. Watch and save
 

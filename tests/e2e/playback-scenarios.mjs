@@ -201,43 +201,47 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
   mark("sustained-cached-playback-and-memory-window", { videoSeconds: afterReplay.time - replayStart.time,
     samples: replaySamples, sampleRates: afterReplay.sampleRates });
 
-  // Routing observes actual refetches and selectively injects network faults.
-  // Installing a route disables Chromium's HTTP cache for this page, making an
-  // evicted chunk's fresh request visible at the real backend too.
+  // Chunk requests originate in the service worker. The browser harness owns
+  // a test-only worker fetch interceptor, so faults and delayed responses are
+  // injected without restoring page-side backend access.
+  const transport = () => worker.evaluate(() => globalThis.__nomusicE2ETransport || []);
+  const control = () => worker.evaluate(() => globalThis.__nomusicE2EControl || {});
   const chunkRequests = [];
+  const seenFaultRecords = new Set();
   let fault = null;
   let delayed = null;
-  const pattern = `${options.backend}/chunk/**`;
-  const routeChunks = async (route) => {
-    const request = route.request();
-    const index = Number(new URL(request.url()).pathname.split("/").at(-1));
-    chunkRequests.push(index);
-    if (delayed?.index === index && !delayed.entered) {
-      const held = delayed;
-      held.entered = true;
-      const response = await route.fetch();
-      held.fetched = true;
-      await held.gate;
-      // The application aborts this request when its old session is retired.
-      // Deliver the real backend bytes late anyway; Chromium may discard them.
-      try { await route.fulfill({ response }); }
-      catch (error) { held.deliveryError = String(error); }
-      held.delivered = true;
-      return;
+  async function setFault(next) {
+    fault = next;
+    await worker.evaluate((value) => { globalThis.__nomusicE2EControl.fault = value; }, next);
+  }
+  async function setDelayed(next) {
+    delayed = next;
+    await worker.evaluate((value) => {
+      if (value === null && globalThis.__nomusicE2EControl.delayed) {
+        globalThis.__nomusicE2EControl.delayed.released = true;
+      }
+      globalThis.__nomusicE2EControl.delayed = value;
+    }, next);
+  }
+  function syncChunkRequests(records) {
+    chunkRequests.length = 0;
+    for (const item of records) {
+      const match = /^\/chunk\/[^/]+\/(\d+)$/.exec(item.path);
+      if (match) chunkRequests.push(Number(match[1]));
     }
-    if (fault?.index === index && fault.remaining > 0) {
-      fault.remaining--;
-      const state = (await read()).live[0];
-      const item = { name: fault.name, index, status: 503, sessionId: state?.id,
-        statuses: state?.statuses, streamEnded: state?.streamEnded };
-      evidence.injectedFaults.push(item);
-      expectHttp(request, 503, fault.name);
-      await route.fulfill({ status: 503, headers: { "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" }, body: "Injected playback regression fault" });
-      return;
+  }
+  async function collectFaults() {
+    const state = (await read()).live[0];
+    for (const [recordIndex, item] of (await transport()).entries()) {
+      if (!item.faultName || seenFaultRecords.has(recordIndex)) continue;
+      seenFaultRecords.add(recordIndex);
+      evidence.injectedFaults.push({ name: item.faultName,
+        index: Number(item.path.split("/").at(-1)), status: item.status,
+        sessionId: state?.id, statuses: state?.statuses,
+        streamEnded: state?.streamEnded });
     }
-    await route.continue();
-  };
-  await page.route(pattern, routeChunks);
+    syncChunkRequests(await transport());
+  }
   try {
     const positions = [10, 90, 25, 145, 45, 110];
     const rates = [0.75, 1, 1.25, 1.5];
@@ -245,6 +249,7 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
       await pause();
       await seek(position, rates[index % rates.length]);
       const audio = await freshAudio(`fresh audio at ${position}s`);
+      await collectFaults();
       const state = await settledWindow();
       assertBounds(state);
       mark("seek-rate-and-fresh-audio", { position, rate: rates[index % rates.length], audio,
@@ -272,10 +277,11 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
     // The failed request targets the final chunk of an already READY job.
     await pause();
     const lastIndex = ready.total_chunks - 1;
-    fault = { name: "final-ready-chunk-first-attempt", index: lastIndex, remaining: 1 };
+    await setFault({ name: "final-ready-chunk-first-attempt", index: lastIndex, remaining: 1 });
     const beforeFinal = await live();
     await seek(lastIndex * boundary + 0.2);
-    const finalAudio = await freshAudio("final chunk retries without another SSE update");
+    const finalAudio = await freshAudio("final chunk retries without another status poll");
+    await collectFaults();
     const finalState = await settledWindow();
     const finalFault = evidence.injectedFaults.find((item) => item.name === fault.name);
     assert.ok(finalFault, "Injected the final-chunk failure");
@@ -287,10 +293,11 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
     // Exhaust the current chunk, wait beyond the former 2.5-second error
     // revert, and recover through the actual keyboard-accessible controls.
     await pause();
-    fault = { name: "current-chunk-exhaustion", index: 0, remaining: 4 };
+    await setFault({ name: "current-chunk-exhaustion", index: 0, remaining: 4 });
     await seek(1);
     await page.locator("#play").click();
     await page.getByRole("button", { name: "Retry", exact: true }).waitFor();
+    await collectFaults();
     assert.equal(evidence.injectedFaults.filter((item) => item.name === fault.name).length, 4);
     await sleep(2800);
     assert.equal(await page.locator(".nomusic-btn").getAttribute("data-state"), "error");
@@ -301,7 +308,7 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
     const failed = await live();
     assert.equal(failed.failed, true);
     assert.equal(failed.activeSources, 0);
-    fault = null;
+    await setFault(null);
     const retry = page.getByRole("button", { name: "Retry", exact: true });
     await retry.focus();
     await retry.press("Enter");
@@ -310,10 +317,11 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
     mark("terminal-error-and-keyboard-retry", { attempts: 4, persistentAfterMs: 2800, audio: retryAudio });
 
     await pause();
-    fault = { name: "return-to-original-after-error", index: lastIndex, remaining: 4 };
+    await setFault({ name: "return-to-original-after-error", index: lastIndex, remaining: 4 });
     await seek(lastIndex * boundary + 0.2);
     await page.locator("#play").click();
     await page.getByRole("button", { name: "Return to original", exact: true }).waitFor();
+    await collectFaults();
     await page.locator("video").evaluate((video) => { video.volume = 0; video.muted = true; video.pause(); });
     const original = page.getByRole("button", { name: "Return to original", exact: true });
     expectAborts("return to original after terminal failure");
@@ -326,7 +334,7 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
     assert.equal(returned.paused, true);
     assert.equal(returned.blocked, "");
     mark("return-to-original-preserves-latest-zero-mute-and-pause", returned);
-    fault = null;
+    await setFault(null);
 
     // Restore volume for audible-signal measurement, still muted externally by
     // Chromium. Pause intent while selected must survive setup and buffering.
@@ -356,10 +364,9 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
     // The bridge still resolves to the same completed backend artifact, but
     // the old media element resource/session must no longer own responses.
     await pause();
-    delayed = { index: 14, entered: false, fetched: false, delivered: false };
-    delayed.gate = new Promise((resolve) => { delayed.release = resolve; });
+    await setDelayed({ index: 14, entered: false, fetched: false, delivered: false, released: false });
     await seek(14 * boundary + 0.2);
-    await until("old real chunk response held", () => delayed.fetched);
+    await until("old real chunk response held", async () => (await control()).delayed?.fetched);
     expectAborts("source replacement");
     await page.locator("video").evaluate((video) => { video.src = "/clip.mp4?replacement=1"; });
     await until("replaced-source session disposed", async () => (await read()).live.length === 0);
@@ -368,8 +375,8 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
     const replacement = await live();
     assert.notEqual(replacement.id, beforeMove.id);
     const replacementAudio = await freshAudio("new source uses a fresh playback session");
-    delayed.release();
-    await until("late old response released", () => delayed.delivered);
+    await worker.evaluate(() => { globalThis.__nomusicE2EControl.delayed.released = true; });
+    await until("late old response released", async () => (await control()).delayed?.delivered);
     const afterLate = await settledWindow();
     assert.equal(afterLate.id, replacement.id);
     assert.equal(afterLate.indices.includes(14), false, "Delayed old chunk cannot enter the new window");
@@ -413,11 +420,12 @@ export async function runPlaybackScenarios({ page, worker, isolated, audioState,
     evidence.observation = observation;
     evidence.maxSourceAheadSeconds = (await audioState()).maxSourceAhead;
     assert.ok(evidence.maxSourceAheadSeconds <= 30.1, "Every source start obeys the 30-second chunk-start horizon");
+    syncChunkRequests(await transport());
     evidence.chunkRequests = chunkRequests;
     evidence.passed = true;
   } finally {
-    delayed?.release();
-    await page.unroute(pattern, routeChunks);
+    await setFault(null);
+    await setDelayed(null);
     await isolated("__nomusicPlayback.restore()");
   }
 }

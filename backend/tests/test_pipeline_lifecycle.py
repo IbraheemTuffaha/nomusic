@@ -172,6 +172,11 @@ def _install_sessions(monkeypatch, tmp_path, responses):
     """Give SourceFetcher real ownership transitions without network access."""
     import yt_dlp
 
+    # These tests exercise session ownership and cleanup. The extractor is
+    # replaced below, so the fixture URL must not be resolved by the real SSRF
+    # guard; URL-policy coverage lives in the server/downloader validation tests.
+    monkeypatch.setattr(downloader, "validate_public_url", lambda url: str(url))
+
     pending = iter(responses)
     sessions = []
 

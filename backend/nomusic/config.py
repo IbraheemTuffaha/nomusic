@@ -113,16 +113,15 @@ class Settings:
     )
 
     # How long a worker keeps running after its last client interest and status
-    # subscriber drop. Explicit client leases are the normal path; the SSE
-    # subscriber clock remains as a compatibility fallback for older local
+    # subscriber drop. Explicit client leases are the normal path; the legacy
+    # SSE subscriber clock remains as a compatibility fallback for older local
     # extensions. ``0`` disables idle-abandon (workers always run to completion
     # regardless of who's watching).
     idle_timeout_seconds: float = field(
         default_factory=lambda: _env_float("IDLE_TIMEOUT_SECONDS", 10.0)
     )
-    # Gap between SSE keep-alive comments on an otherwise-quiet stream. Keeps
-    # proxies and the browser from treating a long processing pause (e.g. a
-    # slow probe + download with no chunk events) as a dead connection.
+    # Gap between keep-alive comments on the legacy SSE endpoint. The shipped
+    # extension uses authenticated status polling instead.
     sse_keepalive_seconds: float = field(
         default_factory=lambda: _env_float("SSE_KEEPALIVE_SECONDS", 15.0)
     )
@@ -141,8 +140,8 @@ class Settings:
     interest_sweep_interval_seconds: float = field(
         default_factory=lambda: _env_float("INTEREST_SWEEP_INTERVAL_SECONDS", 5.0)
     )
-    # SSE queues retain only the most recent bounded set of snapshots. A slow
-    # subscriber cannot grow process memory without limit.
+    # Legacy SSE queues retain only the most recent bounded set of snapshots. A
+    # slow subscriber cannot grow process memory without limit.
     sse_queue_size: int = field(
         default_factory=lambda: _env_int("SSE_QUEUE_SIZE", 64)
     )

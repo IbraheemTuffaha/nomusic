@@ -59,7 +59,10 @@ def chunk(
         str(path),
         lease,
         media_type=CHUNK_MEDIA_TYPE,
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={
+            "Cache-Control": "private, no-store",
+            "Vary": "Authorization",
+        },
     )
 
 
@@ -108,7 +111,10 @@ def audio(job_id: str, request: Request, _operator=Depends(require_operator)) ->
                     yield block
 
     total = sum(size for _, size in chunk_files)
-    headers = {"Cache-Control": "public, max-age=86400"}
+    headers = {
+        "Cache-Control": "private, no-store",
+        "Vary": "Authorization",
+    }
     if total:
         headers["Content-Length"] = str(total)
     return LeasedStreamingResponse(

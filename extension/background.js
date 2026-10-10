@@ -121,9 +121,20 @@ function responseError(code, message, status = undefined) {
 
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   try {
     return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (timedOut) {
+      const timeout = new Error("Backend request timed out");
+      timeout.code = "timeout";
+      throw timeout;
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -167,16 +178,17 @@ function routeSnapshot() {
 
 function rememberBackendRoute(routes, id, auth) {
   const route = authRoute(auth);
-  if (!id || !route) return;
+  if (!id || !route) return Promise.resolve();
   routes.delete(id);
   routes.set(id, route);
   while (routes.size > MAX_BACKEND_ROUTES) routes.delete(routes.keys().next().value);
   const session = chrome.storage.session;
-  if (!session?.set) return;
+  if (!session?.set) return Promise.resolve();
   backendRoutesWrite = backendRoutesWrite
     .catch(() => {})
     .then(() => session.set(routeSnapshot()))
     .catch(() => {});
+  return backendRoutesWrite;
 }
 
 async function loadBackendRoutes() {
@@ -226,22 +238,24 @@ function clearBackendRoutes() {
   jobBackendRoutes.clear();
   exportBackendRoutes.clear();
   const session = chrome.storage.session;
-  if (!session?.set) return;
+  if (!session?.set) return Promise.resolve();
   backendRoutesWrite = backendRoutesWrite
     .catch(() => {})
     .then(() => session.set(routeSnapshot()))
     .catch(() => {});
+  return backendRoutesWrite;
 }
 
 function rememberActiveDownloads() {
   const session = chrome.storage.session;
-  if (!session?.set) return;
+  if (!session?.set) return Promise.resolve();
   activeDownloadsWrite = activeDownloadsWrite
     .catch(() => {})
     .then(() => session.set({
       [ACTIVE_DOWNLOAD_STORAGE_KEY]: Object.fromEntries(activeDownloads),
     }))
     .catch(() => {});
+  return activeDownloadsWrite;
 }
 
 async function loadActiveDownloads() {
@@ -280,8 +294,18 @@ async function fetchCapabilities(backendUrl, operatorKey) {
     headers: { Authorization: `Bearer ${operatorKey}` },
   }, REQUEST_TIMEOUTS_MS.capabilities);
   if (!response.ok) {
+    let body = null;
+    try { body = await response.json(); } catch { /* status is enough */ }
+    const detail = body?.detail;
     if (response.status === 401) {
       return responseError("unauthorized", "The operator key was rejected.", response.status);
+    }
+    if (response.status === 503 && detail?.code === "auth_not_configured") {
+      return responseError(
+        "auth_not_configured",
+        "Backend authentication is not configured. Run nomusic auth generate.",
+        response.status,
+      );
     }
     if (response.status === 503) {
       return responseError("backend_not_ready", "The backend is not configured or ready.", response.status);
@@ -297,6 +321,12 @@ async function fetchCapabilities(backendUrl, operatorKey) {
   return { ok: true, status: response.status, capabilities };
 }
 
+function transportError(error) {
+  return error?.code === "timeout"
+    ? responseError("timeout", "The backend request timed out.")
+    : responseError("offline", "The backend could not be reached.");
+}
+
 async function configureAuth(message) {
   let backendUrl;
   try {
@@ -309,14 +339,19 @@ async function configureAuth(message) {
   if (!OPERATOR_KEY_PATTERN.test(operatorKey)) {
     return responseError("invalid_key", "Enter the complete operator key.");
   }
-  const checked = await fetchCapabilities(backendUrl, operatorKey).catch(() =>
-    responseError("offline", "The backend could not be reached."));
+  const checked = await fetchCapabilities(backendUrl, operatorKey).catch(transportError);
   if (!checked.ok) return checked;
 
   const previousAuth = await readTrustedAuth();
   const previousSync = await readSync(["backendUrl", "model", "keepStems"]);
   const nextSync = { backendUrl };
-  if (Array.isArray(message.keepStems)) nextSync.keepStems = message.keepStems.slice(0, 4);
+  if (message.keepStems !== undefined) {
+    try {
+      nextSync.keepStems = normalizeKeepStems(message.keepStems);
+    } catch (error) {
+      return responseError("invalid_stems", error.message);
+    }
+  }
   if (typeof message.model === "string" && message.model.length <= 80) nextSync.model = message.model;
   const generation = globalThis.crypto?.randomUUID?.() ||
     `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
@@ -361,6 +396,15 @@ function boundedText(value, max, name) {
   return value.trim();
 }
 
+function normalizeKeepStems(value) {
+  if (value === null || value === undefined) return null;
+  if (!Array.isArray(value) || value.length > 4 || value.some((stem) => !STEMS.has(stem))) {
+    throw new Error("keep_stems is invalid");
+  }
+  const unique = [...new Set(value)];
+  return unique.length ? unique : null;
+}
+
 function safeJobId(value) {
   const id = boundedText(value, 16, "job id").toLowerCase();
   if (!ID_RE.test(id)) throw new Error("job id is invalid");
@@ -386,8 +430,8 @@ function validateOperation(operation, input) {
       const result = { url: boundedText(input.url, 4096, "source URL"), client_id: undefined };
       if (input.model !== undefined && input.model !== null) result.model = boundedText(input.model, 80, "model");
       if (input.keep_stems !== undefined && input.keep_stems !== null) {
-        if (!Array.isArray(input.keep_stems) || !input.keep_stems.length || input.keep_stems.length > 4 || input.keep_stems.some((stem) => !STEMS.has(stem))) throw new Error("keep_stems is invalid");
-        result.keep_stems = [...input.keep_stems];
+        const keepStems = normalizeKeepStems(input.keep_stems);
+        if (keepStems) result.keep_stems = keepStems;
       }
       if (input.client_id !== undefined && input.client_id !== null) result.client_id = safeClientId(input.client_id);
       if (result.client_id === undefined) delete result.client_id;
@@ -476,8 +520,8 @@ async function backendRequest(operation, input) {
       body: request.body,
       cache: "no-store",
     }, REQUEST_TIMEOUTS_MS[operation] || 10_000);
-  } catch {
-    return responseError("offline", "The backend could not be reached.");
+  } catch (error) {
+    return transportError(error);
   }
   if (!response.ok) {
     let body = null;
@@ -499,9 +543,9 @@ async function backendRequest(operation, input) {
   let dataBody = null;
   try { dataBody = await response.json(); } catch { return responseError("backend_error", "The backend returned invalid JSON.", response.status); }
   if (operation === "process" && dataBody?.job_id) {
-    rememberBackendRoute(jobBackendRoutes, dataBody.job_id, auth);
+    await rememberBackendRoute(jobBackendRoutes, dataBody.job_id, auth);
   } else if (operation === "export-submit" && dataBody?.export_id) {
-    rememberBackendRoute(exportBackendRoutes, dataBody.export_id, auth);
+    await rememberBackendRoute(exportBackendRoutes, dataBody.export_id, auth);
   }
   return { ok: true, status: response.status, data: dataBody };
 }
@@ -523,7 +567,7 @@ chrome.downloads.onChanged?.addListener((delta) => {
     const state = delta.state?.current;
     if (state === "complete") {
       activeDownloads.delete(delta.id);
-      rememberActiveDownloads();
+      await rememberActiveDownloads();
       if (entry.tabId != null) {
         chrome.tabs?.sendMessage?.(entry.tabId, {
           type: "download-export-complete",
@@ -532,7 +576,7 @@ chrome.downloads.onChanged?.addListener((delta) => {
       }
     } else if (state === "interrupted") {
       activeDownloads.delete(delta.id);
-      rememberActiveDownloads();
+      await rememberActiveDownloads();
       if (entry.exportId && entry.clientId) {
         backendRequest("export-cancel", {
           exportId: entry.exportId,
@@ -586,8 +630,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.storage.local.remove(AUTH_CONFIG_STORAGE_KEY),
       chrome.storage.local.remove(LEGACY_AUTH_STORAGE_KEY),
     ])
+      .then(() => clearBackendRoutes())
       .then(() => {
-        clearBackendRoutes();
         sendResponse({ ok: true });
       })
       .catch(() => sendResponse(responseError("storage_error", "Could not clear the operator key.")));
@@ -600,8 +644,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return false;
     }
     const patch = {};
-    if (typeof msg.model === "string" || msg.model === null) patch.model = msg.model;
-    if (Array.isArray(msg.keepStems)) patch.keepStems = msg.keepStems.slice(0, 4);
+    try {
+      if (typeof msg.model === "string") patch.model = boundedText(msg.model, 80, "model");
+      else if (msg.model === null) patch.model = null;
+      if (Object.hasOwn(msg, "keepStems")) patch.keepStems = normalizeKeepStems(msg.keepStems);
+    } catch (error) {
+      sendResponse(responseError("invalid_preferences", error.message));
+      return false;
+    }
     chrome.storage.sync.set(patch)
       .then(() => sendResponse({ ok: true }))
       .catch(() => sendResponse(responseError("storage_error", "Could not save preferences.")));
@@ -617,8 +667,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         sendResponse(await fetchCapabilities(auth.backendUrl, auth.operatorKey));
-      } catch {
-        sendResponse(responseError("offline", "The backend could not be reached."));
+      } catch (error) {
+        sendResponse(transportError(error));
       }
     })();
     return true;
@@ -638,8 +688,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           ...(result.status === undefined ? {} : { status: result.status }),
           ...(result.code === undefined ? {} : { code: result.code }),
         });
-      } catch {
-        sendResponse(responseError("offline", "The backend could not be reached."));
+      } catch (error) {
+        sendResponse(transportError(error));
       }
     })();
     return true;
@@ -698,8 +748,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 exportId,
                 clientId,
               });
-              rememberActiveDownloads();
-              sendResponse({ ok: true, downloadId });
+              rememberActiveDownloads().then(() => sendResponse({ ok: true, downloadId }));
             }
           },
         );

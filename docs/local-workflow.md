@@ -10,9 +10,12 @@ private, restricted and live videos are outside the initial supported scope.
 Start `backend/.venv/bin/nomusic serve` in the project folder. In another terminal:
 
 ```sh
-curl --include http://127.0.0.1:8723/readyz
+curl --include \
+  -H "Authorization: Bearer <operator-key>" \
+  http://127.0.0.1:8723/readyz
 ```
 
+Replace `<operator-key>` with the key printed by `nomusic auth generate`.
 HTTP **200** with `"state":"ready"` means startup checks and default-model loading
 passed. HTTP **503** with `starting` or `warming` means wait and retry. A `failed`
 state needs its logged cause fixed and the helper restarted. Readiness does not
@@ -22,7 +25,7 @@ check YouTube availability or perform inference on each request. The extension's
 ## Playback and settings
 
 Click nomusic on the video and wait for processed playback. The extension keeps
-one bounded client lease alive separately from the status stream. Try pause/resume
+one bounded client lease alive separately from status polling. Try pause/resume
 and
 a backward/forward seek, allowing processing to catch up. CPU processing may be
 slower than playback. The toolbar popup saves settings automatically:
@@ -42,12 +45,11 @@ recovery panel offers **Retry** (which preserves the current volume and
 play/pause intent) and **Return to original** (which explicitly restores the
 native track).
 
-Pausing normally closes the SSE stream and stops the heartbeat, but retains the
-job for the configured client lease plus the idle timeout (30 + 10 seconds by
-default). Playing again
-re-acquires the same job and resumes from its valid cached chunks. Disabling or
-closing the session sends a client-scoped release; another tab or extension
-session holding a lease keeps the worker running.
+Pausing normally stops status polling and the heartbeat, but retains the job
+for the configured client lease plus the idle timeout (30 + 10 seconds by
+default). Playing again re-acquires the same job and resumes from its valid
+cached chunks. Disabling or closing the session sends a client-scoped release;
+another tab or extension session holding a lease keeps the worker running.
 
 ## Exports and cache
 
@@ -65,9 +67,16 @@ fails before a download starts. Check saved files have their full expected
 duration; resolution also depends on the source's available formats.
 
 Completed work is cached for reuse, with seven-day default retention. Finish
-playback and exports before clearing it: open the popup, click **Clear**, then
-**Confirm**. Active processing and downloads hold leases, so a clear skips those
-namespaces until their current writer/reader releases them. The helper keeps a
+playback and exports before clearing it, then use the local CLI:
+
+```sh
+backend/.venv/bin/nomusic cache stats
+backend/.venv/bin/nomusic cache clear
+```
+
+Stop the helper before a full clear. Active processing and downloads hold
+leases, so a clear skips those namespaces until their current writer/reader
+releases them. The helper keeps a
 4 GiB processed-media budget and requires 256 MiB of free space for a new
 export reservation; tighten these with the `NOMUSIC_MAX_*` settings when disk
 space is smaller. Model weights and files already saved to Downloads are
@@ -83,8 +92,8 @@ artifacts survive a normal restart; an interrupted queued/building export is
 reconciled and can simply be requested again after startup.
 
 Start the helper again, check readiness, and toggle nomusic off/on for the
-video. Reopen the popup or reload the page if needed. The extension retries a
-lost status connection and re-submits the same job with bounded backoff. If it
+video. Reopen the popup or reload the page if needed. The extension retries
+lost status polling and re-submits the same job with bounded backoff. If it
 reaches the terminal recovery panel, use Retry after the helper is healthy;
 completed audio can be reused.
 
@@ -95,7 +104,7 @@ completed audio can be reused.
 | Installation or doctor fails | Follow the displayed remedy; see [installation](installation.md). |
 | Readiness remains failed | Inspect the helper log, fix the cause and restart. |
 | CUDA runs out of memory | Stop the helper and retry with `NOMUSIC_GPU_BATCH=1`. Keep `NOMUSIC_DEVICE=cuda` to require GPU execution; see [NVIDIA profile and device selection](installation.md#platforms-and-profiles). |
-| Popup works but video says “backend unreachable” | Allow the site's **Local network access** permission in Chrome site settings, then reload. |
+| Popup works but video says “backend unreachable” | Confirm the backend URL and trusted operator key in the popup, restart the backend if needed, then reload the extension and video tab. |
 | YouTube returns HTTP 429 or human verification | Acquisition is blocked independently of local readiness, even if browser playback works. Retry later or on a network where downloads are available. |
 | Music remains or effects disappear | Adjust retained stems; results depend on the recording. |
 | Playback stalls or drifts | Mute the site/browser, toggle nomusic off/on, and retry; long-session recovery still has limitations. |

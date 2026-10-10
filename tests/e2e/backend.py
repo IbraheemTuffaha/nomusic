@@ -1,7 +1,8 @@
 """Run the installed CPU backend with one test-only acquisition adapter.
 
 Only the exact fixture URL receives generated local media; all other URLs are
-rejected before acquisition. Processing, Demucs, chunk encoding, SSE, exports,
+rejected before acquisition. Processing, Demucs, chunk encoding, authenticated
+status polling, exports,
 readiness, and shutdown remain real. This is not a deployment entry point and
 does not validate YouTube acquisition. Prefetch the pinned model before use.
 

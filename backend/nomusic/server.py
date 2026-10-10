@@ -15,15 +15,13 @@ The endpoints live in :mod:`nomusic.routes` (system / jobs / media):
   POST /process/{job_id}/interest {client_id, lease_seconds?} -> lease
   DELETE /process/{job_id}/interest?client_id=... -> release that client lease
   GET  /status/{job_id}      -> JobStatus
-  GET  /events/{job_id}      -> text/event-stream (SSE status updates)
+  GET  /events/{job_id}      -> text/event-stream (legacy authenticated status updates)
   GET  /chunk/{job_id}/{idx} -> audio/ogg (425 if not yet ready)
   GET  /audio/{job_id}       -> audio/ogg (concatenated track)
   POST /exports              -> asynchronous export preparation
   GET  /exports/{export_id}  -> export status
   DELETE /exports/{export_id} -> cancel an export
   GET  /exports/{export_id}/download -> prepared artifact
-  GET  /cache                -> cache stats
-  POST /cache/clear          -> {deleted_bytes}
 """
 
 from __future__ import annotations
