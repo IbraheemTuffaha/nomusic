@@ -31,6 +31,9 @@ def test_generate_stores_only_a_digest_and_owner_only_file(tmp_path):
     if os.name == "posix":
         assert path.stat().st_mode & 0o077 == 0
         assert path.parent.stat().st_mode & 0o077 == 0
+        lock_path = path.with_name(f".{path.name}.lock")
+        assert lock_path.exists()
+        assert lock_path.stat().st_mode & 0o077 == 0
 
 
 def test_authentication_observes_revoke_without_restart(tmp_path):

@@ -22,10 +22,16 @@ import re
 import secrets
 import tempfile
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:  # pragma: no cover - the supported platforms are POSIX
+    import fcntl
+except ImportError:  # pragma: no cover - keep imports usable on Windows
+    fcntl = None
 
 
 KEY_PREFIX = "nm_"
@@ -207,6 +213,40 @@ class AuthStore:
                 pass
             raise
 
+    @contextmanager
+    def _process_lock(self):
+        """Serialize key-file mutations across CLI/server processes.
+
+        The in-process lock protects threads, while this advisory lock protects
+        separate ``nomusic auth`` invocations from overwriting each other's
+        read-modify-write cycle.  The lock file is deliberately separate from
+        the JSON file so atomic replacement of the latter cannot drop the lock.
+        """
+        if fcntl is None:
+            yield
+            return
+
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if os.name == "posix":
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "a+", encoding="utf-8") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except BaseException:
+            # ``fdopen`` owns the descriptor after entering its context.  If
+            # opening it failed, close the raw descriptor here.
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+
     @staticmethod
     def _info(entry: dict[str, Any]) -> KeyInfo:
         return KeyInfo(
@@ -234,7 +274,7 @@ class AuthStore:
 
     def generate(self, label: str | None = None) -> tuple[str, KeyInfo]:
         label = _label(label)
-        with self._lock:
+        with self._lock, self._process_lock():
             data = self._read(allow_missing=True)
             raw = KEY_PREFIX + secrets.token_hex(KEY_BYTES)
             entry = {
@@ -251,7 +291,7 @@ class AuthStore:
     def revoke(self, key_id: str) -> KeyInfo:
         if not _KEY_ID_RE.fullmatch(str(key_id)):
             raise KeyNotFound("unknown operator key id")
-        with self._lock:
+        with self._lock, self._process_lock():
             data = self._read()
             for entry in data["keys"]:
                 if entry["id"] == key_id:
@@ -267,7 +307,7 @@ class AuthStore:
         label = _label(label)
         if revoke_id is not None and not _KEY_ID_RE.fullmatch(str(revoke_id)):
             raise KeyNotFound("unknown operator key id")
-        with self._lock:
+        with self._lock, self._process_lock():
             data = self._read()
             if revoke_id is not None and not any(
                 entry["id"] == revoke_id for entry in data["keys"]
