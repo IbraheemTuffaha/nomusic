@@ -14,6 +14,19 @@ export class BackendError extends Error {
   }
 }
 
+export function explainBackendError(error, fallback = "Backend request failed") {
+  switch (error?.code) {
+    case "revoked": return "Operator key revoked. Update the key in nomusic settings.";
+    case "unauthorized": return "Operator key rejected. Check the key in nomusic settings.";
+    case "not_configured": return "Configure an operator key in nomusic settings.";
+    case "offline":
+    case "timeout": return "Backend unavailable. Start it and retry.";
+    case "busy": return "Backend is busy. Retry in a moment.";
+    case "backend_not_ready": return "Backend is not ready. Run nomusic doctor and retry.";
+    default: return fallback;
+  }
+}
+
 function throwResponseError(response, body) {
   const detail = body?.detail;
   const code = typeof detail === "object" ? detail.code : undefined;
