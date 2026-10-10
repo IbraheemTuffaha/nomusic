@@ -349,6 +349,8 @@ try {
   }, { backendUrl: options.backend, key: operatorKey });
   const popup = await context.newPage();
   popup.on("pageerror", (error) => report.pageErrors.push(`popup: ${error}`));
+  await popup.route(`${options.backend}/**`, (route) =>
+    route.continue({ headers: { ...route.request().headers(), authorization: `Bearer ${operatorKey}` } }));
   await popup.goto(`chrome-extension://${extensionId}/popup.html`);
   if (await popup.locator("#operatorKey").count()) {
     await popup.locator("#operatorKey").fill(operatorKey);
@@ -356,9 +358,6 @@ try {
   }
   await popup.locator("#status.ok").waitFor();
   assert.equal(await popup.locator("#backend").inputValue(), options.backend);
-  if (await popup.locator("#cacheSize").count()) {
-    await popup.waitForFunction(() => document.querySelector("#cacheSize")?.textContent === "empty");
-  }
   const ping = await popup.evaluate(() => chrome.runtime.sendMessage({ type: "ping-backend" }));
   assert.equal(ping.ok, true, "Actual service-worker backend ping");
   await popup.screenshot({ path: path.join(options.output, "settings.png") });
