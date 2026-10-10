@@ -38,6 +38,18 @@ class Settings:
     host: str = field(default_factory=lambda: _env("HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: _env_int("PORT", 8723))
 
+    # Operator-issued credentials protect every processing/media operation.
+    # The file is deliberately outside the repository and is never read by
+    # the browser extension's page-facing contexts.
+    auth_file: Path = field(
+        default_factory=lambda: Path(
+            _env(
+                "AUTH_FILE",
+                str(Path.home() / ".config" / "nomusic" / "operator-keys.json"),
+            )
+        ).expanduser()
+    )
+
     # One total process-level grace period for active jobs and HTTP responses.
     # Warmup alone is disposable; it never consumes this grace period.
     shutdown_grace_seconds: float = field(

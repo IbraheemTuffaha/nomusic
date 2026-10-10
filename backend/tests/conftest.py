@@ -24,6 +24,13 @@ os.environ.setdefault("NOMUSIC_CACHE_SWEEP_INTERVAL_SECONDS", "0")
 os.environ.setdefault("NOMUSIC_MEMORY_GC_INTERVAL_SECONDS", "0")
 os.environ.setdefault("NOMUSIC_INTEREST_SWEEP_INTERVAL_SECONDS", "0")
 os.environ.setdefault("NOMUSIC_IDLE_TIMEOUT_SECONDS", "0")
+@pytest.fixture(autouse=True)
+def isolate_legacy_route_fixtures(monkeypatch):
+    # Tests may inject a deliberately anonymous store. There is no production
+    # environment switch or automatic keyless fallback.
+    from nomusic import server
+    from nomusic.auth import AuthStore
+    monkeypatch.setattr(server, "AuthStore", lambda path: AuthStore(path, required=False))
 
 
 def _check_installed_imports() -> None:

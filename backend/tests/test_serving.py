@@ -304,7 +304,8 @@ class Engine:
 server.SETTINGS = replace(server.SETTINGS, cache_dir=ROOT / "cache",
                           cache_ttl_days=0, memory_gc_interval_seconds=0)
 server.get_engine = lambda _: Engine()
-app = server.create_app()
+from nomusic.auth import AuthStore
+app = server.create_app(auth_store=AuthStore(ROOT / 'fixture-keys', required=False))
 
 @app.get("/pid")
 def pid():
