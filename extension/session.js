@@ -6,6 +6,7 @@ import { MuteController } from "./mute-controller.js";
 import { AudioScheduler } from "./audio-scheduler.js";
 import { ChunkLoader } from "./chunk-loader.js";
 import { PlaybackIntent } from "./playback-intent.js";
+import { backendRequest, explainBackendError } from "./backend-client.js";
 
 // The source metadata can round down by almost one processing chunk while the
 // native player reports the container's full duration. Keep the host muted
@@ -85,13 +86,16 @@ export class Session {
     this._starting = null;
     this._reconnectTimer = null;
     this._streamTimer = null;
+    this._statusPollTimer = null;
+    this._statusPollInFlight = null;
+    this._statusPollFailures = 0;
     this._reconnectAttempts = 0;
     // Web Audio graph + chunk scheduling + sync monitor (created in start()).
     this.scheduler = null;
     // Owns host-video muting + volume mirroring; created in start().
     this.muteController = null;
     this.jobId = null;
-    // One session owns one interest lease. It survives an SSE reconnect and
+    // One session owns one interest lease. It survives a status reconnect and
     // the ordinary pause retention window, so transport changes never cancel
     // another tab's work.
     this.clientId = newClientId();
@@ -115,18 +119,17 @@ export class Session {
     this.chunks = new Map();
     this.failed = false;
     this.loader = this._createLoader();
-    // SSE stream of backend status (replaces /status polling). Opened in
-    // start(); closed in dispose() and when a terminal state arrives.
+    // Status transport is short polling in production. The eventSource field
+    // exists only for the explicit legacy-SSE test adapter.
     this.eventSource = null;
-    // True when we closed the stream because the user paused (not a buffer
-    // pause). While closed, the backend sees no subscriber and starts its
-    // idle-abandon clock; we re-establish the worker + stream on play.
+    // True when we closed status transport because the user paused (not a
+    // buffer pause). We re-establish the worker + polling on play.
     this._streamPausedClosed = false;
     this.bufferTimer = null;
     this.disposed = false;
-    // Flipped true once the SSE stream ends (state == ready/error, or the
-    // server closed it). Tells _resumeAfterBuffer that no future status
-    // event will repaint the label, so it has to restore "nomusic on".
+    // Flipped true once status transport ends (state == ready/error, or the
+    // server closes it). Tells _resumeAfterBuffer that no future status
+    // update will repaint the label, so it has to restore "nomusic on".
     this._streamEnded = false;
     this._statusState = null;
     // Debounce timer for the /prioritize POST on seek so scrubbing a
@@ -169,6 +172,10 @@ export class Session {
       getTime: () => this.video.currentTime,
       getStride: () => this.chunkSeconds - this.chunkOverlapSeconds,
       getTotalChunks: () => this.totalChunks,
+      getChunk: (idx, signal) => backendRequest("chunk", {
+        jobId: this.jobId,
+        chunkIndex: idx,
+      }, { signal, timeoutMs: 15_000, backendUrl: this.config.backendUrl }),
       getChunkUrl: (idx) => `${this.config.backendUrl}/chunk/${this.jobId}/${idx}`,
       decode: (encoded) => this.scheduler.decode(encoded),
       onChunk: (idx, entry) => this._chunkArrived(idx, entry),
@@ -195,7 +202,7 @@ export class Session {
     } catch (err) {
       if (!signal.aborted && !this.disposed) {
         dlog("playback setup failed", err?.name || err);
-        this.fail("Could not start playback. Check the backend and site permissions.");
+        this.fail(explainBackendError(err, "Could not start playback. Check the backend and site permissions."));
       }
     } finally {
       if (this._starting === attempt) this._starting = null;
@@ -238,25 +245,6 @@ export class Session {
     this.startBufferMonitor();
   }
 
-  async _fetchJSON(path, options, timeoutMs) {
-    const parent = this._requests.signal;
-    const controller = new AbortController();
-    const abort = () => controller.abort();
-    parent.addEventListener("abort", abort, { once: true });
-    if (parent.aborted) abort();
-    const timer = setTimeout(abort, timeoutMs);
-    try {
-      const response = await fetch(`${this.config.backendUrl}${path}`, {
-        ...options, signal: controller.signal,
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return await response.json();
-    } finally {
-      clearTimeout(timer);
-      parent.removeEventListener("abort", abort);
-    }
-  }
-
   requestJob() {
     const body = {
       url: this.sourceUrl || window.location.href,
@@ -264,14 +252,19 @@ export class Session {
     };
     if (this.config.model) body.model = this.config.model;
     if (this.config.keepStems) body.keep_stems = this.config.keepStems;
-    return this._fetchJSON("/process", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }, 30_000);
+    return backendRequest("process", body, {
+      signal: this._requests.signal,
+      timeoutMs: 30_000,
+      backendUrl: this.config.backendUrl,
+    });
   }
 
   fetchCapabilities() {
-    return this._fetchJSON("/capabilities", {}, 5_000);
+    return backendRequest("capabilities", {}, {
+      signal: this._requests.signal,
+      timeoutMs: 5_000,
+      backendUrl: this.config.backendUrl,
+    });
   }
 
   async _loadCapabilities(signal = this._requests.signal) {
@@ -292,6 +285,9 @@ export class Session {
   _closeEventStream() {
     clearTimeout(this._streamTimer);
     this._streamTimer = null;
+    clearTimeout(this._statusPollTimer);
+    this._statusPollTimer = null;
+    this._statusPollInFlight = null;
     this.eventSource?.close();
     this.eventSource = null;
   }
@@ -329,26 +325,22 @@ export class Session {
   async _renewInterest() {
     if (!this._interestSupported || !this.jobId || this.disposed) return;
     try {
-      const response = await fetch(
-        `${this.config.backendUrl}/process/${this.jobId}/interest`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ client_id: this.clientId }),
-          signal: this._requests.signal,
-        },
-      );
-      if (response.status === 404) {
+      await backendRequest("interest-renew", {
+        jobId: this.jobId,
+        clientId: this.clientId,
+      }, {
+        signal: this._requests.signal,
+        timeoutMs: 5_000,
+        backendUrl: this.config.backendUrl,
+      });
+    } catch (error) {
+      if (error?.status === 404) {
         // A restarted helper may have lost in-memory interest. The next
         // bounded /process reconnect will reacquire it from cached progress.
         this._interestSupported = false;
         this._stopInterestHeartbeat();
-      } else if (!response.ok) {
-        dlog("interest heartbeat failed", response.status);
-      }
-    } catch (err) {
-      if (!this._requests.signal.aborted && !this.disposed) {
-        dlog("interest heartbeat failed", err?.name || err);
+      } else if (!this._requests.signal.aborted && !this.disposed) {
+        dlog("interest heartbeat failed", error?.code || error?.name || error);
       }
     }
   }
@@ -358,16 +350,84 @@ export class Session {
     // Do not use the session abort signal: dispose() aborts all work before
     // this best-effort release is sent. ``keepalive`` lets tab retirement
     // finish the small request while the page is being torn down.
-    const query = new URLSearchParams({ client_id: this.clientId });
-    fetch(`${this.config.backendUrl}/process/${jobId}/interest?${query}`, {
-      method: "DELETE",
-      keepalive: true,
-    }).catch((err) => dlog("interest release failed", err?.name || err));
+    backendRequest("interest-release", {
+      jobId,
+      clientId: this.clientId,
+    }, { timeoutMs: 5_000, backendUrl: this.config.backendUrl })
+      .catch((err) => dlog("interest release failed", err?.name || err));
   }
 
-  /** Own reconnection so CONNECTING and CLOSED failures both have a budget.
-   *  Re-POST before reopening: a restarted backend may need to respawn work. */
+  /** Own reconnection so transport failures have a bounded recovery budget.
+   * Re-POST before polling again: a restarted backend may need to respawn work. */
   _openEventStream() {
+    if (globalThis.__nomusicLegacySseTests) {
+      this._openLegacyEventStream();
+      return;
+    }
+    this._closeEventStream();
+    this._statusPollFailures = 0;
+    this._pollStatus();
+  }
+
+  async _pollStatus() {
+    if (this.disposed || this.failed || this._streamEnded || this._streamPausedClosed) return;
+    if (this._statusPollInFlight) return;
+    const attempt = {};
+    this._statusPollInFlight = attempt;
+    try {
+      const status = await backendRequest("status", { jobId: this.jobId }, {
+        signal: this._requests.signal,
+        timeoutMs: 5_000,
+        backendUrl: this.config.backendUrl,
+      });
+      if (this._statusPollInFlight !== attempt || this.disposed || this.failed) return;
+      this._statusPollFailures = 0;
+      this._reconnectAttempts = 0;
+      this.handleStatus(status);
+      if (!this._streamEnded && !this._streamPausedClosed && !this.disposed && !this.failed) {
+        this._statusPollTimer = setTimeout(() => {
+          this._statusPollTimer = null;
+          this._pollStatus();
+        }, 500);
+      }
+    } catch (error) {
+      if (this._statusPollInFlight !== attempt || this.disposed || this.failed || this._streamPausedClosed) return;
+      if (error?.status === 401 || error?.code === "unauthorized" || error?.code === "revoked") {
+        this.fail(error.code === "revoked" ? "Operator key revoked. Update the extension key." : "Operator key rejected. Check extension settings.");
+        return;
+      }
+      if (error?.code === "auth_not_configured") {
+        this.fail("Backend authentication is not configured. Run nomusic auth generate, then reconnect.");
+        return;
+      }
+      if (error?.status === 404) {
+        this._recoverStream();
+        return;
+      }
+      if (error?.code === "offline" || error?.code === "timeout" ||
+          (Number.isInteger(error?.status) && error.status >= 500)) {
+        // A transport failure can mean the helper restarted between polls.
+        // Re-submit the captured job before reopening status so the backend
+        // can respawn work and restore the same job identity where possible.
+        this._recoverStream();
+        return;
+      }
+      this._statusPollFailures++;
+      if (this._statusPollFailures >= 3) {
+        this.fail("Connection lost. Check the backend and retry.");
+        return;
+      }
+      const delay = 500 * 2 ** (this._statusPollFailures - 1);
+      this._statusPollTimer = setTimeout(() => {
+        this._statusPollTimer = null;
+        this._pollStatus();
+      }, delay);
+    } finally {
+      if (this._statusPollInFlight === attempt) this._statusPollInFlight = null;
+    }
+  }
+
+  _openLegacyEventStream() {
     if (this.disposed || this.failed) return;
     this._closeEventStream();
     let stream;
@@ -450,7 +510,7 @@ export class Session {
    *  even if the user had already paused (which would normally let it idle). */
   ensureLiveForDownload() {
     if (this.disposed || this._streamEnded) return;
-    if (!this.eventSource) {
+    if (!this.eventSource && !this._statusPollInFlight && !this._statusPollTimer) {
       this._streamPausedClosed = false;
       if (!this._starting) this._resumeProcessing(); // Startup will open its own stream.
     }
@@ -506,7 +566,13 @@ export class Session {
     try {
       info = await this.requestJob();
     } catch (err) {
-      if (!signal.aborted) this._recoverStream();
+      if (!signal.aborted) {
+        if (err?.status === 401 || err?.code === "unauthorized" || err?.code === "revoked") {
+          this.fail(explainBackendError(err));
+        } else {
+          this._recoverStream();
+        }
+      }
       return;
     }
     if (signal.aborted || this.disposed || this.failed) return;
@@ -668,14 +734,16 @@ export class Session {
       if (final < 0) return;
       const fromChunk = Math.min(final, this._chunkIdxForTime(this.video.currentTime));
       dlog("prioritize POST", { fromChunk, currentTime: this.video.currentTime });
-      fetch(`${this.config.backendUrl}/process/${this.jobId}/prioritize`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ from_chunk: fromChunk }),
+      backendRequest("prioritize", {
+        jobId: this.jobId,
+        fromChunk,
+      }, {
         signal: this._requests.signal,
+        timeoutMs: 5_000,
+        backendUrl: this.config.backendUrl,
       })
-        .then((r) => dlog("prioritize response", r.status))
-        .catch((err) => dlog("prioritize POST failed", err));
+        .then(() => dlog("prioritize response", "ok"))
+        .catch((err) => dlog("prioritize request failed", err));
     }, 250);
   }
 

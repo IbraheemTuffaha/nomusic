@@ -7,7 +7,7 @@ export preparation lives in :mod:`nomusic.exports` and its dedicated routes.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 
 from nomusic.pipeline.cache import CHUNK_MEDIA_TYPE
@@ -15,6 +15,7 @@ from nomusic.pipeline.export import (
     complete_manifest,
     snapshot_chunk_files,
 )
+from nomusic.security import require_operator
 from .responses import LeasedFileResponse, LeasedStreamingResponse
 
 router = APIRouter()
@@ -24,7 +25,9 @@ _STREAM_BLOCK_BYTES = 65536
 
 
 @router.get("/chunk/{job_id}/{chunk_idx}")
-def chunk(job_id: str, chunk_idx: int, request: Request) -> FileResponse:
+def chunk(
+    job_id: str, chunk_idx: int, request: Request, _operator=Depends(require_operator)
+) -> FileResponse:
     cache = request.app.state.cache
     meta = cache.load_meta(job_id)
     if meta is None:
@@ -56,12 +59,15 @@ def chunk(job_id: str, chunk_idx: int, request: Request) -> FileResponse:
         str(path),
         lease,
         media_type=CHUNK_MEDIA_TYPE,
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={
+            "Cache-Control": "private, no-store",
+            "Vary": "Authorization",
+        },
     )
 
 
 @router.get("/audio/{job_id}")
-def audio(job_id: str, request: Request) -> Response:
+def audio(job_id: str, request: Request, _operator=Depends(require_operator)) -> Response:
     """On-demand concatenation of every chunk into a single track.
 
     We no longer keep a precomputed full file on disk (cut storage in
@@ -105,7 +111,10 @@ def audio(job_id: str, request: Request) -> Response:
                     yield block
 
     total = sum(size for _, size in chunk_files)
-    headers = {"Cache-Control": "public, max-age=86400"}
+    headers = {
+        "Cache-Control": "private, no-store",
+        "Vary": "Authorization",
+    }
     if total:
         headers["Content-Length"] = str(total)
     return LeasedStreamingResponse(

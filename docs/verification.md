@@ -98,7 +98,10 @@ lives outside the installed application and is never a deployment launcher.
 
 The scenario checks:
 
-- Actual extension settings, service-worker communication and page bridge.
+- Actual extension settings, trusted operator-key setup, service-worker
+  communication and page bridge.
+- Authenticated worker operations for processing, status polling, chunks and
+  export preparation; the key is never placed in a request URL.
 - Ready CPU backend, a fresh processing job, real inference, encoded chunks
   and extension retrieval of those chunks.
 - Nonzero processed Web Audio while video advances, backward/forward seeks,

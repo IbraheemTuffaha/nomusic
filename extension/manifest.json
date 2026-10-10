@@ -5,11 +5,16 @@
   "description": "Strip music from videos on YouTube, Facebook, and the rest of the web using a local source-separation backend.",
   "permissions": ["storage", "activeTab", "downloads"],
   "host_permissions": [
-    "http://127.0.0.1:8723/*",
-    "http://localhost:8723/*"
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "http://[::1]/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "content_scripts": [
     {
@@ -49,6 +54,8 @@
         "icons/button.png",
         "main.js",
         "settings.js",
+        "config.js",
+        "backend-client.js",
         "session.js",
         "chunk-loader.js",
         "button.js",

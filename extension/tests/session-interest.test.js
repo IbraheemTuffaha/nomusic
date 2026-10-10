@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 
 import { Session } from "../session.js";
 
+globalThis.__nomusicTestDirectBackend = true;
+
 class Media extends EventTarget {
   constructor() {
     super();

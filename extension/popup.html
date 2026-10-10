@@ -46,7 +46,7 @@
         letter-spacing: 0.06em;
         color: #aab1bd;
       }
-      input[type="url"], select {
+      input[type="url"], input[type="password"], select {
         width: 100%;
         box-sizing: border-box;
         padding: 6px 8px;
@@ -105,27 +105,10 @@
       button.danger:hover { background: #4a2840; }
       .hint { color: #8a92a0; font-size: 11px; margin-top: 8px; }
       .err { color: #ff9a9a; font-size: 12px; margin-top: 6px; }
-      .cache-row {
-        margin-top: 12px;
-        padding: 8px 10px;
-        background: #161a22;
-        border: 1px solid #252b36;
-        border-radius: 6px;
-        font-size: 12px;
-        color: #aab1bd;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-      }
-      .cache-row strong { color: #f3f4f7; font-weight: 600; }
-      .cache-row__info { display: flex; flex-direction: column; gap: 2px; }
-      .cache-row__info .hint { margin: 0; }
-      button.danger.armed {
-        background: #6e1e2e;
-        border-color: #ff7575;
-        color: #ffe6e6;
-      }
+      .setup-row { display: flex; gap: 6px; align-items: stretch; }
+      .setup-row input { flex: 1; min-width: 0; }
+      .setup-row button { white-space: nowrap; }
+      .auth-help { margin-top: 5px; }
       button:disabled {
         opacity: 0.5;
         cursor: not-allowed;
@@ -139,26 +122,26 @@
     <label class="field-label" for="backend">Backend URL</label>
     <input id="backend" type="url" value="http://127.0.0.1:8723" />
 
+    <label class="field-label" for="operatorKey">Operator key</label>
+    <div class="setup-row">
+      <input id="operatorKey" type="password" autocomplete="off" spellcheck="false" placeholder="nm_…" />
+      <button id="saveAuth" type="button">Connect</button>
+    </div>
+    <div class="hint auth-help">Create one with <code>nomusic auth generate</code>. The key stays in trusted extension storage.</div>
+
     <label class="field-label" for="model">Model</label>
     <select id="model"></select>
 
     <span class="field-label">Keep stems</span>
     <div id="stems"></div>
 
-    <div class="cache-row" id="cacheRow">
-      <div class="cache-row__info">
-        <div>Cache: <strong id="cacheSize">—</strong></div>
-        <div class="hint" id="cacheTtl"></div>
-      </div>
-      <button id="clearCache" class="danger" type="button">Clear</button>
-    </div>
-
     <div class="footer">
       <span class="hint" id="device"></span>
       <span class="hint" id="saved"></span>
+      <button id="clearAuth" type="button">Forget key</button>
     </div>
     <div class="err" id="err"></div>
 
-    <script src="popup.js"></script>
+    <script type="module" src="popup.js"></script>
   </body>
 </html>

@@ -65,16 +65,52 @@ def validate_public_url(url: str) -> str:
     except ValueError:
         try:
             candidates = [ipaddress.ip_address(socket.inet_aton(host))]
-        except OSError:
+        except (OSError, ValueError):
             try:
                 infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
             except (socket.gaierror, UnicodeError, ValueError) as exc:
                 raise ValueError("url host could not be resolved") from exc
             candidates = [ipaddress.ip_address(info[4][0]) for info in infos]
     for ip in candidates:
-        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_unspecified or ip.is_multicast:
+        if (
+            not ip.is_global
+            or ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_unspecified
+            or ip.is_multicast
+        ):
             raise ValueError("url host is not allowed")
     return str(url).strip()
+
+
+def _validate_media_targets(info: dict[str, Any], _incomplete: bool) -> str | None:
+    """Reject extractor-selected media URLs on private/special hosts.
+
+    The request URL is validated by the route and again immediately before
+    yt-dlp starts. Extractors can still select a separate manifest or media
+    URL, so yt-dlp's pre-download match hook applies the same policy to those
+    delayed destinations.
+    """
+    candidates: list[str] = []
+    for key in ("url", "manifest_url", "fragment_base_url"):
+        value = info.get(key)
+        if isinstance(value, str) and value:
+            candidates.append(value)
+    for fmt in info.get("formats") or ():
+        if not isinstance(fmt, dict):
+            continue
+        for key in ("url", "manifest_url", "fragment_base_url"):
+            value = fmt.get(key)
+            if isinstance(value, str) and value:
+                candidates.append(value)
+    for candidate in candidates:
+        try:
+            validate_public_url(candidate)
+        except ValueError as exc:
+            return str(exc)
+    return None
 
 
 @dataclass(frozen=True)
@@ -154,6 +190,7 @@ def _common_opts() -> dict[str, Any]:
         "no_warnings": True,
         "noplaylist": True,
         "remote_components": [],
+        "match_filter": _validate_media_targets,
     }
 
     runtime = javascript_runtime()
@@ -243,6 +280,7 @@ def validate_metadata(info: VideoMetadata, limits: ResourceLimits | None) -> Vid
 def probe(url: str, *, limits: ResourceLimits | None = None) -> VideoMetadata:
     """Fetch metadata without downloading the media."""
     from yt_dlp import YoutubeDL  # imported lazily; yt-dlp is heavy
+    validate_public_url(url)
 
     opts = {**_common_opts(), "skip_download": True}
     with YoutubeDL(opts) as ydl:
@@ -253,6 +291,8 @@ def probe(url: str, *, limits: ResourceLimits | None = None) -> VideoMetadata:
     # Playlists: take the first entry.
     if "entries" in info and info["entries"]:
         info = info["entries"][0]
+    if reason := _validate_media_targets(info, False):
+        raise ValueError(reason)
 
     return validate_metadata(_metadata_from_info(info, url), limits)
 
@@ -301,8 +341,7 @@ def download_source(
         _emit_finished_progress(progress_hook, existing.stat().st_size)
         return existing
 
-    from yt_dlp import YoutubeDL
-
+    validate_public_url(url)
     opts = (
         _source_download_opts(out_dir)
         if limits is None
@@ -313,6 +352,7 @@ def download_source(
             lambda event: _guard_download_progress(event, progress_hook, limits, "source")
         ]
     log.info("Downloading source audio for %s -> %s", url, out_dir)
+    from yt_dlp import YoutubeDL
     with YoutubeDL(opts) as ydl:
         ydl.download([url])
 
@@ -440,8 +480,7 @@ def download_video(
         _emit_finished_progress(progress_hook, existing.stat().st_size)
         return existing
 
-    from yt_dlp import YoutubeDL
-
+    validate_public_url(url)
     effective_height = max_height
     if limits is not None:
         effective_height = min(
@@ -468,6 +507,7 @@ def download_video(
     if ratelimit:
         opts["ratelimit"] = ratelimit
     log.info("Downloading video for %s -> %s", url, out_dir)
+    from yt_dlp import YoutubeDL
     with YoutubeDL(opts) as ydl:
         ydl.download([url])
 
@@ -608,6 +648,7 @@ class SourceFetcher:
     def extract(self) -> VideoMetadata:
         from yt_dlp import YoutubeDL
 
+        validate_public_url(self.url)
         # Reusing the fetcher starts a new session; do not lose ownership of a
         # previous one or retain metadata from a failed extraction.
         self.close()
@@ -626,6 +667,8 @@ class SourceFetcher:
                 raise RuntimeError(f"yt-dlp returned no metadata for {self.url}")
             if "entries" in info and info["entries"]:
                 info = info["entries"][0]
+            if reason := _validate_media_targets(info, False):
+                raise ValueError(reason)
             duration = info.get("duration")
             if duration is None:
                 raise RuntimeError(
@@ -649,6 +692,7 @@ class SourceFetcher:
                 _emit_finished_progress(progress_hook, self._cached.stat().st_size)
                 return self._cached
 
+            validate_public_url(self.url)
             if self._ydl is None or self._info is None:
                 # extract() wasn't called — just do a clean run.
                 if self.limits is None:

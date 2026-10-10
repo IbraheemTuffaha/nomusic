@@ -6,10 +6,10 @@ registry from ``request.app.state``.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
-from nomusic.config import SETTINGS
+from nomusic.security import require_operator
 
 from . import JsonDict
 
@@ -22,7 +22,7 @@ def healthz() -> dict[str, bool]:
 
 
 @router.get("/readyz")
-def readyz(request: Request) -> JSONResponse:
+def readyz(request: Request, _operator=Depends(require_operator)) -> JSONResponse:
     services = getattr(request.app.state, "services", None)
     status = services.readiness() if services is not None else {"ok": False, "state": "not_started"}
     return JSONResponse(status, status_code=200 if status["ok"] else 503,
@@ -30,8 +30,9 @@ def readyz(request: Request) -> JSONResponse:
 
 
 @router.get("/capabilities")
-def get_capabilities(request: Request) -> JsonDict:
+def get_capabilities(request: Request, _operator=Depends(require_operator)) -> JsonDict:
     engine = request.app.state.engine
+    settings = request.app.state.settings
     caps = engine.capabilities()
     return {
         "server_version": request.app.version,
@@ -43,35 +44,12 @@ def get_capabilities(request: Request) -> JsonDict:
             "supported_stems": list(caps.supported_stems),
         },
         "defaults": {
-            "keep_stems": list(SETTINGS.default_keep_stems),
-            "chunk_seconds": SETTINGS.chunk_seconds,
-            "chunk_overlap_seconds": SETTINGS.chunk_overlap_seconds,
+            "keep_stems": list(settings.default_keep_stems),
+            "chunk_seconds": settings.chunk_seconds,
+            "chunk_overlap_seconds": settings.chunk_overlap_seconds,
         },
         "cache": {
-            "ttl_days": SETTINGS.cache_ttl_days,
-            "keep_source_after_complete": SETTINGS.keep_source_after_complete,
+            "ttl_days": settings.cache_ttl_days,
+            "keep_source_after_complete": settings.keep_source_after_complete,
         },
     }
-
-
-@router.get("/cache")
-def cache_stats(request: Request) -> JsonDict:
-    cache = request.app.state.cache
-    return {"root": str(cache.root), **cache.stats()}
-
-
-@router.post("/cache/clear")
-def cache_clear(request: Request) -> dict[str, int]:
-    # Ask any in-flight workers to abandon at their next chunk boundary
-    # (releases the GPU lock + runs their own cleanup) and drop the
-    # in-memory status map so a freshly cleared cache doesn't surface stale
-    # "ready" status. Doing this before clear_all() means a live worker
-    # unwinds cleanly instead of crashing on a chunk write into a
-    # just-deleted directory.
-    registry = request.app.state.registry
-    exports = request.app.state.exports
-    cache = request.app.state.cache
-    exports.clear_all()
-    registry.abandon_all()
-    freed = cache.clear_all()
-    return {"deleted_bytes": freed}

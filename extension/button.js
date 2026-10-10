@@ -1,6 +1,7 @@
 // Button: the floating pill UI per <video> — status display, menu, MP4
 // download. Creates/disposes a Session on toggle. Split out of content.js.
 import { Session, newClientId } from "./session.js";
+import { backendRequest, explainBackendError } from "./backend-client.js";
 
 // Strip characters that are illegal in filenames across Windows/macOS/Linux
 // (plus control chars), collapse whitespace, and bound the length so a very
@@ -391,7 +392,11 @@ export class Button {
       download.controller.abort();
       if (cancelExport && download.exportId && !download.nativeStarted && !download.cancelSent) {
         download.cancelSent = true;
-        fetch(download.cancelUrl, { method: "DELETE", cache: "no-store", keepalive: true }).catch(() => {});
+        backendRequest("export-cancel", {
+          exportId: download.exportId,
+          clientId: download.clientId,
+        }, { backendUrl: this.session?.config.backendUrl })
+          .catch(() => {});
       }
     }
     this._downloading = false;
@@ -509,14 +514,12 @@ export class Button {
     const backendUrl = this.session.config.backendUrl;
     if (this._downloading) return; // ignore double-clicks mid-download
     this._downloading = true;
-    const base = backendUrl.replace(/\/+$/, "");
     const download = {
       clientId: newClientId(),
       controller: new AbortController(),
       pollTimer: null,
       pollResolve: null,
       exportId: null,
-      cancelUrl: null,
       cancelSent: false,
       nativeStarted: false,
     };
@@ -532,22 +535,17 @@ export class Button {
     this.fill.style.width = "0%";
 
     try {
-      const submit = await fetch(`${base}/exports`, {
-        method: "POST",
-        cache: "no-store",
+      const submitted = await backendRequest("export-submit", {
+        jobId,
+        format,
+        clientId: download.clientId,
+        ...(format === "mp4" && height ? { maxHeight: height } : {}),
+      }, {
         signal,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          job_id: jobId,
-          format,
-          client_id: download.clientId,
-          ...(format === "mp4" && height ? { max_height: height } : {}),
-        }),
+        timeoutMs: 15_000,
+        backendUrl,
       });
-      const submitted = await submit.json();
-      if (!submit.ok) throw new Error(submitted?.detail || `HTTP ${submit.status}`);
       download.exportId = submitted.export_id;
-      download.cancelUrl = `${base}/exports/${encodeURIComponent(download.exportId)}?client_id=${encodeURIComponent(download.clientId)}`;
       if (!current()) return;
       let status = submitted;
       while (current() && status.state !== "ready") {
@@ -567,12 +565,13 @@ export class Button {
           }, 600);
         });
         if (!current()) return;
-        const statusResponse = await fetch(
-          `${base}/exports/${encodeURIComponent(download.exportId)}`,
-          { cache: "no-store", signal },
-        );
-        if (!statusResponse.ok) throw new Error(`HTTP ${statusResponse.status}`);
-        status = await statusResponse.json();
+        status = await backendRequest("export-status", {
+          exportId: download.exportId,
+        }, {
+          signal,
+          timeoutMs: 15_000,
+          backendUrl,
+        });
       }
       if (!current()) return;
       const title = sanitizeFilename(this.title);
@@ -584,9 +583,9 @@ export class Button {
           chrome.runtime.sendMessage(
             {
               type: "download-export",
-              url: `${base}/exports/${encodeURIComponent(download.exportId)}/download`,
+              exportId: download.exportId,
+              clientId: download.clientId,
               filename,
-              cancelUrl: download.cancelUrl,
             },
             (response) => {
               const error = chrome.runtime.lastError;
@@ -606,13 +605,17 @@ export class Button {
       this._restoreAfterDownload();
     } catch (err) {
       if (current()) {
-        console.warn("[nomusic] download failed", err);
-        this._flashDownloadError();
+        console.warn("[nomusic] download failed", err?.code || err?.message || err);
+        this._flashDownloadError(explainBackendError(err, "Download failed"));
       }
     } finally {
       if (!download.nativeStarted && download.exportId && !download.cancelSent) {
         download.cancelSent = true;
-        fetch(download.cancelUrl, { method: "DELETE", cache: "no-store", keepalive: true }).catch(() => {});
+        backendRequest("export-cancel", {
+          exportId: download.exportId,
+          clientId: download.clientId,
+        }, { backendUrl })
+          .catch(() => {});
       }
       if (current()) this._cancelDownload();
     }
@@ -648,10 +651,10 @@ export class Button {
     }
   }
 
-  _flashDownloadError() {
+  _flashDownloadError(message = "Download failed") {
     if (this.session?.failed) return;
     this.el.dataset.state = "error";
-    this.label.textContent = "Download failed";
+    this.label.textContent = message;
     this.pct.textContent = "";
     this.fill.style.width = "0%";
     this._clearErrorRevert();

@@ -61,6 +61,9 @@ def acquisition(tmp_path, monkeypatch):
 
     monkeypatch.setattr(yt_dlp, "YoutubeDL", Session)
     monkeypatch.setattr(downloader, "_source_download_opts", lambda _: {})
+    # This fixture replaces yt-dlp entirely; keep the test focused on
+    # cancellation/cleanup rather than DNS policy for its synthetic URL.
+    monkeypatch.setattr(downloader, "validate_public_url", lambda value: str(value))
     processor = pipeline.Processor(
         engine=object(), cache=cache, chunk_seconds=10,
         chunk_overlap_seconds=0.5, progressive=False,

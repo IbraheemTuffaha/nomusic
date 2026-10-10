@@ -14,4 +14,5 @@ def test_routers_expose_expected_paths():
             "/exports/{export_id}/download"} <= export_paths
 
     system_paths = {r.path for r in system.router.routes}
-    assert {"/healthz", "/capabilities", "/cache", "/cache/clear"} <= system_paths
+    assert {"/healthz", "/capabilities", "/readyz"} <= system_paths
+    assert "/cache" not in system_paths and "/cache/clear" not in system_paths

@@ -5,6 +5,13 @@ import { Session } from "../session.js";
 import { AudioScheduler } from "../audio-scheduler.js";
 import { mediaFixture } from "./media-fixture.js";
 
+// Most recovery cases need direct abortable fetches; the production worker
+// path is enabled by the dedicated transport test below.
+globalThis.__nomusicTestDirectBackend = true;
+// Keep the legacy stream cases hermetic and explicit; the shipped session
+// defaults to authenticated status polling.
+globalThis.__nomusicLegacySseTests = true;
+
 const settle = () => new Promise(setImmediate);
 const json = (value) => ({ ok: true, json: async () => value });
 const job = (job_id = "JOB") => ({ job_id, state: "processing", total_chunks: 10,
@@ -95,6 +102,28 @@ test("selection suppresses before a pending POST and setup failure stays silent"
   assert.equal(f.video.playCalls, 0);
   assert.equal(f.errors.length, 1);
   assert.equal(f.streams.length, 0);
+});
+
+test("production transport polls authenticated status through the worker API", async (t) => {
+  const previous = globalThis.__nomusicLegacySseTests;
+  const previousDirect = globalThis.__nomusicTestDirectBackend;
+  globalThis.__nomusicLegacySseTests = false;
+  globalThis.__nomusicTestDirectBackend = false;
+  t.after(() => {
+    globalThis.__nomusicLegacySseTests = previous;
+    globalThis.__nomusicTestDirectBackend = previousDirect;
+  });
+  const f = fixture(t, { fetch: ({ path }) => {
+    if (path === "/status/JOB") return json(job("JOB"));
+  } });
+  await f.session.start();
+  await settle();
+  assert.equal(f.session.eventSource, null);
+  assert.ok(f.requests.some(({ path }) => path === "/status/JOB"));
+  const firstCount = f.requests.filter(({ path }) => path === "/status/JOB").length;
+  t.mock.timers.tick(500);
+  await settle();
+  assert.ok(f.requests.filter(({ path }) => path === "/status/JOB").length > firstCount);
 });
 
 test("audio initialization failure closes the graph and preserves suppression", async (t) => {

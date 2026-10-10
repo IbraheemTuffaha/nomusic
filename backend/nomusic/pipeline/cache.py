@@ -44,7 +44,7 @@ class PublicationRevoked(RuntimeError):
 
 # Bump when the on-disk chunk encoding, sample rate, or directory layout
 # changes. Old entries become invisible to the new code and the TTL sweep
-# (or the user's "Clear cache" button) reclaims their disk.
+# (or the local ``nomusic cache clear`` command) reclaims their disk.
 SCHEMA_VERSION = 3
 
 CHUNK_EXT = ".opus"
@@ -417,7 +417,7 @@ class JobCache:
         exports of the same video don't re-download a multi-GB stream. The key
         includes the requested ``max_height`` so switching the download-quality
         setting fetches the new resolution instead of reusing the old one.
-        Reaped by the TTL sweep and the "Clear cache" button just like
+        Reaped by the TTL sweep and the local cache-clear command just like
         ``sources/``."""
         tag = str(max_height) if max_height else "best"
         key = hashlib.sha256(f"{url}\x00{tag}".encode()).hexdigest()[:16]

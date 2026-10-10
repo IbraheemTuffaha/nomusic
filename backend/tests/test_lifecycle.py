@@ -29,6 +29,7 @@ class WarmupEngine:
 
 @pytest.fixture
 def settings(monkeypatch, tmp_path):
+    from nomusic.auth import AuthStore
     monkeypatch.setattr("nomusic.services.check_runtime", lambda: {})
     configured = replace(
         server.SETTINGS, cache_dir=tmp_path / "cache",
@@ -36,6 +37,9 @@ def settings(monkeypatch, tmp_path):
         memory_gc_interval_seconds=3600,
     )
     monkeypatch.setattr(server, "SETTINGS", configured)
+    monkeypatch.setattr(
+        server, "AuthStore", lambda path: AuthStore(path, required=False)
+    )
     return configured
 
 

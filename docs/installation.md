@@ -131,8 +131,9 @@ loads verify those hashes; legacy pickle weights do not replace these files.
 
 Model files use `~/.cache/huggingface/hub`, honoring `HF_HOME` or `HF_HUB_CACHE`.
 Processed media uses `~/.cache/nomusic`, overridden by `NOMUSIC_CACHE_DIR`.
-Installation preserves both caches; the extension's Clear control removes
-processed media only.
+Installation preserves both caches. Use `nomusic cache stats` and
+`nomusic cache clear` from the local CLI to inspect or remove processed media;
+the extension does not administer the cache.
 
 ## Upgrading and rollback
 
