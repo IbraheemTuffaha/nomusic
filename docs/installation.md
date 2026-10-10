@@ -89,6 +89,8 @@ provide FFmpeg, a JS runtime and either uv or Python with venv support themselve
 | `--dev` | Include test/development dependencies |
 | `--skip-system-packages` | Check prerequisites without calling apt/Homebrew |
 | `--skip-model-download` | Defer weights until `models fetch` or first use |
+| `--service` | macOS: enable the authenticated background service without asking |
+| `--no-service` | macOS: skip service setup and leave it off after installation |
 | `NOMUSIC_UV=/absolute/path/to/uv` | Use an exact-version uv executable |
 | `NOMUSIC_VENV=/absolute/path` | Use a dedicated custom environment |
 
@@ -103,6 +105,11 @@ not in the lock. Direct versions and entry points live in
 [`pyproject.toml`](../pyproject.toml). FFmpeg and JS runtime versions follow the
 host package manager. FFmpeg needs `libopus`, `libmp3lame`, `aac` and `libx264`
 for normal processing/exports; verification additionally checks `libvpx-vp9`.
+
+The background-service option assumes an operator key has already been
+generated. If the first install happens before credentials exist, finish the
+install, run `backend/.venv/bin/nomusic auth generate`, then run
+`./service.sh install`.
 
 ## Diagnostics and model storage
 
@@ -139,7 +146,10 @@ the extension does not administer the cache.
 
 Stop the helper and keep the previous checkout until the replacement works.
 Update the project files, run `./install.sh`, then run doctor and the
-[local workflow](local-workflow.md). Reload the extension and video tabs.
+[local workflow](local-workflow.md). On macOS, a running owned background service
+is stopped while the environment changes and restarted after a successful install.
+Reload the extension and video tabs. See [background service](background-service.md)
+for explicit install, status, restart and uninstall commands.
 
 If the default `backend/.venv` uses another Python version, the installer moves
 it to **`backend/.venv.bak`** after checking prerequisites and creates the pinned
