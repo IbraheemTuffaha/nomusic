@@ -140,8 +140,8 @@ acquisition is established by this fixture.
 ## CI and manual acceptance
 
 CI runs on ordinary pull requests (including stacked PR targets), pushes to
-`main`, and manual dispatch. Actions use commit pins and read-only repository
-permissions. Both jobs exercise `install.sh --profile cpu` with the committed
+`main`, and manual dispatch. It uses read-only repository permissions. Both
+jobs exercise `install.sh --profile cpu` with the committed
 Python lock, fetch the pinned model explicitly, and run the real
 `nomusic doctor --json` CPU inference check. Linux installs the locked npm browser dependencies
 and runs the complete baseline. The `macos-15` Apple Silicon job runs the backend
