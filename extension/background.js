@@ -246,6 +246,18 @@ function clearBackendRoutes() {
   return backendRoutesWrite;
 }
 
+function exportMediaType(filename, declared) {
+  const type = String(declared || "").split(";", 1)[0].trim().toLowerCase();
+  if (type === "audio/mpeg" || type === "video/mp4") return type;
+  return filename.toLowerCase().endsWith(".mp4") ? "video/mp4" : "audio/mpeg";
+}
+
+function releaseDownloadUrl(entry) {
+  if (!entry?.objectUrl) return;
+  URL.revokeObjectURL(entry.objectUrl);
+  entry.objectUrl = "";
+}
+
 function rememberActiveDownloads() {
   const session = chrome.storage.session;
   if (!session?.set) return Promise.resolve();
@@ -566,6 +578,7 @@ chrome.downloads.onChanged?.addListener((delta) => {
     if (!entry) return;
     const state = delta.state?.current;
     if (state === "complete") {
+      releaseDownloadUrl(entry);
       activeDownloads.delete(delta.id);
       await rememberActiveDownloads();
       if (entry.tabId != null) {
@@ -575,6 +588,7 @@ chrome.downloads.onChanged?.addListener((delta) => {
         });
       }
     } else if (state === "interrupted") {
+      releaseDownloadUrl(entry);
       activeDownloads.delete(delta.id);
       await rememberActiveDownloads();
       if (entry.exportId && entry.clientId) {
@@ -729,24 +743,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse(responseError("not_configured", "Configure a trusted backend and operator key first."));
           return;
         }
+        // Fetch here and save a typed blob. chrome.downloads would otherwise
+        // record http://127.0.0.1 in the macOS quarantine entry, and Gatekeeper
+        // then refuses to open the MP3 or MP4.
         const url = `${auth.backendUrl}/exports/${encodeURIComponent(exportId)}/download`;
+        const response = await fetch(url, {
+          cache: "no-store",
+          headers: { Authorization: `Bearer ${auth.operatorKey}` },
+        });
+        if (!response.ok) {
+          sendResponse({ ok: false, error: `Could not download export (HTTP ${response.status}).` });
+          return;
+        }
+        const bytes = await response.arrayBuffer();
+        if (!bytes.byteLength) {
+          sendResponse({ ok: false, error: "The export file is empty." });
+          return;
+        }
+        const objectUrl = URL.createObjectURL(new Blob([bytes], {
+          type: exportMediaType(filename, response.headers?.get?.("content-type")),
+        }));
         chrome.downloads.download(
           {
-            url,
-            headers: [{ name: "Authorization", value: `Bearer ${auth.operatorKey}` }],
+            url: objectUrl,
             filename,
             conflictAction: "uniquify",
             saveAs: false,
           },
           (downloadId) => {
             const error = chrome.runtime.lastError;
-            if (error) {
-              sendResponse({ ok: false, error: error.message || String(error) });
+            if (error || !Number.isInteger(downloadId)) {
+              URL.revokeObjectURL(objectUrl);
+              sendResponse({ ok: false, error: error?.message || "Could not start download" });
             } else {
               activeDownloads.set(downloadId, {
                 tabId: sender?.tab?.id,
                 exportId,
                 clientId,
+                objectUrl,
               });
               rememberActiveDownloads().then(() => sendResponse({ ok: true, downloadId }));
             }

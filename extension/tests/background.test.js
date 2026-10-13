@@ -76,7 +76,7 @@ test("backend URL validation keeps loopback HTTP and rejects remote HTTP", () =>
   assert.ok(OPERATOR_KEY_PATTERN.test(`nm_${"a".repeat(64)}`));
 });
 
-test("download-export delegates the response body to chrome downloads", async () => {
+test("download-export saves a typed blob instead of the backend URL", async () => {
   const { captured, local } = await loadBackground({ stored: { backendUrl: "http://127.0.0.1:8723" } });
   local.trustedBackend = {
     version: 1,
@@ -84,6 +84,22 @@ test("download-export delegates the response body to chrome downloads", async ()
     operatorKey: `nm_${"e".repeat(64)}`,
     generation: "test-e",
   };
+  const requests = [];
+  const revoked = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: (name) => (name.toLowerCase() === "content-type" ? "audio/mpeg" : null) },
+      arrayBuffer: async () => new Uint8Array([0x49, 0x44, 0x33]).buffer,
+    };
+  };
+  globalThis.URL.createObjectURL = (blob) => {
+    captured.blob = blob;
+    return "blob:nomusic/export";
+  };
+  globalThis.URL.revokeObjectURL = (url) => revoked.push(url);
   let response;
   const keepOpen = captured.onMessage(
     {
@@ -97,14 +113,21 @@ test("download-export delegates the response body to chrome downloads", async ()
   );
   assert.equal(keepOpen, true);
   await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, `http://127.0.0.1:8723/exports/${"a".repeat(32)}/download`);
+  assert.equal(requests[0].options.headers.Authorization, `Bearer ${local.trustedBackend.operatorKey}`);
+  assert.equal(captured.blob.type, "audio/mpeg");
   assert.deepEqual(captured.downloadOptions, {
-    url: `http://127.0.0.1:8723/exports/${"a".repeat(32)}/download`,
-    headers: [{ name: "Authorization", value: `Bearer ${local.trustedBackend.operatorKey}` }],
+    url: "blob:nomusic/export",
     filename: "sample.mp3",
     conflictAction: "uniquify",
     saveAs: false,
   });
+  assert.equal(captured.downloadOptions.headers, undefined);
   assert.deepEqual(response, { ok: true, downloadId: 42 });
+  captured.onChanged({ id: 42, state: { current: "complete" } });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(revoked, ["blob:nomusic/export"]);
 });
 
 test("an interrupted native download cancels its export and notifies its tab", async () => {
@@ -118,8 +141,16 @@ test("an interrupted native download cancels its export and notifies its tab", a
   const requests = [];
   globalThis.fetch = async (url, options) => {
     requests.push({ url, options });
-    return { ok: true };
+    if (options?.method === "DELETE") return { ok: true };
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => "audio/mpeg" },
+      arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+    };
   };
+  globalThis.URL.createObjectURL = () => "blob:nomusic/export";
+  globalThis.URL.revokeObjectURL = () => {};
   let response;
   captured.onMessage(
     {
@@ -139,10 +170,9 @@ test("an interrupted native download cancels its export and notifies its tab", a
     error: { current: "NETWORK_FAILED" },
   });
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0].url, `http://127.0.0.1:8723/exports/${"b".repeat(32)}?client_id=client-1`);
-  assert.equal(requests[0].options.method, "DELETE");
-  assert.equal(requests[0].options.headers.Authorization, `Bearer ${local.trustedBackend.operatorKey}`);
+  const cancelled = requests.find((request) => request.options?.method === "DELETE");
+  assert.equal(cancelled.url, `http://127.0.0.1:8723/exports/${"b".repeat(32)}?client_id=client-1`);
+  assert.equal(cancelled.options.headers.Authorization, `Bearer ${local.trustedBackend.operatorKey}`);
   assert.deepEqual(messages, [{
     tabId: 9,
     message: {

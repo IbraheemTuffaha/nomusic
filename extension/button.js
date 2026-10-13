@@ -505,9 +505,9 @@ export class Button {
     this.session.ensureLiveForDownload();
   }
 
-  /** Prepare an export, then hand its ready URL to the background worker.
-   * The downloads API owns the response body, so the content script never
-   * buffers a complete MP3/MP4 in a Blob or keeps it in page memory. */
+  /** Prepare an export, then ask the background worker to save it.
+   * The worker fetches the file, so the content script never buffers a
+   * complete MP3 or MP4. */
   async _startDownload(format, height = 0) {
     const jobId = this.session?.jobId;
     if (this._retired || !jobId || this.session.disposed || this.session.failed) return;
