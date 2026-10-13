@@ -1,9 +1,11 @@
 // Trusted extension service worker.
 //
-// Page-facing content scripts never receive the operator key and never make
-// backend requests directly. This worker owns the key in storage.local,
-// validates the small message surface, and performs authenticated setup and
-// capability checks. Processing transport is added in the next stack layer.
+// Page-facing content scripts never receive the operator key. This worker owns
+// the key in storage.local, validates the small message surface, and performs
+// authenticated setup and capability checks. For a prepared export it mints a
+// single-use download grant. The page fetches that grant and saves a typed
+// blob: a service worker cannot build a blob URL, which is what macOS needs
+// in order to open the saved MP3 or MP4.
 
 import {
   DEFAULT_BACKEND,
@@ -40,11 +42,7 @@ const STEMS = new Set(["vocals", "drums", "bass", "other"]);
 const MAX_BACKEND_ROUTES = 256;
 const JOB_ROUTE_STORAGE_KEY = "nomusicJobBackendRoutes";
 const EXPORT_ROUTE_STORAGE_KEY = "nomusicExportBackendRoutes";
-const ACTIVE_DOWNLOAD_STORAGE_KEY = "nomusicActiveDownloads";
-const activeDownloads = new Map();
-let activeDownloadsLoaded = false;
-let activeDownloadsLoad = null;
-let activeDownloadsWrite = Promise.resolve();
+const DOWNLOAD_GRANT_RE = /^[A-Za-z0-9_-]{43}$/;
 const jobBackendRoutes = new Map();
 const exportBackendRoutes = new Map();
 let backendRoutesLoaded = false;
@@ -228,7 +226,7 @@ function routeFor(operation, data, configuredAuth) {
   if (operation === "export-submit") {
     return jobBackendRoutes.get(data.jobId) || configuredAuth;
   }
-  if (["export-status", "export-cancel", "export-download"].includes(operation)) {
+  if (["export-status", "export-cancel", "export-download", "export-grant"].includes(operation)) {
     return exportBackendRoutes.get(data.exportId) || configuredAuth;
   }
   return configuredAuth;
@@ -249,55 +247,7 @@ function clearBackendRoutes() {
 function exportMediaType(filename, declared) {
   const type = String(declared || "").split(";", 1)[0].trim().toLowerCase();
   if (type === "audio/mpeg" || type === "video/mp4") return type;
-  return filename.toLowerCase().endsWith(".mp4") ? "video/mp4" : "audio/mpeg";
-}
-
-function releaseDownloadUrl(entry) {
-  if (!entry?.objectUrl) return;
-  URL.revokeObjectURL(entry.objectUrl);
-  entry.objectUrl = "";
-}
-
-function rememberActiveDownloads() {
-  const session = chrome.storage.session;
-  if (!session?.set) return Promise.resolve();
-  activeDownloadsWrite = activeDownloadsWrite
-    .catch(() => {})
-    .then(() => session.set({
-      [ACTIVE_DOWNLOAD_STORAGE_KEY]: Object.fromEntries(activeDownloads),
-    }))
-    .catch(() => {});
-  return activeDownloadsWrite;
-}
-
-async function loadActiveDownloads() {
-  if (activeDownloadsLoaded) return;
-  if (!activeDownloadsLoad) {
-    activeDownloadsLoad = (async () => {
-      const session = chrome.storage.session;
-      if (session?.get) {
-        try {
-          const stored = await session.get(ACTIVE_DOWNLOAD_STORAGE_KEY);
-          for (const [id, entry] of Object.entries(stored?.[ACTIVE_DOWNLOAD_STORAGE_KEY] || {})) {
-            const downloadId = Number(id);
-            if (!Number.isInteger(downloadId) || downloadId < 0 ||
-                !entry || typeof entry !== "object" ||
-                !EXPORT_ID_RE.test(entry.exportId) ||
-                typeof entry.clientId !== "string") continue;
-            activeDownloads.set(downloadId, {
-              tabId: Number.isInteger(entry.tabId) ? entry.tabId : undefined,
-              exportId: entry.exportId,
-              clientId: entry.clientId,
-            });
-          }
-        } catch {
-          // A browser without session storage can still track live downloads.
-        }
-      }
-      activeDownloadsLoaded = true;
-    })();
-  }
-  await activeDownloadsLoad;
+  return String(filename || "").toLowerCase().endsWith(".mp4") ? "video/mp4" : "audio/mpeg";
 }
 
 async function fetchCapabilities(backendUrl, operatorKey) {
@@ -571,43 +521,6 @@ chrome.runtime.onInstalled.addListener(async () => {
   if (Object.keys(patched).length) await chrome.storage.sync.set(patched);
 });
 
-chrome.downloads.onChanged?.addListener((delta) => {
-  (async () => {
-    await loadActiveDownloads();
-    const entry = activeDownloads.get(delta.id);
-    if (!entry) return;
-    const state = delta.state?.current;
-    if (state === "complete") {
-      releaseDownloadUrl(entry);
-      activeDownloads.delete(delta.id);
-      await rememberActiveDownloads();
-      if (entry.tabId != null) {
-        chrome.tabs?.sendMessage?.(entry.tabId, {
-          type: "download-export-complete",
-          downloadId: delta.id,
-        });
-      }
-    } else if (state === "interrupted") {
-      releaseDownloadUrl(entry);
-      activeDownloads.delete(delta.id);
-      await rememberActiveDownloads();
-      if (entry.exportId && entry.clientId) {
-        backendRequest("export-cancel", {
-          exportId: entry.exportId,
-          clientId: entry.clientId,
-        }).catch(() => {});
-      }
-      if (entry.tabId != null) {
-        chrome.tabs?.sendMessage?.(entry.tabId, {
-          type: "download-export-failed",
-          downloadId: delta.id,
-          error: delta.error?.current || "browser download interrupted",
-        });
-      }
-    }
-  })().catch(() => {});
-});
-
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "get-auth-state") {
     (async () => {
@@ -726,66 +639,55 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return false;
     }
     let exportId;
-    let clientId;
     try {
       exportId = safeExportId(msg.exportId);
-      clientId = safeClientId(msg.clientId);
+      // The page cancels with this id if the save fails. Reject a malformed
+      // one here so a download is not started for a message the page cannot
+      // pair with its export owner.
+      safeClientId(msg.clientId);
     } catch (error) {
       sendResponse({ ok: false, error: error.message });
       return false;
     }
     (async () => {
       try {
-        await Promise.all([loadBackendRoutes(), loadActiveDownloads()]);
+        await loadBackendRoutes();
         const configuredAuth = await readTrustedAuth();
-        const auth = routeFor("export-download", { exportId }, configuredAuth);
+        const auth = routeFor("export-grant", { exportId }, configuredAuth);
         if (!auth) {
           sendResponse(responseError("not_configured", "Configure a trusted backend and operator key first."));
           return;
         }
-        // Fetch here and save a typed blob. chrome.downloads would otherwise
-        // record http://127.0.0.1 in the macOS quarantine entry, and Gatekeeper
-        // then refuses to open the MP3 or MP4.
-        const url = `${auth.backendUrl}/exports/${encodeURIComponent(exportId)}/download`;
-        const response = await fetch(url, {
-          cache: "no-store",
-          headers: { Authorization: `Bearer ${auth.operatorKey}` },
-        });
+        // Mint the grant here. The page fetches the bytes and clicks a typed
+        // blob link. This worker never sees the file and never passes the
+        // operator key back to the page.
+        const response = await fetchWithTimeout(
+          `${auth.backendUrl}/exports/${encodeURIComponent(exportId)}/download-grant`,
+          {
+            method: "POST",
+            cache: "no-store",
+            referrerPolicy: "no-referrer",
+            headers: { Authorization: `Bearer ${auth.operatorKey}` },
+          },
+          10_000,
+        );
         if (!response.ok) {
           sendResponse({ ok: false, error: `Could not download export (HTTP ${response.status}).` });
           return;
         }
-        const bytes = await response.arrayBuffer();
-        if (!bytes.byteLength) {
-          sendResponse({ ok: false, error: "The export file is empty." });
+        let data = null;
+        try { data = await response.json(); } catch { data = null; }
+        const grant = typeof data?.grant === "string" ? data.grant : "";
+        if (!DOWNLOAD_GRANT_RE.test(grant)) {
+          sendResponse({ ok: false, error: "The backend did not provide a download grant." });
           return;
         }
-        const objectUrl = URL.createObjectURL(new Blob([bytes], {
-          type: exportMediaType(filename, response.headers?.get?.("content-type")),
-        }));
-        chrome.downloads.download(
-          {
-            url: objectUrl,
-            filename,
-            conflictAction: "uniquify",
-            saveAs: false,
-          },
-          (downloadId) => {
-            const error = chrome.runtime.lastError;
-            if (error || !Number.isInteger(downloadId)) {
-              URL.revokeObjectURL(objectUrl);
-              sendResponse({ ok: false, error: error?.message || "Could not start download" });
-            } else {
-              activeDownloads.set(downloadId, {
-                tabId: sender?.tab?.id,
-                exportId,
-                clientId,
-                objectUrl,
-              });
-              rememberActiveDownloads().then(() => sendResponse({ ok: true, downloadId }));
-            }
-          },
-        );
+        sendResponse({
+          ok: true,
+          backendUrl: auth.backendUrl,
+          grant,
+          mediaType: exportMediaType(filename, data?.media_type),
+        });
       } catch (error) {
         sendResponse({ ok: false, error: error.message || "Could not start download" });
       }

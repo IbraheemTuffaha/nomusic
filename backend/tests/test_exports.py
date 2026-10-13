@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 from dataclasses import replace
 
 from nomusic.exports import (
+    DownloadGrantStore,
+    DownloadGrantsFull,
     ExportArtifact,
     ExportDownloadsFull,
     ExportQueueFull,
@@ -351,4 +353,115 @@ def test_http_export_api_serves_prepared_opus(client):
 def test_http_export_api_rejects_malformed_export_ids(client):
     assert client.get("/exports/not-an-id").status_code == 404
     assert client.get("/exports/not-an-id/download").status_code == 404
+    assert client.post("/exports/not-an-id/download-grant").status_code == 404
     assert client.delete("/exports/not-an-id").status_code == 404
+
+
+def test_download_grant_is_single_use_and_expires():
+    now = [10.0]
+    store = DownloadGrantStore(ttl_seconds=5, max_grants=2, clock=lambda: now[0])
+    token, ttl = store.issue("a" * 32)
+    assert ttl == 5
+    assert len(token) == 43
+    assert store.consume("b" * 32, token) is False
+    assert store.consume("a" * 32, token) is True
+    assert store.consume("a" * 32, token) is False
+    assert store.consume("a" * 32, "short") is False
+    assert store.consume("a" * 32, "b" * 43) is False
+
+    second, _ = store.issue("a" * 32)
+    now[0] = 16
+    assert store.consume("a" * 32, second) is False
+
+
+def test_download_grant_cap_keeps_the_live_grant():
+    store = DownloadGrantStore(ttl_seconds=30, max_grants=1)
+    token, _ = store.issue("a" * 32)
+    with pytest.raises(DownloadGrantsFull):
+        store.issue("b" * 32)
+    assert store.consume("a" * 32, token) is True
+    store.clear()
+    replacement, _ = store.issue("b" * 32)
+    assert store.consume("b" * 32, replacement) is True
+
+
+def _publish_export(client, fmt="opus"):
+    from nomusic.config import SETTINGS
+
+    cache = client.app.state.cache
+    job_id = cache.key(
+        "http://example.com/export",
+        "fake",
+        ["vocals"],
+        chunk_seconds=SETTINGS.chunk_seconds,
+        chunk_overlap_seconds=SETTINGS.chunk_overlap_seconds,
+    )
+    cache.save_meta(
+        job_id,
+        CacheMeta(
+            url="http://example.com/export",
+            model="fake",
+            keep_stems=["vocals"],
+            duration_seconds=1,
+            chunk_seconds=1,
+            chunk_overlap_seconds=0,
+            total_chunks=2,
+            title="Test export",
+            chunks_ready=[0, 1],
+            complete=True,
+        ),
+    )
+    cache.chunk_path(job_id, 0).write_bytes(b"one")
+    cache.chunk_path(job_id, 1).write_bytes(b"two")
+    client.app.state.exports.builder = _builder
+    response = client.post("/exports", json={"job_id": job_id, "format": fmt})
+    assert response.status_code in (200, 202)
+    export_id = response.json()["export_id"]
+    deadline = time.monotonic() + 3
+    status = None
+    while time.monotonic() < deadline:
+        status = client.get(f"/exports/{export_id}").json()
+        if status["state"] == "ready":
+            return export_id
+        time.sleep(0.01)
+    raise AssertionError(f"export {export_id} did not become ready: {status}")
+
+
+def test_download_grant_authorizes_one_fetch_without_the_operator_key(client, caplog):
+    export_id = _publish_export(client)
+    store = client.app.state.auth_store
+    raw, _info = store.generate("download-test")
+    store.required = True
+    download = f"/exports/{export_id}/download"
+    grant_url = f"/exports/{export_id}/download-grant"
+    assert client.get(download).status_code == 401
+    assert client.post(grant_url).status_code == 401
+
+    minted = client.post(grant_url, headers={"Authorization": f"Bearer {raw}"})
+    assert minted.status_code == 200
+    assert minted.headers["cache-control"] == "no-store"
+    token = minted.json()["grant"]
+    assert token not in str(minted.request.url)
+    assert token not in caplog.text
+    assert minted.json()["expires_in"] == 60
+
+    rejected = client.get(download, headers={
+        "Authorization": "Bearer nm_" + "0" * 64,
+        "X-Nomusic-Download-Grant": token,
+    })
+    assert rejected.status_code == 401
+    assert token not in rejected.text
+
+    other = client.get(f"/exports/{'d' * 32}/download", headers={
+        "X-Nomusic-Download-Grant": token,
+    })
+    assert other.status_code == 401
+
+    saved = client.get(download, headers={"X-Nomusic-Download-Grant": token})
+    assert saved.status_code == 200
+    assert saved.content == b"prepared"
+    assert saved.headers["content-type"].startswith("audio/ogg")
+    assert client.get(download, headers={"X-Nomusic-Download-Grant": token}).status_code == 401
+    again = client.get(download, headers={"Authorization": f"Bearer {raw}"})
+    assert again.status_code == 200
+    assert again.content == b"prepared"

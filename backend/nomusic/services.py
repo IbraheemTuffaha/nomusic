@@ -18,7 +18,7 @@ from nomusic.config import Settings
 from nomusic.diagnostics import check_working_storage
 from nomusic.engines.base import Engine
 from nomusic.jobs import JobRegistry
-from nomusic.exports import ExportRegistry
+from nomusic.exports import DownloadGrantStore, ExportRegistry
 from nomusic.pipeline.cache import JobCache
 from nomusic.pipeline.downloader import limits_from_settings
 from nomusic.pipeline.export import build_export
@@ -40,6 +40,7 @@ class Services:
         self.cache: JobCache | None = None
         self.registry: JobRegistry | None = None
         self.exports: ExportRegistry | None = None
+        self.download_grants = DownloadGrantStore()
         self.worker: SupervisedModelWorker | None = None
         self._stop = threading.Event()
         self.shutdown_requested = False
@@ -231,6 +232,7 @@ class Services:
             self.registry.begin_shutdown()
         if self.exports is not None:
             self.exports.begin_shutdown()
+        self.download_grants.clear()
 
     def shutdown(self) -> None:
         """Join from outside the event loop so final queue callbacks can run."""

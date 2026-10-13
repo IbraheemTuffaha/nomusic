@@ -2,6 +2,24 @@
 // download. Creates/disposes a Session on toggle. Split out of content.js.
 import { Session, newClientId } from "./session.js";
 import { backendRequest, explainBackendError } from "./backend-client.js";
+import { normalizeBackendUrl } from "./config.js";
+
+const DOWNLOAD_GRANT_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const EXPORT_ID_PATTERN = /^[0-9a-f]{32}$/;
+
+function exportBlobType(filename, declared, fallback) {
+  const normalize = (value) => String(value || "").split(";", 1)[0].trim().toLowerCase();
+  for (const candidate of [declared, fallback]) {
+    const type = normalize(candidate);
+    if (type === "audio/mpeg" || type === "video/mp4") return type;
+  }
+  return String(filename || "").toLowerCase().endsWith(".mp4") ? "video/mp4" : "audio/mpeg";
+}
+
+function grantedDownloadUrl(backendUrl, exportId) {
+  if (!EXPORT_ID_PATTERN.test(exportId)) throw new Error("download URL is invalid");
+  return `${normalizeBackendUrl(backendUrl)}/exports/${exportId}/download`;
+}
 
 // Strip characters that are illegal in filenames across Windows/macOS/Linux
 // (plus control chars), collapse whitespace, and bound the length so a very
@@ -87,15 +105,7 @@ export class Button {
     this._menuOpen = false;
     this._downloading = false;
     this._download = null;
-    this._nativeDownloads = new Set();
-    this._onRuntimeMessage = (message) => {
-      if (!this._nativeDownloads.has(message?.downloadId)) return;
-      this._nativeDownloads.delete(message.downloadId);
-      if (message.type === "download-export-complete") return;
-      if (message.type !== "download-export-failed") return;
-      if (!this._retired) this._flashDownloadError(message.error || "browser download interrupted");
-    };
-    chrome.runtime.onMessage.addListener(this._onRuntimeMessage);
+    this._downloadUrls = new Map();
     // A download requested before the track finished processing: {format,
     // height}. Held until the job reaches "ready", then saved automatically.
     this._pendingDownload = null;
@@ -378,9 +388,23 @@ export class Button {
     this.session?.dispose({ restore: false });
     this.session = null;
     this.dispose();
-    chrome.runtime.onMessage.removeListener(this._onRuntimeMessage);
-    this._nativeDownloads.clear();
+    this._revokeDownloadUrls();
     this.el.remove();
+  }
+
+  _revokeDownloadUrls() {
+    for (const [url, timer] of this._downloadUrls) {
+      clearTimeout(timer);
+      URL.revokeObjectURL(url);
+    }
+    this._downloadUrls.clear();
+  }
+
+  _rememberDownloadUrl(objectUrl) {
+    const timer = setTimeout(() => {
+      if (this._downloadUrls.delete(objectUrl)) URL.revokeObjectURL(objectUrl);
+    }, 10_000);
+    this._downloadUrls.set(objectUrl, timer);
   }
 
   _cancelDownload({ cancelExport = true } = {}) {
@@ -390,7 +414,7 @@ export class Button {
       clearTimeout(download.pollTimer);
       download.pollResolve?.();
       download.controller.abort();
-      if (cancelExport && download.exportId && !download.nativeStarted && !download.cancelSent) {
+      if (cancelExport && download.exportId && !download.saved && !download.cancelSent) {
         download.cancelSent = true;
         backendRequest("export-cancel", {
           exportId: download.exportId,
@@ -505,9 +529,10 @@ export class Button {
     this.session.ensureLiveForDownload();
   }
 
-  /** Prepare an export, then ask the background worker to save it.
-   * The worker fetches the file, so the content script never buffers a
-   * complete MP3 or MP4. */
+  /** Prepare an export, then save it from this page.
+   * The worker mints a one-time grant with the operator key. This page fetches
+   * only that grant and clicks a typed blob link. The key never arrives here,
+   * and the browser download manager never sees the localhost URL. */
   async _startDownload(format, height = 0) {
     const jobId = this.session?.jobId;
     if (this._retired || !jobId || this.session.disposed || this.session.failed) return;
@@ -521,7 +546,7 @@ export class Button {
       pollResolve: null,
       exportId: null,
       cancelSent: false,
-      nativeStarted: false,
+      saved: false,
     };
     this._download = download;
     const { signal } = download.controller;
@@ -599,8 +624,37 @@ export class Button {
       });
       if (!current()) return;
       if (!message?.ok) throw new Error(message?.error || "browser download failed");
-      download.nativeStarted = true;
-      this._nativeDownloads.add(message.downloadId);
+      if (!DOWNLOAD_GRANT_PATTERN.test(message.grant)) {
+        throw new Error("The backend did not provide a download grant.");
+      }
+      const url = grantedDownloadUrl(message.backendUrl, download.exportId);
+      const response = await fetch(url, {
+        cache: "no-store",
+        referrerPolicy: "no-referrer",
+        signal,
+        headers: { "X-Nomusic-Download-Grant": message.grant },
+      });
+      if (!current()) return;
+      if (!response.ok) throw new Error(`Could not download export (HTTP ${response.status}).`);
+      let blob = await response.blob();
+      if (!current()) return;
+      if (!blob.size) throw new Error("The export file is empty.");
+      const type = exportBlobType(
+        filename,
+        blob.type || response.headers?.get?.("content-type"),
+        message.mediaType,
+      );
+      if (blob.type !== type) blob = new Blob([blob], { type });
+      const objectUrl = URL.createObjectURL(blob);
+      this._rememberDownloadUrl(objectUrl);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = filename;
+      anchor.rel = "noopener";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      download.saved = true;
       this._cancelDownload({ cancelExport: false });
       this._restoreAfterDownload();
     } catch (err) {
@@ -609,7 +663,7 @@ export class Button {
         this._flashDownloadError(explainBackendError(err, "Download failed"));
       }
     } finally {
-      if (!download.nativeStarted && download.exportId && !download.cancelSent) {
+      if (!download.saved && download.exportId && !download.cancelSent) {
         download.cancelSent = true;
         backendRequest("export-cancel", {
           exportId: download.exportId,

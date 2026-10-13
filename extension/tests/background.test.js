@@ -76,7 +76,7 @@ test("backend URL validation keeps loopback HTTP and rejects remote HTTP", () =>
   assert.ok(OPERATOR_KEY_PATTERN.test(`nm_${"a".repeat(64)}`));
 });
 
-test("download-export saves a typed blob instead of the backend URL", async () => {
+test("download-export mints a one-time grant and does not fetch the file", async () => {
   const { captured, local } = await loadBackground({ stored: { backendUrl: "http://127.0.0.1:8723" } });
   local.trustedBackend = {
     version: 1,
@@ -85,21 +85,19 @@ test("download-export saves a typed blob instead of the backend URL", async () =
     generation: "test-e",
   };
   const requests = [];
-  const revoked = [];
   globalThis.fetch = async (url, options) => {
     requests.push({ url, options });
     return {
       ok: true,
       status: 200,
-      headers: { get: (name) => (name.toLowerCase() === "content-type" ? "audio/mpeg" : null) },
-      arrayBuffer: async () => new Uint8Array([0x49, 0x44, 0x33]).buffer,
+      json: async () => ({
+        grant: "a".repeat(43),
+        media_type: "audio/mpeg",
+        filename: "server.mp3",
+        expires_in: 60,
+      }),
     };
   };
-  globalThis.URL.createObjectURL = (blob) => {
-    captured.blob = blob;
-    return "blob:nomusic/export";
-  };
-  globalThis.URL.revokeObjectURL = (url) => revoked.push(url);
   let response;
   const keepOpen = captured.onMessage(
     {
@@ -114,73 +112,69 @@ test("download-export saves a typed blob instead of the backend URL", async () =
   assert.equal(keepOpen, true);
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].url, `http://127.0.0.1:8723/exports/${"a".repeat(32)}/download`);
+  assert.equal(requests[0].url, `http://127.0.0.1:8723/exports/${"a".repeat(32)}/download-grant`);
+  assert.equal(requests[0].options.method, "POST");
   assert.equal(requests[0].options.headers.Authorization, `Bearer ${local.trustedBackend.operatorKey}`);
-  assert.equal(captured.blob.type, "audio/mpeg");
-  assert.deepEqual(captured.downloadOptions, {
-    url: "blob:nomusic/export",
-    filename: "sample.mp3",
-    conflictAction: "uniquify",
-    saveAs: false,
+  assert.equal(requests[0].options.referrerPolicy, "no-referrer");
+  assert.equal(captured.downloadOptions, undefined);
+  assert.equal(response.operatorKey, undefined);
+  assert.deepEqual(response, {
+    ok: true,
+    backendUrl: "http://127.0.0.1:8723",
+    grant: "a".repeat(43),
+    mediaType: "audio/mpeg",
   });
-  assert.equal(captured.downloadOptions.headers, undefined);
-  assert.deepEqual(response, { ok: true, downloadId: 42 });
-  captured.onChanged({ id: 42, state: { current: "complete" } });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.deepEqual(revoked, ["blob:nomusic/export"]);
 });
 
-test("an interrupted native download cancels its export and notifies its tab", async () => {
-  const { captured, messages, local } = await loadBackground({ stored: { backendUrl: "http://127.0.0.1:8723" } });
+test("download-export reports a video type and refuses a malformed grant", async () => {
+  const { captured, local } = await loadBackground({ stored: { backendUrl: "http://127.0.0.1:8723" } });
   local.trustedBackend = {
     version: 1,
     backendUrl: "http://127.0.0.1:8723",
     operatorKey: `nm_${"f".repeat(64)}`,
     generation: "test-f",
   };
-  const requests = [];
-  globalThis.fetch = async (url, options) => {
-    requests.push({ url, options });
-    if (options?.method === "DELETE") return { ok: true };
-    return {
-      ok: true,
-      status: 200,
-      headers: { get: () => "audio/mpeg" },
-      arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
-    };
-  };
-  globalThis.URL.createObjectURL = () => "blob:nomusic/export";
-  globalThis.URL.revokeObjectURL = () => {};
+  let grant = "not-a-grant";
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ grant, media_type: "application/octet-stream" }),
+  });
   let response;
   captured.onMessage(
     {
       type: "download-export",
       exportId: "b".repeat(32),
       clientId: "client-1",
-      filename: "sample.mp3",
+      filename: "clip.mp4",
     },
     { tab: { id: 9 } },
     (value) => { response = value; },
   );
   await new Promise((resolve) => setTimeout(resolve, 5));
-  assert.deepEqual(response, { ok: true, downloadId: 42 });
-  captured.onChanged({
-    id: 42,
-    state: { current: "interrupted" },
-    error: { current: "NETWORK_FAILED" },
-  });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const cancelled = requests.find((request) => request.options?.method === "DELETE");
-  assert.equal(cancelled.url, `http://127.0.0.1:8723/exports/${"b".repeat(32)}?client_id=client-1`);
-  assert.equal(cancelled.options.headers.Authorization, `Bearer ${local.trustedBackend.operatorKey}`);
-  assert.deepEqual(messages, [{
-    tabId: 9,
-    message: {
-      type: "download-export-failed",
-      downloadId: 42,
-      error: "NETWORK_FAILED",
+  assert.equal(response.ok, false);
+  assert.equal(captured.downloadOptions, undefined);
+  assert.equal(JSON.stringify(response).includes(grant), false);
+
+  grant = "c".repeat(43);
+  response = undefined;
+  captured.onMessage(
+    {
+      type: "download-export",
+      exportId: "b".repeat(32),
+      clientId: "client-1",
+      filename: "clip.mp4",
     },
-  }]);
+    { tab: { id: 9 } },
+    (value) => { response = value; },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(response, {
+    ok: true,
+    backendUrl: "http://127.0.0.1:8723",
+    grant,
+    mediaType: "video/mp4",
+  });
 });
 
 test("onInstalled seeds only the missing storage defaults", async () => {

@@ -113,15 +113,29 @@ test("a pending download can finish without dismissing a later playback failure"
   button.session.failed = false;
   button.session.jobId = "job";
   button.session.config = { backendUrl: "http://localhost:8723" };
+  URL.createObjectURL = () => "blob:nomusic/export";
+  URL.revokeObjectURL = () => {};
+  const exportId = "c".repeat(32);
+  let calls = 0;
   let finish;
-  t.mock.method(globalThis, "fetch", () => new Promise((resolve) => { finish = resolve; }));
+  t.mock.method(globalThis, "fetch", () => {
+    calls += 1;
+    if (calls === 1) return new Promise((resolve) => { finish = resolve; });
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: { get: () => "audio/mpeg" },
+      blob: async () => new Blob([Uint8Array.of(1, 2, 3)], { type: "audio/mpeg" }),
+      json: async () => ({ state: "cancelled" }),
+    });
+  });
   const download = button._startDownload("mp3");
   button.session.failed = true;
   button.setError("Status connection lost");
   finish({
     ok: true,
     status: 200,
-    json: async () => ({ export_id: "export", state: "ready", filename: "clip.mp3" }),
+    json: async () => ({ export_id: exportId, state: "ready", filename: "clip.mp3" }),
   });
   await download;
   assert.equal(button._downloading, false);
