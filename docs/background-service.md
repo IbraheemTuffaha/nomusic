@@ -3,45 +3,49 @@
 This guide covers the optional macOS path for running the backend as a per-user
 LaunchAgent instead of in a Terminal window. It starts when the user logs in,
 including after a restart, and launchd relaunches it after an unexpected exit.
-
-The active M6 deployment runs inference on the Ubuntu/NVIDIA laptop. This
-LaunchAgent is therefore a convenience for running nomusic locally on a Mac;
-it is not required by the laptop deployment. Linux service management is
-handled by the host's supervisor rather than by `service.sh`.
+Linux service management is handled by the host's supervisor rather than by
+`service.sh`.
 
 ## Turn it on
 
-Run this from the repository root after install.sh has created the virtual
-environment and you have generated at least one operator key:
+Run this from the repository root after `install.sh` has created the virtual
+environment and `nomusic auth generate` has created at least one operator key:
 
-    ./service.sh install
+```sh
+./service.sh install
+```
 
 The command generates an absolute-path LaunchAgent for this checkout, loads it,
-and waits for the unauthenticated local liveness endpoint (/healthz). The
-backend's authenticated readiness endpoint remains protected; the extension
-reports when model warmup is complete.
+and waits for the unauthenticated local liveness endpoint (`/healthz`). The
+backend's authenticated `/capabilities` endpoint remains protected and is what
+the extension uses to discover the running backend.
 
 The installer offers the same action at the end of an interactive Mac install.
 Use explicit flags in scripts:
 
-    ./install.sh --service
-    ./install.sh --no-service
+```sh
+./install.sh --service
+./install.sh --no-service
+```
 
-The installer does not create credentials. If you use --service during the
-same install, generate the key first on a later command and then run
-service.sh install; the helper refuses to start without an operator-key file.
+The installer does not create credentials. If no valid operator key exists,
+an interactive install leaves the background service off and prints the two
+commands needed to generate a key and enable it. An explicit `--service` stops
+with the same prerequisite instead of loading a crash-looping agent.
 
 The service is a per-user agent, so it starts after login rather than before
 login. MPS requires that logged-in GUI session. It runs as the current user,
 with that user's cache, model, operator-key file and permissions.
 
-Do not also run nomusic serve in a Terminal: both use the same port.
+Do not also run `nomusic serve` in a Terminal: both use the same port.
 
 ## Check, restart and turn it off
 
-    ./service.sh status
-    ./service.sh restart
-    ./service.sh uninstall
+```sh
+./service.sh status
+./service.sh restart
+./service.sh uninstall
+```
 
 status checks that this checkout owns the LaunchAgent, that launchd has loaded
 it, and that the local HTTP liveness endpoint responds. A loaded but unhealthy
@@ -51,49 +55,63 @@ cache, model, operator-key and log data.
 
 The helper writes its log to:
 
-    ~/Library/Logs/nomusic-backend.log
+```text
+~/Library/Logs/nomusic-backend.log
+```
 
 Inspect it with:
 
-    tail -f ~/Library/Logs/nomusic-backend.log
+```sh
+tail -f ~/Library/Logs/nomusic-backend.log
+```
 
 Stopping gives active work the same shutdown grace period as Control+C in a
 terminal, 60 seconds by default. Finish long exports before uninstalling.
 
 ## Settings
 
-The LaunchAgent cannot read a shell profile. service.sh install saves the
-backend settings exported in the current shell, plus PATH, HF_HOME and
-HF_HUB_CACHE. It derives the backend settings from the installed configuration
-schema and excludes installer-only variables and arbitrary environment names;
-operator keys are never copied into the plist. The saved names are printed.
+The LaunchAgent cannot read a shell profile. `service.sh install` saves the
+allowlisted backend settings exported in the current shell, plus `PATH`,
+`HF_HOME` and `HF_HUB_CACHE`. Installer-only variables and arbitrary
+environment names are excluded; operator keys are never copied into the plist.
+The saved names are printed.
 
 To change a setting, export the new value and run:
 
-    ./service.sh restart
+```sh
+./service.sh restart
+```
 
 Unexported settings are removed from the generated definition and return to
 application defaults.
 
 ## Upgrades and moving the checkout
 
-install.sh stops an owned running service before changing the environment and
-restores it when the installation completes. If installation fails, the
-service stays off and the installer prints the recovery command.
+`install.sh` stops an owned running service before changing the environment and
+starts it again when the installation completes. Choosing `--no-service` leaves
+it off. If installation or the service health check fails, the previous
+definition is restored when possible and the installer prints the recovery
+commands.
 
 There is one service label per user. If another checkout owns it, installation
-fails without changing that service. Run the other checkout's service.sh
-uninstall first, or intentionally stop it through launchd before installing
-this checkout.
+fails without changing that service. Run the other checkout's
+`service.sh uninstall` first, or intentionally stop it through `launchctl`
+before installing this checkout.
+
+If the definition is damaged and cannot be parsed, the helper refuses to guess
+which checkout owns it. Verify that no other nomusic service should remain,
+then use the recovery commands printed by `service.sh`.
 
 Turn the service off before moving or deleting the project folder. After moving
-it, run install.sh in the new location and then service.sh install.
+it, run `install.sh` in the new location and then `service.sh install`.
 
 ## How it works
 
 The generated definition is:
 
-    ~/Library/LaunchAgents/com.nomusic.backend.plist
+```text
+~/Library/LaunchAgents/com.nomusic.backend.plist
+```
 
 It runs the installed nomusic serve entry point from the repository's
 environment, with the repository as its working directory. The file is

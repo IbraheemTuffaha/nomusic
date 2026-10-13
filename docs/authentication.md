@@ -12,6 +12,7 @@ Run these commands as the same operating-system user that runs the backend:
 
 ```sh
 backend/.venv/bin/nomusic auth generate --label "my Mac"
+backend/.venv/bin/nomusic auth check
 backend/.venv/bin/nomusic auth list
 backend/.venv/bin/nomusic auth revoke KEY_ID
 backend/.venv/bin/nomusic auth rotate --revoke KEY_ID --label "replacement"
@@ -23,6 +24,11 @@ trusted settings; it is never written to the key file. The file defaults to
 `NOMUSIC_AUTH_FILE=/absolute/path/to/operator-keys.json`. The backend refuses a
 missing key file, a file with group/other permissions, or a file with no active
 key. It creates new files as owner-only (`0600`) inside an owner-only directory.
+
+`auth check` runs the same validation used when the server starts. The macOS
+background-service helper runs it before loading a LaunchAgent, so malformed,
+insecure or fully revoked key files fail before launchd can enter a restart
+loop.
 
 Start the backend only after at least one key exists:
 

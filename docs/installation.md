@@ -106,9 +106,9 @@ not in the lock. Direct versions and entry points live in
 host package manager. FFmpeg needs `libopus`, `libmp3lame`, `aac` and `libx264`
 for normal processing/exports; verification additionally checks `libvpx-vp9`.
 
-The background-service option assumes an operator key has already been
-generated. If the first install happens before credentials exist, finish the
-install, run `backend/.venv/bin/nomusic auth generate`, then run
+The background-service option requires a valid operator key. If the first
+install happens before credentials exist, the interactive installer leaves the
+service off; run `backend/.venv/bin/nomusic auth generate`, then
 `./service.sh install`.
 
 ## Diagnostics and model storage
