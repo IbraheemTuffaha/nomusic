@@ -84,6 +84,23 @@ def test_auth_check_command_matches_backend_startup_validation(monkeypatch, tmp_
     assert main(["auth", "check"]) == 1
 
 
+@pytest.mark.parametrize("mutate", ["permissions", "revoked"])
+def test_auth_check_rejects_unusable_key_configuration(monkeypatch, tmp_path, mutate):
+    import nomusic.config as config
+    from nomusic.__main__ import main
+
+    path = tmp_path / "keys.json"
+    store = AuthStore(path)
+    _, info = store.generate("tests")
+    if mutate == "permissions" and os.name == "posix":
+        path.chmod(0o644)
+    elif mutate == "revoked":
+        store.revoke(info.key_id)
+    monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, auth_file=path))
+
+    assert main(["auth", "check"]) == 1
+
+
 def test_required_app_fails_startup_without_keys(monkeypatch, tmp_path):
     from nomusic import server
 

@@ -97,8 +97,18 @@ configured_host() {
   printf '%s\n' "${host:-127.0.0.1}"
 }
 
+health_host() {
+  local host
+  host="$(configured_host)"
+  case "$host" in
+    0.0.0.0) host="127.0.0.1" ;;
+    ::|'[::]') host="::1" ;;
+  esac
+  printf '%s\n' "$host"
+}
+
 health_url() {
-  local host="$(configured_host)"
+  local host="$(health_host)"
   if [[ "$host" == *:* && "$host" != \[*\] ]]; then
     host="[$host]"
   fi
@@ -106,7 +116,7 @@ health_url() {
 }
 
 healthy() {
-  curl -fs --max-time 2 -o /dev/null "$(health_url)"
+  curl --noproxy '*' -fs --max-time 2 -o /dev/null "$(health_url)"
 }
 
 wait_for_health() {
@@ -310,6 +320,13 @@ install_service() {
   backup_definition
   WAS_LOADED=0
   loaded && WAS_LOADED=1
+  # The old process may still be draining when launchd receives bootout. Keep
+  # its own shutdown deadline while replacing the definition; do not let a new
+  # setting shorten the time available to the process being upgraded.
+  STOP_TIMEOUT_OVERRIDE=""
+  if (( WAS_LOADED == 1 )); then
+    STOP_TIMEOUT_OVERRIDE="$(definition_value ExitTimeOut || true)"
+  fi
   # Generate the replacement before stopping the old process. Atomic replacement
   # keeps launchd's current definition intact if serialization or validation fails.
   if ! write_definition; then
@@ -323,9 +340,11 @@ install_service() {
     die "The previous backend could not be stopped; the new definition was not installed."
   fi
   if healthy; then
+    local conflict_url
+    conflict_url="$(health_url)"
     restore_definition 1 \
       || die "Another backend is already answering, and the previous definition could not be restored."
-    die "Another backend already answers at $(health_url); stop it before starting the background service."
+    die "Another backend already answers at $conflict_url; stop it before starting the background service."
   fi
   # A disabled label must be enabled before launchd can bootstrap the plist.
   if ! launchctl enable "$TARGET" >/dev/null 2>&1 \
@@ -336,10 +355,12 @@ install_service() {
   fi
   if ! wait_for_health; then
     if ! stop_loaded; then
-      rm -f -- "$BACKUP_FILE"
-      BACKUP_FILE=""
       printf 'The service failed its health check and could not be stopped. It may keep restarting.\n' >&2
       printf '  %q uninstall\n  tail -f %q\n' "$REPO_DIR/service.sh" "$LOG" >&2
+      if [[ -n "$BACKUP_FILE" ]]; then
+        printf 'The previous definition is preserved at %q. After the failed service is stopped, restore it with:\n  mv -- %q %q\n' \
+          "$BACKUP_FILE" "$BACKUP_FILE" "$PLIST" >&2
+      fi
       die "The failed service remains loaded."
     fi
     restore_definition 1 \
@@ -374,9 +395,7 @@ case "$COMMAND" in
     printf 'nomusic background service removed; cache, models, keys, and logs were preserved.\n'
     ;;
   status)
-    if [[ -e "$PLIST" ]] && ! ours; then
-      die "A different nomusic installation owns the LaunchAgent. Run that checkout's service.sh uninstall first."
-    fi
+    check_ownership
     if ! loaded; then
       if [[ -f "$PLIST" ]] && ours; then
         printf 'The background service is installed but stopped. Run %q install.\n' "$REPO_DIR/service.sh"

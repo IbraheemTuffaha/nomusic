@@ -30,8 +30,9 @@ NOMUSIC_VENV may select another dedicated, absolute virtual-environment path.
 NOMUSIC_UV may point to an existing uv 0.12.19 executable.
 NOMUSIC_JS_RUNTIME may select a supported Node.js or Deno executable.
 Stop the backend before installing. A running macOS service is stopped before
-the environment changes and restarted when installation completes. An old
-default backend/.venv is moved to
+the environment changes and restarted when installation completes. An
+interactive upgrade keeps an already-running service enabled; --no-service
+overrides that choice. An old default backend/.venv is moved to
 backend/.venv.bak when its Python differs; an existing backup is never replaced.
 Incompatible explicitly selected environments are left untouched.
 EOF
@@ -323,8 +324,15 @@ fi
 
 trap - EXIT
 if [[ "$SERVICE" == "ask" ]]; then
-  SERVICE="no"
-  if [[ "$OS" == "Darwin" && -t 0 ]]; then
+  if [[ "$SERVICE_PAUSED" -eq 1 ]]; then
+    # An upgrade of an already-running service keeps it running without
+    # asking again. An explicit --no-service still wins because SERVICE is
+    # already "no" and does not enter this branch.
+    SERVICE="yes"
+  else
+    SERVICE="no"
+  fi
+  if [[ "$SERVICE" == "no" && "$OS" == "Darwin" && -t 0 ]]; then
     if ! "$ENV_DIR/bin/nomusic" auth check >/dev/null 2>&1; then
       printf '\nNo valid operator key exists yet; leaving the background service off. Generate a key, then run:\n  %q auth generate\n  %q install\n' \
         "$ENV_DIR/bin/nomusic" "$REPO_DIR/service.sh"
@@ -340,9 +348,6 @@ PY
         ""|[Yy]|[Yy][Ee][Ss]) SERVICE="yes" ;;
       esac
     fi
-  elif [[ "$SERVICE_PAUSED" -eq 1 ]]; then
-    # A noninteractive upgrade preserves an already-enabled service.
-    SERVICE="yes"
   fi
 fi
 
@@ -351,8 +356,7 @@ if [[ "$SERVICE" == "yes" ]]; then
   if ! "$BASH" "$REPO_DIR/service.sh" install; then
     printf '\nThe environment is installed, but the background service did not start. Check:\n  %q status\n  tail -f %q\n' \
       "$REPO_DIR/service.sh" "$HOME/Library/Logs/nomusic-backend.log" >&2
-    printf 'After fixing the operator-key configuration, run:\n  %q auth check\n  %q install\n' \
-      "$ENV_DIR/bin/nomusic" "$REPO_DIR/service.sh" >&2
+    printf 'After fixing the reported problem, run:\n  %q install\n' "$REPO_DIR/service.sh" >&2
     die "The background service did not start."
   fi
 else

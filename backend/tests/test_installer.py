@@ -55,7 +55,10 @@ def installer(tmp_path):
     executable(binaries / "curl", r'''
 import os
 from pathlib import Path
+import sys
 
+with open(Path(os.environ["HOME"]) / "curl-urls", "a") as calls:
+    calls.write(sys.argv[-1] + "\n")
 if os.environ.get("TEST_FAIL") == "curl":
     raise SystemExit(7)
 raise SystemExit(0 if (Path(os.environ["HOME"]) / "health-ok").exists() else 7)
@@ -103,6 +106,7 @@ import sys
 
 home = Path(os.environ["HOME"])
 loaded, stopping = home / "launchd-loaded", home / "launchd-stopping"
+bootouts = home / "launchd-bootouts"
 uv_calls = Path(os.environ["TEST_UV_CALLS"])
 with open(home / "launchctl-calls.jsonl", "a") as calls:
     calls.write(json.dumps({
@@ -123,7 +127,12 @@ if command == "print":
 if command == "bootout":
     if not loaded.exists():
         raise SystemExit(3)
-    stopping.write_text(os.environ.get("TEST_STOP_POLLS", "1"))
+    count = int(bootouts.read_text()) + 1 if bootouts.exists() else 1
+    bootouts.write_text(str(count))
+    polls = os.environ.get("TEST_STOP_POLLS", "1")
+    if count >= 2:
+        polls = os.environ.get("TEST_STOP_POLLS_SECOND", polls)
+    stopping.write_text(polls)
 elif os.environ.get("TEST_FAIL") == command:
     raise SystemExit(5)
 elif command == "bootstrap":
@@ -638,6 +647,14 @@ def test_reinstall_turns_running_service_off_while_environment_changes(installer
     assert installer.service_loaded()
 
 
+def test_terminal_upgrade_preserves_running_service_without_asking(installer):
+    assert installer.run("--service", **MAC).returncode == 0
+    result = installer.run(answer="n\n", **MAC)
+    assert result.returncode == 0, result.stderr
+    assert "Keep nomusic running" not in result.stdout
+    assert installer.service_loaded()
+
+
 def test_install_elsewhere_does_not_take_over_a_running_service(installer):
     def backend():
         return plistlib.loads(installer.plist.read_bytes())["ProgramArguments"][0]
@@ -650,7 +667,7 @@ def test_install_elsewhere_does_not_take_over_a_running_service(installer):
     assert "another checkout" in scripted.stderr
     assert service_changes(installer, before) == [] and backend() == str(other / "bin/nomusic")
     status = installer.service("status", **MAC)
-    assert status.returncode == 1 and "different nomusic installation" in status.stderr
+    assert status.returncode == 1 and "another nomusic checkout" in status.stderr
     assert backend() == str(other / "bin/nomusic") and installer.service_loaded()
 
 
@@ -717,6 +734,18 @@ def test_service_script_restarts_this_checkout(installer):
     assert definition["EnvironmentVariables"]["NOMUSIC_PORT"] == "18723"
 
 
+def test_service_upgrade_waits_for_the_previous_shutdown_deadline(installer):
+    assert installer.run("--service", NOMUSIC_SHUTDOWN_GRACE_SECONDS="120", **MAC).returncode == 0
+    result = installer.service(
+        "restart",
+        NOMUSIC_SHUTDOWN_GRACE_SECONDS="1",
+        TEST_STOP_POLLS="100",
+        **MAC,
+    )
+    assert result.returncode == 0, result.stderr
+    assert installer.service_loaded()
+
+
 def test_failed_health_check_restores_the_previous_definition(installer):
     assert installer.run("--service", **MAC).returncode == 0
     previous = installer.plist.read_bytes()
@@ -729,6 +758,23 @@ def test_failed_health_check_restores_the_previous_definition(installer):
     assert result.returncode != 0
     assert "previous definition was restored" in result.stderr
     assert installer.plist.read_bytes() == previous
+    assert installer.service_loaded()
+
+
+def test_failed_health_check_keeps_rollback_copy_if_stop_times_out(installer):
+    assert installer.run("--service", NOMUSIC_SHUTDOWN_GRACE_SECONDS="1", **MAC).returncode == 0
+    result = installer.service(
+        "restart",
+        TEST_FAIL="curl",
+        TEST_STOP_POLLS="1",
+        TEST_STOP_POLLS_SECOND="99",
+        NOMUSIC_SERVICE_HEALTH_TIMEOUT_SECONDS="1",
+        TMPDIR=str(installer.home.parent),
+        **MAC,
+    )
+    assert result.returncode != 0
+    assert "previous definition is preserved" in result.stderr
+    assert list(installer.home.parent.glob("nomusic-service.*"))
     assert installer.service_loaded()
 
 
@@ -751,6 +797,22 @@ def test_service_refuses_a_malformed_existing_definition(installer):
     assert "not a readable LaunchAgent definition" in result.stderr
     assert "launchctl bootout" in result.stderr and "rm -f" in result.stderr
     assert installer.plist.read_bytes() == before and not installer.service_loaded()
+
+
+def test_service_status_refuses_a_malformed_existing_definition(installer):
+    assert installer.run(**MAC).returncode == 0
+    installer.plist.parent.mkdir(parents=True)
+    installer.plist.write_text("placeholder")
+    result = installer.service("status", **MAC)
+    assert result.returncode != 0
+    assert "not a readable LaunchAgent definition" in result.stderr
+    assert "launchctl bootout" in result.stderr and "rm -f" in result.stderr
+
+
+def test_service_health_probe_uses_loopback_for_wildcard_bind(installer):
+    assert installer.run("--service", NOMUSIC_HOST="0.0.0.0", **MAC).returncode == 0
+    urls = (installer.home / "curl-urls").read_text().splitlines()
+    assert urls and urls[-1] == "http://127.0.0.1:8723/healthz"
 
 
 def test_service_requires_an_operator_key_file(installer):

@@ -148,6 +148,8 @@ Stop the helper and keep the previous checkout until the replacement works.
 Update the project files, run `./install.sh`, then run doctor and the
 [local workflow](local-workflow.md). On macOS, a running owned background service
 is stopped while the environment changes and restarted after a successful install.
+An interactive upgrade keeps it enabled without asking again; `--no-service`
+leaves it off.
 Reload the extension and video tabs. See [background service](background-service.md)
 for explicit install, status, restart and uninstall commands.
 

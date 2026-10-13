@@ -49,9 +49,9 @@ Do not also run `nomusic serve` in a Terminal: both use the same port.
 
 status checks that this checkout owns the LaunchAgent, that launchd has loaded
 it, and that the local HTTP liveness endpoint responds. A loaded but unhealthy
-service is reported as an error. restart reloads the generated definition and
-restarts this checkout. uninstall removes only the LaunchAgent; it preserves
-cache, model, operator-key and log data.
+service is reported as an error. restart regenerates the definition from the
+current shell settings and restarts this checkout. uninstall removes only the
+LaunchAgent; it preserves cache, model, operator-key and log data.
 
 The helper writes its log to:
 
@@ -66,7 +66,10 @@ tail -f ~/Library/Logs/nomusic-backend.log
 ```
 
 Stopping gives active work the same shutdown grace period as Control+C in a
-terminal, 60 seconds by default. Finish long exports before uninstalling.
+terminal, 60 seconds by default. Set
+`NOMUSIC_SERVICE_HEALTH_TIMEOUT_SECONDS` to change how long install/restart
+waits for `/healthz`; the stop deadline follows the backend's configured
+`NOMUSIC_SHUTDOWN_GRACE_SECONDS`. Finish long exports before uninstalling.
 
 ## Settings
 
@@ -88,10 +91,11 @@ application defaults.
 ## Upgrades and moving the checkout
 
 `install.sh` stops an owned running service before changing the environment and
-starts it again when the installation completes. Choosing `--no-service` leaves
-it off. If installation or the service health check fails, the previous
-definition is restored when possible and the installer prints the recovery
-commands.
+starts it again when the installation completes. An interactive upgrade keeps
+an already-running service enabled without asking again; choosing
+`--no-service` leaves it off. If installation or the service health check fails,
+the previous definition is restored when possible and the installer prints the
+recovery commands.
 
 There is one service label per user. If another checkout owns it, installation
 fails without changing that service. Run the other checkout's
