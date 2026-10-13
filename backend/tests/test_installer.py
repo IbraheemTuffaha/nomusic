@@ -762,12 +762,13 @@ def test_failed_health_check_restores_the_previous_definition(installer):
 
 
 def test_failed_health_check_keeps_rollback_copy_if_stop_times_out(installer):
-    assert installer.run("--service", NOMUSIC_SHUTDOWN_GRACE_SECONDS="1", **MAC).returncode == 0
+    assert installer.run("--service", NOMUSIC_SHUTDOWN_GRACE_SECONDS="120", **MAC).returncode == 0
     result = installer.service(
         "restart",
         TEST_FAIL="curl",
         TEST_STOP_POLLS="1",
         TEST_STOP_POLLS_SECOND="99",
+        NOMUSIC_SHUTDOWN_GRACE_SECONDS="1",
         NOMUSIC_SERVICE_HEALTH_TIMEOUT_SECONDS="1",
         TMPDIR=str(installer.home.parent),
         **MAC,

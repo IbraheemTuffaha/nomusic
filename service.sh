@@ -339,6 +339,9 @@ install_service() {
       || die "The previous backend could not be stopped, and the previous definition could not be restored."
     die "The previous backend could not be stopped; the new definition was not installed."
   fi
+  # The old deadline was only for the process we just drained. Subsequent
+  # rollback/cleanup stops must use the replacement definition's own deadline.
+  STOP_TIMEOUT_OVERRIDE=""
   if healthy; then
     local conflict_url
     conflict_url="$(health_url)"
