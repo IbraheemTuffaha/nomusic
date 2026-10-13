@@ -52,11 +52,22 @@ def installer(tmp_path):
     executable(binaries / "node", "import os\nprint(os.environ.get('TEST_NODE', 'v24.19.0'))\n")
     for name in ("ffmpeg", "ffprobe"):
         executable(binaries / name, "pass\n")
-    executable(binaries / "curl", "raise SystemExit(0)\n")
+    executable(binaries / "curl", r'''
+import os
+from pathlib import Path
+
+if os.environ.get("TEST_FAIL") == "curl":
+    raise SystemExit(7)
+raise SystemExit(0 if (Path(os.environ["HOME"]) / "health-ok").exists() else 7)
+''')
     executable(binaries / "plutil", r'''
 import plistlib
 import sys
 
+if "-lint" in sys.argv:
+    with open(sys.argv[-1], "rb") as definition:
+        plistlib.load(definition)
+    raise SystemExit(0)
 with open(sys.argv[-1], "rb") as definition:
     value = plistlib.load(definition)
 key = sys.argv[sys.argv.index("-extract") + 1]
@@ -71,7 +82,16 @@ print(value)
     home.mkdir()
     auth_file = home / ".config/nomusic/operator-keys.json"
     auth_file.parent.mkdir(parents=True)
-    auth_file.write_text("{}\n")
+    auth_file.write_text(json.dumps({
+        "version": 1,
+        "keys": [{
+            "id": "0123456789abcdef",
+            "digest": "a" * 64,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "revoked_at": None,
+        }],
+    }) + "\n")
+    auth_file.chmod(0o600)
     # launchd as service.sh meets it: bootout returns before the job is gone,
     # and a label that is still loaded cannot be loaded again.
     executable(binaries / "launchctl", r'''
@@ -98,6 +118,7 @@ if command == "print":
         else:
             stopping.unlink()
             loaded.unlink()
+            (home / "health-ok").unlink(missing_ok=True)
     raise SystemExit(0 if loaded.exists() else 113)
 if command == "bootout":
     if not loaded.exists():
@@ -112,6 +133,7 @@ elif command == "bootstrap":
     with open(sys.argv[3], "rb") as definition:
         plistlib.load(definition)
     loaded.touch()
+    (home / "health-ok").touch()
 ''')
     uv = binaries / "uv"
     executable(uv, r'''
@@ -160,9 +182,29 @@ else:
 """)
 python.chmod(0o755)
 nomusic = env / "bin/nomusic"
-nomusic.write_text("#!" + sys.executable + "\nimport os, sys\nraise SystemExit(24 if os.environ.get('TEST_FAIL') == sys.argv[1] else 0)\n")
+nomusic.write_text("#!" + sys.executable + r"""
+import json
+import os
+from pathlib import Path
+import sys
+
+if sys.argv[1:] == ["auth", "check"]:
+    path = Path(os.environ.get("NOMUSIC_AUTH_FILE", Path(os.environ["HOME"]) / ".config/nomusic/operator-keys.json")).expanduser()
+    if (os.environ.get("TEST_FAIL") == "auth" or not path.is_file()
+            or path.stat().st_mode & 0o77):
+        raise SystemExit(1)
+    try:
+        data = json.loads(path.read_text())
+        keys = data["keys"]
+        if data["version"] != 1 or not any(key.get("revoked_at") is None for key in keys):
+            raise ValueError
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        raise SystemExit(1)
+    raise SystemExit(0)
+raise SystemExit(24 if os.environ.get("TEST_FAIL") == sys.argv[1] else 0)
+""")
 nomusic.chmod(0o755)
-''')
+    ''')
     # CI's model-cache paths are not part of the simulated terminal settings.
     # Each test supplies the backend and cache settings it expects to persist.
     env = {key: value for key, value in os.environ.items()
@@ -503,7 +545,6 @@ def test_mac_service_runs_this_installation_with_the_terminal_settings(installer
             "PATH": tools,
             "NOMUSIC_SHUTDOWN_GRACE_SECONDS": "90.5",
             "HF_HOME": "/models",
-            "HOME": str(installer.home),
         },
         "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 10,
         "ExitTimeOut": 96,  # launchd waits for the backend's own deadline
@@ -513,7 +554,7 @@ def test_mac_service_runs_this_installation_with_the_terminal_settings(installer
     domain = f"gui/{os.getuid()}"
     assert [call["args"] for call in installer.launchctl() if call["args"][0] != "print"] == [
         ["enable", f"{domain}/com.nomusic.backend"], ["bootstrap", domain, str(installer.plist)]]
-    assert "Saved settings: HF_HOME, HOME, NOMUSIC_SHUTDOWN_GRACE_SECONDS" in result.stdout
+    assert "Saved settings: HF_HOME, NOMUSIC_SHUTDOWN_GRACE_SECONDS" in result.stdout
     assert "running as a background service" in result.stdout and "Start the backend" not in result.stdout
 
 
@@ -561,6 +602,23 @@ def test_scripted_mac_install_does_not_ask_or_start_service(installer):
     assert "Keep nomusic running" not in result.stdout
     assert service_changes(installer) == [] and not installer.plist.exists()
     assert "Start the backend" in result.stdout and "service.sh install" in result.stdout
+
+
+def test_mac_terminal_install_without_a_key_skips_service(installer):
+    installer.auth.write_text("{}\n")
+    result = installer.run(answer="\n", **MAC)
+    assert result.returncode == 0, result.stderr
+    assert "No valid operator key exists" in result.stdout
+    assert "Keep nomusic running" not in result.stdout
+    assert not installer.plist.exists() and not installer.service_loaded()
+
+
+def test_explicit_service_requires_a_valid_key(installer):
+    installer.auth.write_text("{}\n")
+    result = installer.run("--service", **MAC)
+    assert result.returncode != 0
+    assert "auth generate" in result.stderr
+    assert not installer.plist.exists() and not installer.service_loaded()
 
 
 def test_linux_install_at_a_terminal_does_not_offer_service(installer):
@@ -635,13 +693,13 @@ def test_service_script_reports_and_removes_service(installer):
     log = installer.home / "Library/Logs/nomusic-backend.log"
     cache.mkdir(parents=True)
     key.parent.mkdir(parents=True, exist_ok=True)
-    key.write_text("operator key")
+    key_contents = key.read_bytes()
     log.write_text("backend log")
     for _ in range(2):
         result = installer.service("uninstall", **MAC)
         assert result.returncode == 0, result.stderr
         assert not installer.plist.exists() and not installer.service_loaded()
-    assert cache.exists() and key.read_text() == "operator key" and log.read_text() == "backend log"
+    assert cache.exists() and key.read_bytes() == key_contents and log.read_text() == "backend log"
     assert installer.service("status", **MAC).returncode == 1
     restarted = installer.service("install", **MAC)
     assert restarted.returncode == 0, restarted.stderr
@@ -659,6 +717,30 @@ def test_service_script_restarts_this_checkout(installer):
     assert definition["EnvironmentVariables"]["NOMUSIC_PORT"] == "18723"
 
 
+def test_failed_health_check_restores_the_previous_definition(installer):
+    assert installer.run("--service", **MAC).returncode == 0
+    previous = installer.plist.read_bytes()
+    result = installer.service(
+        "restart",
+        TEST_FAIL="curl",
+        NOMUSIC_SERVICE_HEALTH_TIMEOUT_SECONDS="1",
+        **MAC,
+    )
+    assert result.returncode != 0
+    assert "previous definition was restored" in result.stderr
+    assert installer.plist.read_bytes() == previous
+    assert installer.service_loaded()
+
+
+def test_existing_listener_is_not_reported_as_the_new_service(installer):
+    assert installer.run(**MAC).returncode == 0
+    (installer.home / "health-ok").touch()
+    result = installer.service("install", **MAC)
+    assert result.returncode != 0
+    assert "already answers" in result.stderr
+    assert not installer.plist.exists() and not installer.service_loaded()
+
+
 def test_service_refuses_a_malformed_existing_definition(installer):
     assert installer.run(**MAC).returncode == 0
     installer.plist.parent.mkdir(parents=True)
@@ -666,7 +748,8 @@ def test_service_refuses_a_malformed_existing_definition(installer):
     before = installer.plist.read_bytes()
     result = installer.service("install", **MAC)
     assert result.returncode != 0
-    assert "another nomusic checkout" in result.stderr
+    assert "not a readable LaunchAgent definition" in result.stderr
+    assert "launchctl bootout" in result.stderr and "rm -f" in result.stderr
     assert installer.plist.read_bytes() == before and not installer.service_loaded()
 
 

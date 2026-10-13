@@ -325,16 +325,21 @@ trap - EXIT
 if [[ "$SERVICE" == "ask" ]]; then
   SERVICE="no"
   if [[ "$OS" == "Darwin" && -t 0 ]]; then
-    # Do not let text typed while installation ran answer this question.
-    "$ENV_DIR/bin/python" - 3<&0 <<'PY' || true
+    if ! "$ENV_DIR/bin/nomusic" auth check >/dev/null 2>&1; then
+      printf '\nNo valid operator key exists yet; leaving the background service off. Generate a key, then run:\n  %q auth generate\n  %q install\n' \
+        "$ENV_DIR/bin/nomusic" "$REPO_DIR/service.sh"
+    else
+      # Do not let text typed while installation ran answer this question.
+      "$ENV_DIR/bin/python" - 3<&0 <<'PY' || true
 import termios
 termios.tcflush(3, termios.TCIFLUSH)
 PY
-    printf '\nKeep nomusic running in the background? [Y/n] '
-    read -r ANSWER || ANSWER="n"
-    case "$ANSWER" in
-      ""|[Yy]|[Yy][Ee][Ss]) SERVICE="yes" ;;
-    esac
+      printf '\nKeep nomusic running in the background? [Y/n] '
+      read -r ANSWER || ANSWER="n"
+      case "$ANSWER" in
+        ""|[Yy]|[Yy][Ee][Ss]) SERVICE="yes" ;;
+      esac
+    fi
   elif [[ "$SERVICE_PAUSED" -eq 1 ]]; then
     # A noninteractive upgrade preserves an already-enabled service.
     SERVICE="yes"
@@ -343,8 +348,13 @@ fi
 
 printf '\nInstall complete (%s).\n' "$PROFILE"
 if [[ "$SERVICE" == "yes" ]]; then
-  "$BASH" "$REPO_DIR/service.sh" install \
-    || die "The environment is installed, but the background service did not start. Inspect its log or run '$REPO_DIR/service.sh status'."
+  if ! "$BASH" "$REPO_DIR/service.sh" install; then
+    printf '\nThe environment is installed, but the background service did not start. Check:\n  %q status\n  tail -f %q\n' \
+      "$REPO_DIR/service.sh" "$HOME/Library/Logs/nomusic-backend.log" >&2
+    printf 'After fixing the operator-key configuration, run:\n  %q auth check\n  %q install\n' \
+      "$ENV_DIR/bin/nomusic" "$REPO_DIR/service.sh" >&2
+    die "The background service did not start."
+  fi
 else
   printf 'Start the backend:\n  %q serve\n' "$ENV_DIR/bin/nomusic"
   if [[ "$OS" == "Darwin" ]]; then

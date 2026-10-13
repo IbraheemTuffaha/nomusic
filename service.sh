@@ -2,7 +2,7 @@
 # Manage the authenticated nomusic backend as a per-user macOS LaunchAgent.
 set -euo pipefail
 
-SCRIPT_PATH="$0"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
 REPO_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 ENV_DIR="$REPO_DIR/backend/.venv"
 if [[ -n "${NOMUSIC_VENV-}" ]]; then
@@ -21,7 +21,9 @@ TARGET="$DOMAIN/$LABEL"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/nomusic-backend.log"
 HEALTH_TIMEOUT="${NOMUSIC_SERVICE_HEALTH_TIMEOUT_SECONDS-30}"
-SKIP_HEALTH="${NOMUSIC_SERVICE_SKIP_HEALTH-0}"
+STOP_TIMEOUT_OVERRIDE=""
+WAS_LOADED=0
+BACKUP_FILE=""
 
 die() {
   printf 'Error: %s\n' "$1" >&2
@@ -57,6 +59,8 @@ esac
 [[ "$(uname -s)" == "Darwin" ]] || die "The background service is available on macOS only."
 command -v launchctl >/dev/null 2>&1 || die "launchctl is unavailable; run this from macOS."
 command -v plutil >/dev/null 2>&1 || die "plutil is unavailable; run this from macOS."
+command -v curl >/dev/null 2>&1 || die "curl is unavailable; install it before checking service health."
+[[ "$HEALTH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "NOMUSIC_SERVICE_HEALTH_TIMEOUT_SECONDS must be a positive whole number."
 
 loaded() {
   launchctl print "$TARGET" >/dev/null 2>&1
@@ -87,17 +91,25 @@ configured_port() {
   printf '%s\n' "${port:-8723}"
 }
 
+configured_host() {
+  local host
+  host="$(definition_value EnvironmentVariables.NOMUSIC_HOST || true)"
+  printf '%s\n' "${host:-127.0.0.1}"
+}
+
 health_url() {
-  printf 'http://127.0.0.1:%s/healthz\n' "$(configured_port)"
+  local host="$(configured_host)"
+  if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+    host="[$host]"
+  fi
+  printf 'http://%s:%s/healthz\n' "$host" "$(configured_port)"
 }
 
 healthy() {
-  command -v curl >/dev/null 2>&1 || die "curl is unavailable; install it before checking service health."
-  curl -fsS --max-time 2 -o /dev/null "$(health_url)"
+  curl -fs --max-time 2 -o /dev/null "$(health_url)"
 }
 
 wait_for_health() {
-  [[ "$SKIP_HEALTH" == "1" ]] && return 0
   local deadline=$((SECONDS + HEALTH_TIMEOUT))
   while ! healthy; do
     [[ "$SECONDS" -lt "$deadline" ]] || return 1
@@ -106,12 +118,19 @@ wait_for_health() {
 }
 
 stop_loaded() {
-  local waited=0
+  local waited=0 limit=90 configured
+  configured="${STOP_TIMEOUT_OVERRIDE:-$(definition_value ExitTimeOut || true)}"
+  if [[ "$configured" =~ ^[0-9]+$ ]] && (( configured + 30 > limit )); then
+    limit=$((configured + 30))
+  fi
   loaded || return 0
+  # launchd bootout returns before an active backend has finished shutting down.
   launchctl bootout "$TARGET" >/dev/null 2>&1 || true
   while loaded; do
-    [[ "$waited" -lt 90 ]] \
-      || die "The background backend is still stopping. Try again in a moment."
+    if [[ "$waited" -ge "$limit" ]]; then
+      printf 'Error: The background backend is still stopping after %ss. Try again in a moment.\n' "$limit" >&2
+      return 1
+    fi
     [[ "$waited" -ne 3 ]] \
       || printf 'Waiting for the backend to finish active work...\n'
     sleep 1
@@ -125,6 +144,7 @@ import math
 import os
 import plistlib
 import sys
+import tempfile
 from pathlib import Path
 
 from nomusic.config import SETTINGS
@@ -166,7 +186,6 @@ allowed.update({
     "NOMUSIC_RELOAD",
     "HF_HOME",
     "HF_HUB_CACHE",
-    "HOME",
 })
 environment = {key: value for key, value in os.environ.items() if key in allowed}
 path_entries = [
@@ -179,14 +198,7 @@ plist_path = Path(plist)
 log_path = Path(log)
 plist_path.parent.mkdir(parents=True, exist_ok=True)
 log_path.parent.mkdir(parents=True, exist_ok=True)
-try:
-    plist_path.parent.chmod(0o700)
-    log_path.parent.chmod(0o700)
-except OSError:
-    pass
-
-with plist_path.open("wb") as file:
-    plistlib.dump({
+definition = {
         "Label": label,
         "ProgramArguments": [command, "serve"],
         "WorkingDirectory": project,
@@ -197,8 +209,24 @@ with plist_path.open("wb") as file:
         "ExitTimeOut": math.ceil(grace) + 5,
         "StandardOutPath": log,
         "StandardErrorPath": log,
-    }, file, sort_keys=False)
-os.chmod(plist, 0o600)
+    }
+descriptor, temporary = tempfile.mkstemp(
+    prefix=f".{plist_path.name}.", dir=plist_path.parent
+)
+try:
+    with os.fdopen(descriptor, "wb") as file:
+        plistlib.dump(definition, file, sort_keys=False)
+        file.flush()
+        os.fsync(file.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, plist_path)
+    os.chmod(plist_path, 0o600)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
 saved = sorted(key for key in environment if key != "PATH")
 if saved:
     print("Saved settings: " + ", ".join(saved))
@@ -211,9 +239,21 @@ check_environment() {
 }
 
 check_auth_file() {
-  local auth_file="${NOMUSIC_AUTH_FILE:-$HOME/.config/nomusic/operator-keys.json}"
-  [[ -f "$auth_file" ]] \
-    || die "No operator key file exists at $auth_file. Run '$ENV_DIR/bin/nomusic auth generate' before starting the service."
+  local report
+  if report="$("$ENV_DIR/bin/nomusic" auth check 2>&1)"; then
+    return 0
+  fi
+  [[ -z "$report" ]] || printf '%s\n' "$report" >&2
+  printf 'Generate an operator key, then enable the service with:\n  %q auth generate\n  %q install\n' \
+    "$ENV_DIR/bin/nomusic" "$REPO_DIR/service.sh" >&2
+  return 1
+}
+
+unreadable_definition() {
+  printf 'Error: %s is not a readable LaunchAgent definition; it was not changed.\n' "$PLIST" >&2
+  printf 'If no other nomusic service should remain, recover it with:\n  launchctl bootout %q\n  rm -f -- %q\n' \
+    "$TARGET" "$PLIST" >&2
+  exit 1
 }
 
 check_ownership() {
@@ -221,6 +261,9 @@ check_ownership() {
     || die "$PLIST is a symlink; it was not changed."
   [[ ! -e "$PLIST" || -f "$PLIST" ]] \
     || die "$PLIST is not a regular file; it was not changed."
+  if [[ -e "$PLIST" ]] && ! plutil -lint "$PLIST" >/dev/null 2>&1; then
+    unreadable_definition
+  fi
   if loaded && [[ ! -e "$PLIST" ]]; then
     die "A different nomusic installation owns the loaded LaunchAgent, but its definition is not at $PLIST. Stop that service before continuing."
   fi
@@ -247,10 +290,15 @@ restore_definition() {
   fi
   rm -f -- "$PLIST"
   if [[ -n "$BACKUP_FILE" ]]; then
-    mv -- "$BACKUP_FILE" "$PLIST"
-    if ! loaded; then
-      launchctl enable "$TARGET" >/dev/null 2>&1 || true
-      launchctl bootstrap "$DOMAIN" "$PLIST" >/dev/null 2>&1 || true
+    if ! mv -- "$BACKUP_FILE" "$PLIST"; then
+      return 1
+    fi
+    BACKUP_FILE=""
+    if (( WAS_LOADED == 1 )) && ! loaded; then
+      if ! launchctl enable "$TARGET" >/dev/null 2>&1 \
+          || ! launchctl bootstrap "$DOMAIN" "$PLIST" >/dev/null 2>&1; then
+        return 1
+      fi
     fi
   fi
 }
@@ -260,17 +308,45 @@ install_service() {
   check_auth_file
   check_ownership
   backup_definition
-  write_definition
-  stop_loaded
+  WAS_LOADED=0
+  loaded && WAS_LOADED=1
+  # Generate the replacement before stopping the old process. Atomic replacement
+  # keeps launchd's current definition intact if serialization or validation fails.
+  if ! write_definition; then
+    restore_definition 1 \
+      || die "Could not write the LaunchAgent definition, and the previous definition could not be restored."
+    die "Could not write the LaunchAgent definition; the previous definition was preserved."
+  fi
+  if ! stop_loaded; then
+    restore_definition 1 \
+      || die "The previous backend could not be stopped, and the previous definition could not be restored."
+    die "The previous backend could not be stopped; the new definition was not installed."
+  fi
+  if healthy; then
+    restore_definition 1 \
+      || die "Another backend is already answering, and the previous definition could not be restored."
+    die "Another backend already answers at $(health_url); stop it before starting the background service."
+  fi
+  # A disabled label must be enabled before launchd can bootstrap the plist.
   if ! launchctl enable "$TARGET" >/dev/null 2>&1 \
       || ! launchctl bootstrap "$DOMAIN" "$PLIST" >/dev/null 2>&1; then
-    restore_definition 1
+    restore_definition 1 \
+      || die "launchd could not start the backend, and the previous definition could not be restored."
     die "launchd could not start the backend. Check that you are logged in to this Mac's desktop."
   fi
-  restore_definition 0
   if ! wait_for_health; then
-    die "The service was loaded but did not answer the health check within ${HEALTH_TIMEOUT}s. Inspect $LOG."
+    if ! stop_loaded; then
+      rm -f -- "$BACKUP_FILE"
+      BACKUP_FILE=""
+      printf 'The service failed its health check and could not be stopped. It may keep restarting.\n' >&2
+      printf '  %q uninstall\n  tail -f %q\n' "$REPO_DIR/service.sh" "$LOG" >&2
+      die "The failed service remains loaded."
+    fi
+    restore_definition 1 \
+      || die "The service failed its health check and the previous definition could not be restored. Inspect $LOG."
+    die "The service failed its health check; the previous definition was restored. Inspect $LOG."
   fi
+  restore_definition 0
   printf 'nomusic is running as a background service.\n'
   printf '  Starts:   at login in the current user session\n'
   printf '  Log:      %s\n' "$LOG"
@@ -291,9 +367,10 @@ case "$COMMAND" in
     ;;
   uninstall)
     check_ownership
+    STOP_TIMEOUT_OVERRIDE="$(definition_value ExitTimeOut || true)"
     # Remove the login definition first so a delayed stop cannot relaunch it.
     rm -f -- "$PLIST"
-    stop_loaded
+    stop_loaded || die "The service definition was removed, but the backend is still stopping. Try again after active work finishes."
     printf 'nomusic background service removed; cache, models, keys, and logs were preserved.\n'
     ;;
   status)

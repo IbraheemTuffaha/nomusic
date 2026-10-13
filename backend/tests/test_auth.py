@@ -70,6 +70,20 @@ def test_required_store_rejects_missing_or_all_revoked_configuration(tmp_path):
         store.validate()
 
 
+def test_auth_check_command_matches_backend_startup_validation(monkeypatch, tmp_path):
+    import nomusic.config as config
+    from nomusic.__main__ import main
+
+    path = tmp_path / "keys.json"
+    store = AuthStore(path)
+    store.generate("tests")
+    monkeypatch.setattr(config, "SETTINGS", replace(config.SETTINGS, auth_file=path))
+
+    assert main(["auth", "check"]) == 0
+    path.write_text("{}\n")
+    assert main(["auth", "check"]) == 1
+
+
 def test_required_app_fails_startup_without_keys(monkeypatch, tmp_path):
     from nomusic import server
 
