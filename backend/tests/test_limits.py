@@ -57,6 +57,26 @@ def test_extractor_media_targets_are_revalidated():
     assert reason == "url host is not allowed"
 
 
+def test_match_filter_accepts_yt_dlp_calls():
+    from yt_dlp import YoutubeDL
+
+    public = {"id": "clip", "title": "clip", "url": "https://93.184.216.34/media"}
+    private = {
+        "id": "clip",
+        "title": "clip",
+        "formats": [{"url": "http://127.0.0.1:8723/private"}],
+    }
+    with YoutubeDL({
+        "quiet": True,
+        "no_warnings": True,
+        "match_filter": downloader._validate_media_targets,
+    }) as ydl:
+        assert ydl._match_entry(public, incomplete=True, silent=True) is None
+        assert ydl._match_entry(public, incomplete=False, silent=True) is None
+        assert ydl._match_entry(private, incomplete=True, silent=True) == "url host is not allowed"
+        assert ydl._match_entry(private, incomplete=False, silent=True) == "url host is not allowed"
+
+
 def test_short_completed_source_cannot_be_reused(monkeypatch, tmp_path):
     source = tmp_path / "source.wav"
     source.write_bytes(b"source")
