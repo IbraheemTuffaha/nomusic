@@ -1,9 +1,13 @@
-# Background service (macOS)
+# Optional background service (macOS)
 
-The selected M6 host is the MacBook Pro. The backend can run as a per-user
+This guide covers the optional macOS path for running the backend as a per-user
 LaunchAgent instead of in a Terminal window. It starts when the user logs in,
 including after a restart, and launchd relaunches it after an unexpected exit.
-Linux service support is outside this host task.
+
+The active M6 deployment runs inference on the Ubuntu/NVIDIA laptop. This
+LaunchAgent is therefore a convenience for running nomusic locally on a Mac;
+it is not required by the laptop deployment. Linux service management is
+handled by the host's supervisor rather than by `service.sh`.
 
 ## Turn it on
 
