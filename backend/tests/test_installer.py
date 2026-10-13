@@ -163,9 +163,11 @@ nomusic = env / "bin/nomusic"
 nomusic.write_text("#!" + sys.executable + "\nimport os, sys\nraise SystemExit(24 if os.environ.get('TEST_FAIL') == sys.argv[1] else 0)\n")
 nomusic.chmod(0o755)
 ''')
+    # CI's model-cache paths are not part of the simulated terminal settings.
+    # Each test supplies the backend and cache settings it expects to persist.
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("NOMUSIC_", "UV_", "TEST_"))
-           and key not in ("PYTHONPATH", "PYTHONHOME")}
+           and key not in ("PYTHONPATH", "PYTHONHOME", "HF_HOME", "HF_HUB_CACHE")}
     # A private HOME keeps the service definition out of the developer's own.
     env.update(PATH=str(binaries), NOMUSIC_UV=str(uv), HOME=str(home),
                TEST_UV_CALLS=str(tmp_path / "uv-calls.jsonl"))
