@@ -354,6 +354,8 @@ def test_http_export_api_rejects_malformed_export_ids(client):
     assert client.get("/exports/not-an-id").status_code == 404
     assert client.get("/exports/not-an-id/download").status_code == 404
     assert client.post("/exports/not-an-id/download-grant").status_code == 404
+    assert client.post("/exports/not-an-id/save").status_code == 404
+    assert client.post("/exports/not-an-id/save", json={}).status_code == 404
     assert client.delete("/exports/not-an-id").status_code == 404
 
 
@@ -465,3 +467,185 @@ def test_download_grant_authorizes_one_fetch_without_the_operator_key(client, ca
     again = client.get(download, headers={"Authorization": f"Bearer {raw}"})
     assert again.status_code == 200
     assert again.content == b"prepared"
+
+
+def test_safe_download_name_keeps_the_artifact_suffix():
+    from nomusic.routes import exports as export_routes
+
+    assert export_routes.safe_download_name(
+        "../../etc/passwd.mp4", "built.mp3"
+    ) == "passwd.mp3"
+    assert export_routes.safe_download_name("   ", "built.mp3") == "built.mp3"
+    assert export_routes.safe_download_name(None, "built.mp3") == "built.mp3"
+    assert export_routes.safe_download_name("Dr. Who.mp3", "built.mp3") == "Dr. Who.mp3"
+    assert export_routes.safe_download_name("a/b\\c.mp3", "built.mp3") == "c.mp3"
+    assert export_routes.safe_download_name("..", "built.mp3") == "nomusic.mp3"
+    long_name = "n" * 150 + ".mp3"
+    assert export_routes.safe_download_name(long_name, "built.mp3") == ("n" * 120) + ".mp3"
+    with pytest.raises(ValueError):
+        export_routes.safe_download_name("song.mp3", "built.txt")
+    with pytest.raises(ValueError):
+        export_routes.safe_download_name("song.mp3", "../built.mp3")
+
+
+def test_copy_export_into_leaves_existing_names_and_quarantine_behind(tmp_path):
+    import os
+    import stat
+
+    from nomusic.routes import exports as export_routes
+
+    source = tmp_path / "built.mp3"
+    source.write_bytes(b"prepared")
+    try:
+        os.setxattr(source, b"user.quarantine", b"marked")
+    except OSError:
+        marked = False
+    else:
+        marked = True
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"secret")
+    link = downloads / "Song.mp3"
+    link.symlink_to(secret)
+    saved = export_routes.copy_export_into(source, downloads, "Song.mp3")
+    assert saved == "Song (1).mp3"
+    assert link.is_symlink()
+    assert secret.read_bytes() == b"secret"
+    copied = downloads / saved
+    assert copied.read_bytes() == b"prepared"
+    assert copied.stat().st_ino != source.stat().st_ino
+    assert copied.stat().st_nlink == 1
+    assert stat.S_ISREG(copied.stat().st_mode)
+    assert stat.S_IMODE(copied.stat().st_mode) == 0o644
+    if marked:
+        assert b"user.quarantine" not in os.listxattr(copied)
+    again = export_routes.copy_export_into(source, downloads, "Song (1).mp3")
+    assert again == "Song (1) (1).mp3"
+    assert copied.read_bytes() == b"prepared"
+
+
+def test_copy_export_into_removes_a_partial_file(tmp_path, monkeypatch):
+    from nomusic.routes import exports as export_routes
+
+    source = tmp_path / "built.mp3"
+    source.write_bytes(b"prepared")
+    downloads = tmp_path / "Downloads"
+
+    def fail(*_args, **_kwargs):
+        raise OSError("disk full at /home/secret/Downloads/Song.mp3")
+
+    monkeypatch.setattr(export_routes.shutil, "copyfileobj", fail)
+    with pytest.raises(OSError, match="disk full"):
+        export_routes.copy_export_into(source, downloads, "Song.mp3")
+    assert list(downloads.iterdir()) == []
+    assert source.read_bytes() == b"prepared"
+
+
+def test_copy_export_into_stops_after_the_collision_cap(tmp_path, monkeypatch):
+    from nomusic.routes import exports as export_routes
+
+    source = tmp_path / "built.mp3"
+    source.write_bytes(b"prepared")
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    (downloads / "Song.mp3").write_bytes(b"old")
+    (downloads / "Song (1).mp3").write_bytes(b"old")
+    monkeypatch.setattr(export_routes, "_MAX_DOWNLOAD_COLLISIONS", 1)
+    with pytest.raises(FileExistsError):
+        export_routes.copy_export_into(source, downloads, "Song.mp3")
+    assert (downloads / "Song.mp3").read_bytes() == b"old"
+    assert (downloads / "Song (1).mp3").read_bytes() == b"old"
+
+
+def test_downloads_directory_follows_a_directory_symlink(monkeypatch, tmp_path):
+    from nomusic.routes import exports as export_routes
+
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "Downloads").symlink_to(real, target_is_directory=True)
+    monkeypatch.setattr(export_routes.Path, "home", staticmethod(lambda: tmp_path))
+    assert export_routes.downloads_directory() == real.resolve()
+
+
+def test_client_is_local_only_for_loopback_peers():
+    from types import SimpleNamespace
+
+    from nomusic.routes import exports as export_routes
+
+    def request(host):
+        return SimpleNamespace(client=SimpleNamespace(host=host))
+
+    assert export_routes._client_is_local(request("127.0.0.1"))
+    assert export_routes._client_is_local(request("::1"))
+    assert export_routes._client_is_local(request("::ffff:127.0.0.1"))
+    assert export_routes._client_is_local(request("testclient"))
+    assert not export_routes._client_is_local(request("203.0.113.8"))
+    assert not export_routes._client_is_local(request("::ffff:203.0.113.8"))
+    assert not export_routes._client_is_local(SimpleNamespace(client=None))
+
+
+def test_save_export_copies_a_loopback_mp3_into_downloads(client, monkeypatch, tmp_path):
+    from nomusic.routes import exports as export_routes
+
+    downloads = tmp_path / "Downloads"
+    monkeypatch.setattr(export_routes, "downloads_directory", lambda: downloads)
+    export_id = _publish_export(client, "mp3")
+    response = client.post(
+        f"/exports/{export_id}/save",
+        json={"filename": "../../etc/passwd.mp4"},
+    )
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert set(response.json()) == {"filename"}
+    assert response.json()["filename"] == "passwd.mp3"
+    assert str(downloads) not in response.text
+    assert str(tmp_path) not in response.text
+    saved = downloads / "passwd.mp3"
+    assert saved.read_bytes() == b"prepared"
+    assert saved.is_symlink() is False
+
+    collision = client.post(
+        f"/exports/{export_id}/save",
+        json={"filename": "passwd.mp3"},
+    )
+    assert collision.status_code == 200
+    assert collision.json()["filename"] == "passwd (1).mp3"
+    assert saved.read_bytes() == b"prepared"
+    assert (downloads / "passwd (1).mp3").read_bytes() == b"prepared"
+    assert client.post(f"/exports/{'e' * 32}/save", json={}).status_code == 404
+
+
+def test_save_export_hides_filesystem_errors(client, monkeypatch, tmp_path):
+    from nomusic.routes import exports as export_routes
+
+    export_id = _publish_export(client, "mp3")
+    secret = tmp_path / "secret-downloads"
+
+    def boom():
+        raise OSError(f"permission denied: {secret}")
+
+    monkeypatch.setattr(export_routes, "downloads_directory", boom)
+    response = client.post(f"/exports/{export_id}/save", json={})
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Could not save the export into Downloads."
+    assert str(secret) not in response.text
+    assert "permission denied" not in response.text
+
+
+def test_save_export_refuses_a_remote_peer(client, monkeypatch, tmp_path):
+    from nomusic.routes import exports as export_routes
+
+    downloads = tmp_path / "Downloads"
+    monkeypatch.setattr(export_routes, "downloads_directory", lambda: downloads)
+    monkeypatch.setattr(export_routes, "_client_is_local", lambda _request: False)
+    export_id = _publish_export(client, "mp3")
+    response = client.post(
+        f"/exports/{export_id}/save",
+        json={"filename": "Song.mp3"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == (
+        "Local save is only available for a loopback connection."
+    )
+    assert not downloads.exists()

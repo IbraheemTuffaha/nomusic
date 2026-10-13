@@ -19,7 +19,7 @@ async function settle() {
   for (let i = 0; i < 12; i++) await Promise.resolve();
 }
 
-function setup(t) {
+function setup(t, downloadResponse) {
   const dom = domFixture(t);
   const button = new Button({});
   button.position(dom.document.body);
@@ -43,7 +43,7 @@ function setup(t) {
   URL.revokeObjectURL = () => {};
   t.mock.method(chrome.runtime, "sendMessage", (message, callback) => {
     messages.push(message);
-    callback({
+    callback(downloadResponse ? downloadResponse(message) : {
       ok: true,
       backendUrl: "http://127.0.0.1:8723",
       grant: "a".repeat(43),
@@ -107,6 +107,60 @@ test("ready export saves a typed blob from a one-time grant", async (t) => {
   assert.equal(requests.some((request) => request.options?.method === "DELETE"), false);
   assert.equal(button._downloading, false);
   assert.equal(button.label.textContent, "nomusic on");
+});
+
+test("a local save reports Saved without fetching the file", async (t) => {
+  const { button, messages, elements, blobs, tick } = setup(
+    t, () => ({ ok: true, saved: "local", filename: "A song (1).mp3" }),
+  );
+  const exportId = "d".repeat(32);
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    requests.push({ url, options });
+    if (url.endsWith("/exports")) {
+      return response({
+        export_id: exportId, state: "ready", filename: "A song.mp3",
+        progress: 1, phase: "ready",
+      });
+    }
+    return response({ state: "cancelled" });
+  });
+  await button._startDownload("mp3");
+  assert.equal(requests.length, 1);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].filename, "A song.mp3");
+  assert.equal(blobs.length, 0);
+  assert.equal(elements.filter((element) => element.tagName === "A").length, 0);
+  assert.equal(requests.some((request) => request.options?.method === "DELETE"), false);
+  assert.equal(button._downloading, false);
+  assert.equal(button.el.dataset.state, "active");
+  assert.equal(button.label.textContent, "Saved");
+  tick();
+  assert.equal(button.label.textContent, "nomusic on");
+  assert.equal(button._savedNotice, false);
+});
+
+test("a local save with a bad filename does not click a download link", async (t) => {
+  const { button, elements, blobs } = setup(
+    t, () => ({ ok: true, saved: "local", filename: "../A song.mp3" }),
+  );
+  const exportId = "e".repeat(32);
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    requests.push({ url, options });
+    if (url.endsWith("/exports")) {
+      return response({
+        export_id: exportId, state: "ready", filename: "A song.mp3",
+        progress: 1, phase: "ready",
+      });
+    }
+    return response({ state: "cancelled" });
+  });
+  await button._startDownload("mp3");
+  assert.equal(blobs.length, 0);
+  assert.equal(elements.filter((element) => element.tagName === "A").length, 0);
+  assert.equal(button.label.textContent, "Download failed");
+  assert.equal(requests.some((request) => request.options?.method === "DELETE"), true);
 });
 
 test("queued export polls status and renders backend progress before saving", async (t) => {

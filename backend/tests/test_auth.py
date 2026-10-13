@@ -180,6 +180,7 @@ def test_only_healthz_is_public_and_cache_administration_is_local(authenticated_
         ("DELETE", "/exports/" + "b" * 32, None),
         ("GET", "/exports/" + "b" * 32 + "/download", None),
         ("POST", "/exports/" + "b" * 32 + "/download-grant", None),
+        ("POST", "/exports/" + "b" * 32 + "/save", None),
     ]
     for method, path, payload in protected:
         response = client.request(method, path, json=payload)

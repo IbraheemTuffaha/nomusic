@@ -21,6 +21,15 @@ function grantedDownloadUrl(backendUrl, exportId) {
   return `${normalizeBackendUrl(backendUrl)}/exports/${exportId}/download`;
 }
 
+function localSaveName(name) {
+  if (typeof name !== "string" || !name || name.length > 180) return "";
+  if (name.includes("/") || name.includes("\\") || name.includes("\0") || name.startsWith(".")) {
+    return "";
+  }
+  if (!name.toLowerCase().endsWith(".mp3")) return "";
+  return name;
+}
+
 // Strip characters that are illegal in filenames across Windows/macOS/Linux
 // (plus control chars), collapse whitespace, and bound the length so a very
 // long video title can't produce an unwieldy filename. Exported for unit tests.
@@ -45,6 +54,7 @@ export class Button {
     this._dismissed = false;
     // Only download errors expire; playback failures require an explicit choice.
     this._errorRevertTimer = null;
+    this._savedNotice = false;
     this.el = document.createElement("button");
     this.el.className = "nomusic-btn";
     this.el.type = "button";
@@ -206,7 +216,8 @@ export class Button {
     if (status.title) this.title = status.title;
     // While a file fetch is in flight the export progress owns the pill
     // (_showExportProgress); ignore late status snapshots so they don't fight.
-    if (this._downloading) return;
+    // A just-saved local file keeps its "Saved" label until that notice ends.
+    if (this._downloading || this._savedNotice) return;
 
     const state = status.state;
     this._ready = state === "ready";
@@ -252,7 +263,7 @@ export class Button {
     // An in-flight export owns the pill (Preparing/Encoding N%); a playback
     // buffer event must not clobber it. _showExportProgress has the inverse
     // guard, so the export display is fully isolated while _downloading.
-    if (this._downloading || this.session?.failed) return;
+    if (this._downloading || this._savedNotice || this.session?.failed) return;
     this._clearErrorRevert();
     this.el.dataset.state = "working";
     this.label.textContent = "Buffering";
@@ -265,7 +276,7 @@ export class Button {
    *  idle. Keeps the current % + fill so the frozen progress is visible,
    *  and the non-"working" state stops the icon pulse. */
   setPaused() {
-    if (this._downloading || this.session?.failed) return;
+    if (this._downloading || this._savedNotice || this.session?.failed) return;
     this._clearErrorRevert();
     this.el.dataset.state = "paused";
     this.label.textContent = "Paused";
@@ -353,6 +364,7 @@ export class Button {
       clearTimeout(this._errorRevertTimer);
       this._errorRevertTimer = null;
     }
+    this._savedNotice = false;
   }
 
   async toggle() {
@@ -529,10 +541,10 @@ export class Button {
     this.session.ensureLiveForDownload();
   }
 
-  /** Prepare an export, then save it from this page.
-   * The worker mints a one-time grant with the operator key. This page fetches
-   * only that grant and clicks a typed blob link. The key never arrives here,
-   * and the browser download manager never sees the localhost URL. */
+  /** Prepare an export, then save it.
+   * A loopback MP3 is copied into Downloads by the backend. Every other
+   * export uses a one-time grant: this page fetches only that grant and
+   * clicks a typed blob link. The key never arrives here. */
   async _startDownload(format, height = 0) {
     const jobId = this.session?.jobId;
     if (this._retired || !jobId || this.session.disposed || this.session.failed) return;
@@ -624,6 +636,15 @@ export class Button {
       });
       if (!current()) return;
       if (!message?.ok) throw new Error(message?.error || "browser download failed");
+      if (message.saved === "local") {
+        if (!localSaveName(message.filename)) {
+          throw new Error("The backend did not save the export.");
+        }
+        download.saved = true;
+        this._cancelDownload({ cancelExport: false });
+        this._showSaved();
+        return;
+      }
       if (!DOWNLOAD_GRANT_PATTERN.test(message.grant)) {
         throw new Error("The backend did not provide a download grant.");
       }
@@ -689,6 +710,26 @@ export class Button {
     this.label.textContent = label;
     this.pct.textContent = `${pct}%`;
     this.fill.style.width = `${pct}%`;
+  }
+
+  /** Confirm a backend copy, then return to the live pill. */
+  _showSaved() {
+    if (this._retired || this.session?.failed) return;
+    if (!this.session || this.session.disposed) {
+      this._restoreAfterDownload();
+      return;
+    }
+    this._clearErrorRevert();
+    this._savedNotice = true;
+    this.el.dataset.state = "active";
+    this.label.textContent = "Saved";
+    this.pct.textContent = "";
+    this.fill.style.width = "0%";
+    this._errorRevertTimer = setTimeout(() => {
+      this._errorRevertTimer = null;
+      this._savedNotice = false;
+      if (this.label.textContent === "Saved") this._restoreAfterDownload();
+    }, 2500);
   }
 
   /** Return the pill to its post-download resting visual: "nomusic on" if the

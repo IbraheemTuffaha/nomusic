@@ -2,10 +2,12 @@
 //
 // Page-facing content scripts never receive the operator key. This worker owns
 // the key in storage.local, validates the small message surface, and performs
-// authenticated setup and capability checks. For a prepared export it mints a
-// single-use download grant. The page fetches that grant and saves a typed
-// blob: a service worker cannot build a blob URL, which is what macOS needs
-// in order to open the saved MP3 or MP4.
+// authenticated setup and capability checks. A loopback MP3 is copied into
+// Downloads by the backend, because a file Chrome writes keeps a quarantine
+// mark that macOS blocks when the MP3 opener does not declare that type. Every
+// other export mints a single-use download grant. The page fetches that grant
+// and saves a typed blob: a service worker cannot build a blob URL, which is
+// what macOS needs in order to open the saved MP4.
 
 import {
   DEFAULT_BACKEND,
@@ -35,6 +37,7 @@ const REQUEST_TIMEOUTS_MS = {
   "export-status": 5_000,
   "export-cancel": 5_000,
   "export-download": 30_000,
+  "export-save": 60_000,
 };
 const ID_RE = /^[0-9a-f]{16}$/;
 const EXPORT_ID_RE = /^[0-9a-f]{32}$/;
@@ -248,6 +251,27 @@ function exportMediaType(filename, declared) {
   const type = String(declared || "").split(";", 1)[0].trim().toLowerCase();
   if (type === "audio/mpeg" || type === "video/mp4") return type;
   return String(filename || "").toLowerCase().endsWith(".mp4") ? "video/mp4" : "audio/mpeg";
+}
+
+function isLoopbackBackend(backendUrl) {
+  try {
+    const url = new URL(backendUrl);
+    if (url.protocol !== "http:") return false;
+    const host = url.hostname.toLowerCase();
+    return host === "127.0.0.1" || host === "localhost" ||
+      host === "[::1]" || host === "::1";
+  } catch {
+    return false;
+  }
+}
+
+function localSaveName(name) {
+  if (typeof name !== "string" || !name || name.length > 180) return "";
+  if (name.includes("/") || name.includes("\\") || name.includes("\0") || name.startsWith(".")) {
+    return "";
+  }
+  if (!name.toLowerCase().endsWith(".mp3")) return "";
+  return name;
 }
 
 async function fetchCapabilities(backendUrl, operatorKey) {
@@ -658,9 +682,40 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse(responseError("not_configured", "Configure a trusted backend and operator key first."));
           return;
         }
+        // A loopback MP3 is copied by the backend. Chrome quarantines every
+        // file it writes, and macOS blocks that mark on an MP3. This worker
+        // never sees the file and never passes the operator key back.
+        if (isLoopbackBackend(auth.backendUrl) && filename.toLowerCase().endsWith(".mp3")) {
+          const response = await fetchWithTimeout(
+            `${auth.backendUrl}/exports/${encodeURIComponent(exportId)}/save`,
+            {
+              method: "POST",
+              cache: "no-store",
+              referrerPolicy: "no-referrer",
+              headers: {
+                Authorization: `Bearer ${auth.operatorKey}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ filename }),
+            },
+            REQUEST_TIMEOUTS_MS["export-save"],
+          );
+          if (!response.ok) {
+            sendResponse({ ok: false, error: `Could not save export (HTTP ${response.status}).` });
+            return;
+          }
+          let data = null;
+          try { data = await response.json(); } catch { data = null; }
+          const savedName = localSaveName(data?.filename);
+          if (!savedName) {
+            sendResponse({ ok: false, error: "The backend did not save the export." });
+            return;
+          }
+          sendResponse({ ok: true, saved: "local", filename: savedName });
+          return;
+        }
         // Mint the grant here. The page fetches the bytes and clicks a typed
-        // blob link. This worker never sees the file and never passes the
-        // operator key back to the page.
+        // blob link. This is the MP4 path, and the path for a remote backend.
         const response = await fetchWithTimeout(
           `${auth.backendUrl}/exports/${encodeURIComponent(exportId)}/download-grant`,
           {

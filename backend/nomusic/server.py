@@ -22,6 +22,7 @@ The endpoints live in :mod:`nomusic.routes` (system / jobs / media):
   GET  /exports/{export_id}  -> export status
   DELETE /exports/{export_id} -> cancel an export
   POST /exports/{export_id}/download-grant -> one-time download grant
+  POST /exports/{export_id}/save -> copy a ready artifact into local Downloads
   GET  /exports/{export_id}/download -> prepared artifact
 """
 
