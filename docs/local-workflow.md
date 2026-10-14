@@ -54,16 +54,12 @@ another tab or extension session holding a lease keeps the worker running.
 ## Exports and cache
 
 The download chevron beside nomusic offers **MP3 — audio only** and **Video
-(MP4)** at several resolutions. The extension submits a durable export job and
-shows its preparation progress. When the artifact is ready, a loopback MP3 is
-copied into Downloads by the backend, so the browser does not mark the file.
-An MP4, and an export from any remote backend, still uses a one-time download
-grant: the page saves a typed blob. The operator key stays in the service
-worker. For that grant path, the page holds the finished file in memory until
-the browser saves it, so keep the tab open until that save finishes. Request
+(MP4)** at several resolutions. The extension submits a durable export job,
+shows its preparation progress, and hands the ready artifact to the browser's
+native downloads service; it never buffers the whole file in the page. Request
 an export while processing or after it reaches Ready; the extension waits for
-the source to become ready before submitting the export.
-Pausing playback does not cancel an admitted export. MP4
+the source to become ready before submitting the export. Keep the tab open
+until the download completes. Pausing playback does not cancel an admitted export. MP4
 may require another source download.
 The local policy accepts finite sources up to two hours and 512 MiB of source
 audio. Video exports are capped at 1080p and 2 GiB; a larger selected format

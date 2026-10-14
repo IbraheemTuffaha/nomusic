@@ -200,9 +200,7 @@ Remote schemas and administrative routes are not exposed.
 | POST | `/exports` | `{job_id, format, max_height?, client_id?}` → durable export status; source must be ready; `429` when the bounded export queue is full |
 | GET | `/exports/{export_id}` | Export status; ready records include `download_url`, `filename`, size and expiry |
 | DELETE | `/exports/{export_id}?client_id=...` | Release one export owner; a queued/building export is cancelled when its last owner leaves |
-| POST | `/exports/{export_id}/download-grant` | Authenticated one-time download grant for a ready artifact. The token is returned once, expires after 60 seconds, works for one fetch, and is not logged |
-| POST | `/exports/{export_id}/save` | Authenticated copy of a ready artifact into the local Downloads folder. Returns `{filename}` only. A remote connection is refused. The extension calls this for a loopback MP3; MP4 keeps the download grant |
-| GET | `/exports/{export_id}/download` | Leased prepared artifact; `425` while building, `409` for failed/cancelled, `410` after expiry; concurrent readers are bounded. Accepts the operator key, or a matching `X-Nomusic-Download-Grant` header when no `Authorization` header is present |
+| GET | `/exports/{export_id}/download` | Leased prepared artifact; `425` while building, `409` for failed/cancelled, `410` after expiry; concurrent readers are bounded |
 Cache administration is local: `nomusic cache stats` and `nomusic cache clear`.
 Stop the backend before a full clear; live namespace leases are retained.
 

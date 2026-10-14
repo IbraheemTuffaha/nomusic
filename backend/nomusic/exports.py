@@ -7,13 +7,10 @@ so a cancellation or process stop cannot silently outlive the service.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import math
 import os
-import re
-import secrets
 import shutil
 import tempfile
 import threading
@@ -54,87 +51,6 @@ class ExportSourceNotReady(RuntimeError):
 
 class ExportBuildError(RuntimeError):
     """A builder rejected or could not complete an export."""
-
-
-class DownloadGrantsFull(RuntimeError):
-    """Too many unused download grants are already outstanding."""
-
-
-# ``secrets.token_urlsafe(32)`` is 43 characters. Reject every other shape
-# before hashing so a huge header cannot become a stored credential.
-_GRANT_RE = re.compile(r"[A-Za-z0-9_-]{43}")
-_GRANT_TTL_SECONDS = 60.0
-_MAX_DOWNLOAD_GRANTS = 32
-
-
-class DownloadGrantStore:
-    """Single-use capabilities for one export download.
-
-    The raw token is returned once to the authenticated caller and is never
-    stored or logged. Lookup keeps only its SHA-256 digest. A grant names one
-    export id and dies on first matching use, on expiry, or when the service
-    stops. Presenting it for a different export does not consume it.
-    """
-
-    def __init__(
-        self,
-        *,
-        ttl_seconds: float = _GRANT_TTL_SECONDS,
-        max_grants: int = _MAX_DOWNLOAD_GRANTS,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive")
-        if max_grants <= 0:
-            raise ValueError("max_grants must be positive")
-        self.ttl_seconds = float(ttl_seconds)
-        self.max_grants = int(max_grants)
-        self._clock = clock
-        self._lock = threading.Lock()
-        self._grants: dict[str, tuple[str, float]] = {}
-
-    def issue(self, export_id: str) -> tuple[str, float]:
-        token = secrets.token_urlsafe(32)
-        digest = hashlib.sha256(token.encode("ascii")).hexdigest()
-        now = self._clock()
-        with self._lock:
-            self._drop_expired(now)
-            if len(self._grants) >= self.max_grants:
-                raise DownloadGrantsFull("too many download grants are outstanding")
-            self._grants[digest] = (export_id, now + self.ttl_seconds)
-        return token, self.ttl_seconds
-
-    def consume(self, export_id: str, token: str) -> bool:
-        if (
-            not isinstance(export_id, str)
-            or not isinstance(token, str)
-            or len(token) != 43
-            or _GRANT_RE.fullmatch(token) is None
-        ):
-            return False
-        digest = hashlib.sha256(token.encode("ascii")).hexdigest()
-        now = self._clock()
-        with self._lock:
-            self._drop_expired(now)
-            record = self._grants.get(digest)
-            if record is None:
-                return False
-            bound_id, expires_at = record
-            if bound_id != export_id or expires_at <= now:
-                return False
-            del self._grants[digest]
-            return True
-
-    def clear(self) -> None:
-        with self._lock:
-            self._grants.clear()
-
-    def _drop_expired(self, now: float) -> None:
-        expired = [
-            digest for digest, (_, expires_at) in self._grants.items() if expires_at <= now
-        ]
-        for digest in expired:
-            del self._grants[digest]
 
 
 @dataclass(frozen=True)
@@ -800,8 +716,7 @@ class ExportRegistry:
 
 
 __all__ = [
-    "DownloadGrantStore", "DownloadGrantsFull", "ExportArtifact", "ExportBuildError",
-    "ExportBuilder", "ExportDownloadsFull", "ExportDownload", "ExportQueueFull",
-    "ExportRegistry", "ExportRegistryClosed", "ExportSourceNotReady", "ExportSpec",
-    "ExportState", "ExportStatus",
+    "ExportArtifact", "ExportBuildError", "ExportBuilder", "ExportDownloadsFull",
+    "ExportDownload", "ExportQueueFull", "ExportRegistry", "ExportRegistryClosed",
+    "ExportSourceNotReady", "ExportSpec", "ExportState", "ExportStatus",
 ]

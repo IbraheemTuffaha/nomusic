@@ -1,13 +1,9 @@
 // Trusted extension service worker.
 //
-// Page-facing content scripts never receive the operator key. This worker owns
-// the key in storage.local, validates the small message surface, and performs
-// authenticated setup and capability checks. A loopback MP3 is copied into
-// Downloads by the backend, because a file Chrome writes keeps a quarantine
-// mark that macOS blocks when the MP3 opener does not declare that type. Every
-// other export mints a single-use download grant. The page fetches that grant
-// and saves a typed blob: a service worker cannot build a blob URL, which is
-// what macOS needs in order to open the saved MP4.
+// Page-facing content scripts never receive the operator key and never make
+// backend requests directly. This worker owns the key in storage.local,
+// validates the small message surface, and performs authenticated setup and
+// capability checks. Processing transport is added in the next stack layer.
 
 import {
   DEFAULT_BACKEND,
@@ -37,7 +33,6 @@ const REQUEST_TIMEOUTS_MS = {
   "export-status": 5_000,
   "export-cancel": 5_000,
   "export-download": 30_000,
-  "export-save": 60_000,
 };
 const ID_RE = /^[0-9a-f]{16}$/;
 const EXPORT_ID_RE = /^[0-9a-f]{32}$/;
@@ -45,7 +40,11 @@ const STEMS = new Set(["vocals", "drums", "bass", "other"]);
 const MAX_BACKEND_ROUTES = 256;
 const JOB_ROUTE_STORAGE_KEY = "nomusicJobBackendRoutes";
 const EXPORT_ROUTE_STORAGE_KEY = "nomusicExportBackendRoutes";
-const DOWNLOAD_GRANT_RE = /^[A-Za-z0-9_-]{43}$/;
+const ACTIVE_DOWNLOAD_STORAGE_KEY = "nomusicActiveDownloads";
+const activeDownloads = new Map();
+let activeDownloadsLoaded = false;
+let activeDownloadsLoad = null;
+let activeDownloadsWrite = Promise.resolve();
 const jobBackendRoutes = new Map();
 const exportBackendRoutes = new Map();
 let backendRoutesLoaded = false;
@@ -229,7 +228,7 @@ function routeFor(operation, data, configuredAuth) {
   if (operation === "export-submit") {
     return jobBackendRoutes.get(data.jobId) || configuredAuth;
   }
-  if (["export-status", "export-cancel", "export-download", "export-grant"].includes(operation)) {
+  if (["export-status", "export-cancel", "export-download"].includes(operation)) {
     return exportBackendRoutes.get(data.exportId) || configuredAuth;
   }
   return configuredAuth;
@@ -247,31 +246,46 @@ function clearBackendRoutes() {
   return backendRoutesWrite;
 }
 
-function exportMediaType(filename, declared) {
-  const type = String(declared || "").split(";", 1)[0].trim().toLowerCase();
-  if (type === "audio/mpeg" || type === "video/mp4") return type;
-  return String(filename || "").toLowerCase().endsWith(".mp4") ? "video/mp4" : "audio/mpeg";
+function rememberActiveDownloads() {
+  const session = chrome.storage.session;
+  if (!session?.set) return Promise.resolve();
+  activeDownloadsWrite = activeDownloadsWrite
+    .catch(() => {})
+    .then(() => session.set({
+      [ACTIVE_DOWNLOAD_STORAGE_KEY]: Object.fromEntries(activeDownloads),
+    }))
+    .catch(() => {});
+  return activeDownloadsWrite;
 }
 
-function isLoopbackBackend(backendUrl) {
-  try {
-    const url = new URL(backendUrl);
-    if (url.protocol !== "http:") return false;
-    const host = url.hostname.toLowerCase();
-    return host === "127.0.0.1" || host === "localhost" ||
-      host === "[::1]" || host === "::1";
-  } catch {
-    return false;
+async function loadActiveDownloads() {
+  if (activeDownloadsLoaded) return;
+  if (!activeDownloadsLoad) {
+    activeDownloadsLoad = (async () => {
+      const session = chrome.storage.session;
+      if (session?.get) {
+        try {
+          const stored = await session.get(ACTIVE_DOWNLOAD_STORAGE_KEY);
+          for (const [id, entry] of Object.entries(stored?.[ACTIVE_DOWNLOAD_STORAGE_KEY] || {})) {
+            const downloadId = Number(id);
+            if (!Number.isInteger(downloadId) || downloadId < 0 ||
+                !entry || typeof entry !== "object" ||
+                !EXPORT_ID_RE.test(entry.exportId) ||
+                typeof entry.clientId !== "string") continue;
+            activeDownloads.set(downloadId, {
+              tabId: Number.isInteger(entry.tabId) ? entry.tabId : undefined,
+              exportId: entry.exportId,
+              clientId: entry.clientId,
+            });
+          }
+        } catch {
+          // A browser without session storage can still track live downloads.
+        }
+      }
+      activeDownloadsLoaded = true;
+    })();
   }
-}
-
-function localSaveName(name) {
-  if (typeof name !== "string" || !name || name.length > 180) return "";
-  if (name.includes("/") || name.includes("\\") || name.includes("\0") || name.startsWith(".")) {
-    return "";
-  }
-  if (!name.toLowerCase().endsWith(".mp3")) return "";
-  return name;
+  await activeDownloadsLoad;
 }
 
 async function fetchCapabilities(backendUrl, operatorKey) {
@@ -545,6 +559,41 @@ chrome.runtime.onInstalled.addListener(async () => {
   if (Object.keys(patched).length) await chrome.storage.sync.set(patched);
 });
 
+chrome.downloads.onChanged?.addListener((delta) => {
+  (async () => {
+    await loadActiveDownloads();
+    const entry = activeDownloads.get(delta.id);
+    if (!entry) return;
+    const state = delta.state?.current;
+    if (state === "complete") {
+      activeDownloads.delete(delta.id);
+      await rememberActiveDownloads();
+      if (entry.tabId != null) {
+        chrome.tabs?.sendMessage?.(entry.tabId, {
+          type: "download-export-complete",
+          downloadId: delta.id,
+        });
+      }
+    } else if (state === "interrupted") {
+      activeDownloads.delete(delta.id);
+      await rememberActiveDownloads();
+      if (entry.exportId && entry.clientId) {
+        backendRequest("export-cancel", {
+          exportId: entry.exportId,
+          clientId: entry.clientId,
+        }).catch(() => {});
+      }
+      if (entry.tabId != null) {
+        chrome.tabs?.sendMessage?.(entry.tabId, {
+          type: "download-export-failed",
+          downloadId: delta.id,
+          error: delta.error?.current || "browser download interrupted",
+        });
+      }
+    }
+  })().catch(() => {});
+});
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "get-auth-state") {
     (async () => {
@@ -663,86 +712,46 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return false;
     }
     let exportId;
+    let clientId;
     try {
       exportId = safeExportId(msg.exportId);
-      // The page cancels with this id if the save fails. Reject a malformed
-      // one here so a download is not started for a message the page cannot
-      // pair with its export owner.
-      safeClientId(msg.clientId);
+      clientId = safeClientId(msg.clientId);
     } catch (error) {
       sendResponse({ ok: false, error: error.message });
       return false;
     }
     (async () => {
       try {
-        await loadBackendRoutes();
+        await Promise.all([loadBackendRoutes(), loadActiveDownloads()]);
         const configuredAuth = await readTrustedAuth();
-        const auth = routeFor("export-grant", { exportId }, configuredAuth);
+        const auth = routeFor("export-download", { exportId }, configuredAuth);
         if (!auth) {
           sendResponse(responseError("not_configured", "Configure a trusted backend and operator key first."));
           return;
         }
-        // A loopback MP3 is copied by the backend. Chrome quarantines every
-        // file it writes, and macOS blocks that mark on an MP3. This worker
-        // never sees the file and never passes the operator key back.
-        if (isLoopbackBackend(auth.backendUrl) && filename.toLowerCase().endsWith(".mp3")) {
-          const response = await fetchWithTimeout(
-            `${auth.backendUrl}/exports/${encodeURIComponent(exportId)}/save`,
-            {
-              method: "POST",
-              cache: "no-store",
-              referrerPolicy: "no-referrer",
-              headers: {
-                Authorization: `Bearer ${auth.operatorKey}`,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({ filename }),
-            },
-            REQUEST_TIMEOUTS_MS["export-save"],
-          );
-          if (!response.ok) {
-            sendResponse({ ok: false, error: `Could not save export (HTTP ${response.status}).` });
-            return;
-          }
-          let data = null;
-          try { data = await response.json(); } catch { data = null; }
-          const savedName = localSaveName(data?.filename);
-          if (!savedName) {
-            sendResponse({ ok: false, error: "The backend did not save the export." });
-            return;
-          }
-          sendResponse({ ok: true, saved: "local", filename: savedName });
-          return;
-        }
-        // Mint the grant here. The page fetches the bytes and clicks a typed
-        // blob link. This is the MP4 path, and the path for a remote backend.
-        const response = await fetchWithTimeout(
-          `${auth.backendUrl}/exports/${encodeURIComponent(exportId)}/download-grant`,
+        const url = `${auth.backendUrl}/exports/${encodeURIComponent(exportId)}/download`;
+        chrome.downloads.download(
           {
-            method: "POST",
-            cache: "no-store",
-            referrerPolicy: "no-referrer",
-            headers: { Authorization: `Bearer ${auth.operatorKey}` },
+            url,
+            headers: [{ name: "Authorization", value: `Bearer ${auth.operatorKey}` }],
+            filename,
+            conflictAction: "uniquify",
+            saveAs: false,
           },
-          10_000,
+          (downloadId) => {
+            const error = chrome.runtime.lastError;
+            if (error) {
+              sendResponse({ ok: false, error: error.message || String(error) });
+            } else {
+              activeDownloads.set(downloadId, {
+                tabId: sender?.tab?.id,
+                exportId,
+                clientId,
+              });
+              rememberActiveDownloads().then(() => sendResponse({ ok: true, downloadId }));
+            }
+          },
         );
-        if (!response.ok) {
-          sendResponse({ ok: false, error: `Could not download export (HTTP ${response.status}).` });
-          return;
-        }
-        let data = null;
-        try { data = await response.json(); } catch { data = null; }
-        const grant = typeof data?.grant === "string" ? data.grant : "";
-        if (!DOWNLOAD_GRANT_RE.test(grant)) {
-          sendResponse({ ok: false, error: "The backend did not provide a download grant." });
-          return;
-        }
-        sendResponse({
-          ok: true,
-          backendUrl: auth.backendUrl,
-          grant,
-          mediaType: exportMediaType(filename, data?.media_type),
-        });
       } catch (error) {
         sendResponse({ ok: false, error: error.message || "Could not start download" });
       }

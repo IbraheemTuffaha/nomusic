@@ -34,14 +34,7 @@ function workerEndpoint(message) {
 }
 
 async function workerMessage(message) {
-  if (message?.type === "download-export") {
-    return {
-      ok: true,
-      backendUrl: "http://127.0.0.1:8723",
-      grant: "a".repeat(43),
-      mediaType: "audio/mpeg",
-    };
-  }
+  if (message?.type === "download-export") return { ok: true, downloadId: 1 };
   if (message?.type !== "backend-request") return { ok: true };
   const request = workerEndpoint(message);
   const response = await fetch(request.url, {

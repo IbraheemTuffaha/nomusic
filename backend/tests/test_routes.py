@@ -11,9 +11,7 @@ def test_routers_expose_expected_paths():
 
     export_paths = {r.path for r in exports.router.routes}
     assert {"/exports", "/exports/{export_id}",
-            "/exports/{export_id}/download",
-            "/exports/{export_id}/download-grant",
-            "/exports/{export_id}/save"} <= export_paths
+            "/exports/{export_id}/download"} <= export_paths
 
     system_paths = {r.path for r in system.router.routes}
     assert {"/healthz", "/capabilities", "/readyz"} <= system_paths

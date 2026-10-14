@@ -25,8 +25,11 @@ def _auth_response(code: str, message: str) -> HTTPException:
     )
 
 
-def authenticate_request(request: Request, authorization: str | None) -> AuthPrincipal:
-    """Authenticate one ``Authorization`` header, or reject it.
+def require_operator(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> AuthPrincipal:
+    """Require an active operator key before entering a protected route.
 
     Authentication is a dependency rather than middleware so the public
     ``/healthz`` probe stays intentionally tiny and route tests can exercise
@@ -53,32 +56,7 @@ def authenticate_request(request: Request, authorization: str | None) -> AuthPri
         }) from exc
 
 
-def require_operator(
-    request: Request,
-    authorization: str | None = Header(default=None),
-) -> AuthPrincipal:
-    """Require an active operator key before entering a protected route."""
-    return authenticate_request(request, authorization)
-
-
-def authorize_export_download(request: Request, export_id: str) -> None:
-    """Allow the operator key, or exactly one matching download grant.
-
-    A grant is considered only when the request sends no ``Authorization``
-    header. An invalid bearer therefore cannot be combined with a grant, and
-    the grant stays available for a retry. The raw grant is never logged.
-    """
-    authorization = request.headers.get("authorization")
-    grant = request.headers.get("x-nomusic-download-grant")
-    if authorization is not None or not grant:
-        authenticate_request(request, authorization)
-        return
-    grants = getattr(request.app.state, "download_grants", None)
-    if grants is None or not grants.consume(export_id, grant):
-        raise _auth_response("authentication_required", "operator key is required")
-
-
 Operator = AuthPrincipal
 
 
-__all__ = ["Operator", "authenticate_request", "authorize_export_download", "require_operator"]
+__all__ = ["Operator", "require_operator"]

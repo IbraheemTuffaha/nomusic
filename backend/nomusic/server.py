@@ -21,8 +21,6 @@ The endpoints live in :mod:`nomusic.routes` (system / jobs / media):
   POST /exports              -> asynchronous export preparation
   GET  /exports/{export_id}  -> export status
   DELETE /exports/{export_id} -> cancel an export
-  POST /exports/{export_id}/download-grant -> one-time download grant
-  POST /exports/{export_id}/save -> copy a ready artifact into local Downloads
   GET  /exports/{export_id}/download -> prepared artifact
 """
 
@@ -122,7 +120,6 @@ async def lifespan(app: FastAPI):
         app.state.cache = services.cache
         app.state.registry = services.registry
         app.state.exports = services.exports
-        app.state.download_grants = services.download_grants
         yield
     finally:
         if prepare_shutdown is not None:
@@ -131,7 +128,7 @@ async def lifespan(app: FastAPI):
         # Joining synchronously here would block final worker-to-SSE callbacks.
         await asyncio.to_thread(services.shutdown)
         for name in (
-            "engine", "cache", "registry", "exports", "download_grants", "services"
+            "engine", "cache", "registry", "exports", "services"
         ):
             if hasattr(app.state, name):
                 delattr(app.state, name)

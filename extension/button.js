@@ -2,33 +2,6 @@
 // download. Creates/disposes a Session on toggle. Split out of content.js.
 import { Session, newClientId } from "./session.js";
 import { backendRequest, explainBackendError } from "./backend-client.js";
-import { normalizeBackendUrl } from "./config.js";
-
-const DOWNLOAD_GRANT_PATTERN = /^[A-Za-z0-9_-]{43}$/;
-const EXPORT_ID_PATTERN = /^[0-9a-f]{32}$/;
-
-function exportBlobType(filename, declared, fallback) {
-  const normalize = (value) => String(value || "").split(";", 1)[0].trim().toLowerCase();
-  for (const candidate of [declared, fallback]) {
-    const type = normalize(candidate);
-    if (type === "audio/mpeg" || type === "video/mp4") return type;
-  }
-  return String(filename || "").toLowerCase().endsWith(".mp4") ? "video/mp4" : "audio/mpeg";
-}
-
-function grantedDownloadUrl(backendUrl, exportId) {
-  if (!EXPORT_ID_PATTERN.test(exportId)) throw new Error("download URL is invalid");
-  return `${normalizeBackendUrl(backendUrl)}/exports/${exportId}/download`;
-}
-
-function localSaveName(name) {
-  if (typeof name !== "string" || !name || name.length > 180) return "";
-  if (name.includes("/") || name.includes("\\") || name.includes("\0") || name.startsWith(".")) {
-    return "";
-  }
-  if (!name.toLowerCase().endsWith(".mp3")) return "";
-  return name;
-}
 
 // Strip characters that are illegal in filenames across Windows/macOS/Linux
 // (plus control chars), collapse whitespace, and bound the length so a very
@@ -54,7 +27,6 @@ export class Button {
     this._dismissed = false;
     // Only download errors expire; playback failures require an explicit choice.
     this._errorRevertTimer = null;
-    this._savedNotice = false;
     this.el = document.createElement("button");
     this.el.className = "nomusic-btn";
     this.el.type = "button";
@@ -115,7 +87,15 @@ export class Button {
     this._menuOpen = false;
     this._downloading = false;
     this._download = null;
-    this._downloadUrls = new Map();
+    this._nativeDownloads = new Set();
+    this._onRuntimeMessage = (message) => {
+      if (!this._nativeDownloads.has(message?.downloadId)) return;
+      this._nativeDownloads.delete(message.downloadId);
+      if (message.type === "download-export-complete") return;
+      if (message.type !== "download-export-failed") return;
+      if (!this._retired) this._flashDownloadError(message.error || "browser download interrupted");
+    };
+    chrome.runtime.onMessage.addListener(this._onRuntimeMessage);
     // A download requested before the track finished processing: {format,
     // height}. Held until the job reaches "ready", then saved automatically.
     this._pendingDownload = null;
@@ -216,8 +196,7 @@ export class Button {
     if (status.title) this.title = status.title;
     // While a file fetch is in flight the export progress owns the pill
     // (_showExportProgress); ignore late status snapshots so they don't fight.
-    // A just-saved local file keeps its "Saved" label until that notice ends.
-    if (this._downloading || this._savedNotice) return;
+    if (this._downloading) return;
 
     const state = status.state;
     this._ready = state === "ready";
@@ -263,7 +242,7 @@ export class Button {
     // An in-flight export owns the pill (Preparing/Encoding N%); a playback
     // buffer event must not clobber it. _showExportProgress has the inverse
     // guard, so the export display is fully isolated while _downloading.
-    if (this._downloading || this._savedNotice || this.session?.failed) return;
+    if (this._downloading || this.session?.failed) return;
     this._clearErrorRevert();
     this.el.dataset.state = "working";
     this.label.textContent = "Buffering";
@@ -276,7 +255,7 @@ export class Button {
    *  idle. Keeps the current % + fill so the frozen progress is visible,
    *  and the non-"working" state stops the icon pulse. */
   setPaused() {
-    if (this._downloading || this._savedNotice || this.session?.failed) return;
+    if (this._downloading || this.session?.failed) return;
     this._clearErrorRevert();
     this.el.dataset.state = "paused";
     this.label.textContent = "Paused";
@@ -364,7 +343,6 @@ export class Button {
       clearTimeout(this._errorRevertTimer);
       this._errorRevertTimer = null;
     }
-    this._savedNotice = false;
   }
 
   async toggle() {
@@ -400,23 +378,9 @@ export class Button {
     this.session?.dispose({ restore: false });
     this.session = null;
     this.dispose();
-    this._revokeDownloadUrls();
+    chrome.runtime.onMessage.removeListener(this._onRuntimeMessage);
+    this._nativeDownloads.clear();
     this.el.remove();
-  }
-
-  _revokeDownloadUrls() {
-    for (const [url, timer] of this._downloadUrls) {
-      clearTimeout(timer);
-      URL.revokeObjectURL(url);
-    }
-    this._downloadUrls.clear();
-  }
-
-  _rememberDownloadUrl(objectUrl) {
-    const timer = setTimeout(() => {
-      if (this._downloadUrls.delete(objectUrl)) URL.revokeObjectURL(objectUrl);
-    }, 10_000);
-    this._downloadUrls.set(objectUrl, timer);
   }
 
   _cancelDownload({ cancelExport = true } = {}) {
@@ -426,7 +390,7 @@ export class Button {
       clearTimeout(download.pollTimer);
       download.pollResolve?.();
       download.controller.abort();
-      if (cancelExport && download.exportId && !download.saved && !download.cancelSent) {
+      if (cancelExport && download.exportId && !download.nativeStarted && !download.cancelSent) {
         download.cancelSent = true;
         backendRequest("export-cancel", {
           exportId: download.exportId,
@@ -541,10 +505,9 @@ export class Button {
     this.session.ensureLiveForDownload();
   }
 
-  /** Prepare an export, then save it.
-   * A loopback MP3 is copied into Downloads by the backend. Every other
-   * export uses a one-time grant: this page fetches only that grant and
-   * clicks a typed blob link. The key never arrives here. */
+  /** Prepare an export, then hand its ready URL to the background worker.
+   * The downloads API owns the response body, so the content script never
+   * buffers a complete MP3/MP4 in a Blob or keeps it in page memory. */
   async _startDownload(format, height = 0) {
     const jobId = this.session?.jobId;
     if (this._retired || !jobId || this.session.disposed || this.session.failed) return;
@@ -558,7 +521,7 @@ export class Button {
       pollResolve: null,
       exportId: null,
       cancelSent: false,
-      saved: false,
+      nativeStarted: false,
     };
     this._download = download;
     const { signal } = download.controller;
@@ -636,46 +599,8 @@ export class Button {
       });
       if (!current()) return;
       if (!message?.ok) throw new Error(message?.error || "browser download failed");
-      if (message.saved === "local") {
-        if (!localSaveName(message.filename)) {
-          throw new Error("The backend did not save the export.");
-        }
-        download.saved = true;
-        this._cancelDownload({ cancelExport: false });
-        this._showSaved();
-        return;
-      }
-      if (!DOWNLOAD_GRANT_PATTERN.test(message.grant)) {
-        throw new Error("The backend did not provide a download grant.");
-      }
-      const url = grantedDownloadUrl(message.backendUrl, download.exportId);
-      const response = await fetch(url, {
-        cache: "no-store",
-        referrerPolicy: "no-referrer",
-        signal,
-        headers: { "X-Nomusic-Download-Grant": message.grant },
-      });
-      if (!current()) return;
-      if (!response.ok) throw new Error(`Could not download export (HTTP ${response.status}).`);
-      let blob = await response.blob();
-      if (!current()) return;
-      if (!blob.size) throw new Error("The export file is empty.");
-      const type = exportBlobType(
-        filename,
-        blob.type || response.headers?.get?.("content-type"),
-        message.mediaType,
-      );
-      if (blob.type !== type) blob = new Blob([blob], { type });
-      const objectUrl = URL.createObjectURL(blob);
-      this._rememberDownloadUrl(objectUrl);
-      const anchor = document.createElement("a");
-      anchor.href = objectUrl;
-      anchor.download = filename;
-      anchor.rel = "noopener";
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      download.saved = true;
+      download.nativeStarted = true;
+      this._nativeDownloads.add(message.downloadId);
       this._cancelDownload({ cancelExport: false });
       this._restoreAfterDownload();
     } catch (err) {
@@ -684,7 +609,7 @@ export class Button {
         this._flashDownloadError(explainBackendError(err, "Download failed"));
       }
     } finally {
-      if (!download.saved && download.exportId && !download.cancelSent) {
+      if (!download.nativeStarted && download.exportId && !download.cancelSent) {
         download.cancelSent = true;
         backendRequest("export-cancel", {
           exportId: download.exportId,
@@ -710,26 +635,6 @@ export class Button {
     this.label.textContent = label;
     this.pct.textContent = `${pct}%`;
     this.fill.style.width = `${pct}%`;
-  }
-
-  /** Confirm a backend copy, then return to the live pill. */
-  _showSaved() {
-    if (this._retired || this.session?.failed) return;
-    if (!this.session || this.session.disposed) {
-      this._restoreAfterDownload();
-      return;
-    }
-    this._clearErrorRevert();
-    this._savedNotice = true;
-    this.el.dataset.state = "active";
-    this.label.textContent = "Saved";
-    this.pct.textContent = "";
-    this.fill.style.width = "0%";
-    this._errorRevertTimer = setTimeout(() => {
-      this._errorRevertTimer = null;
-      this._savedNotice = false;
-      if (this.label.textContent === "Saved") this._restoreAfterDownload();
-    }, 2500);
   }
 
   /** Return the pill to its post-download resting visual: "nomusic on" if the
