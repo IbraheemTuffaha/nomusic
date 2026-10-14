@@ -58,7 +58,9 @@ def test_abrupt_node_exit_cleans_browser_and_preserves_unrelated(tmp_path):
         "while(!fs.existsSync(process.env.NOMUSIC_VERIFY_BROWSER_OWNERSHIP+'/'+child.pid+'.json'))"
         " await new Promise(r=>setTimeout(r,10));"
         "while(!fs.existsSync(process.env.TEST_BROWSER_RUNNING)) await new Promise(r=>setTimeout(r,10));"
-        "fs.writeFileSync(process.env.TEST_READY,String(child.pid));"
+        "const readyTmp=process.env.TEST_READY+'.tmp';"
+        "fs.writeFileSync(readyTmp,String(child.pid));"
+        "fs.renameSync(readyTmp,process.env.TEST_READY);"
         "process.kill(process.pid,'SIGKILL');",
     ], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
        env={**os.environ, "NOMUSIC_VERIFY_BROWSER_LAUNCHER": str(launcher),
@@ -106,7 +108,9 @@ def test_helper_death_before_handoff_never_starts_browser(tmp_path):
         "const child=spawn(process.env.NOMUSIC_VERIFY_BROWSER_LAUNCHER,"
         " ['--user-data-dir='+process.env.TEST_PROFILE], {detached:true,stdio:'ignore',"
         " env:{...process.env,NOMUSIC_VERIFY_BROWSER_HELPER:String(process.pid)}});"
-        "fs.writeFileSync(process.env.TEST_READY,String(child.pid));"
+        "const readyTmp=process.env.TEST_READY+'.tmp';"
+        "fs.writeFileSync(readyTmp,String(child.pid));"
+        "fs.renameSync(readyTmp,process.env.TEST_READY);"
         "process.kill(process.pid,'SIGKILL');",
     ], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
        env={**os.environ, "NOMUSIC_VERIFY_BROWSER_LAUNCHER": str(launcher),

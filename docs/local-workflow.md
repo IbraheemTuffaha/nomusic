@@ -86,8 +86,11 @@ preserved.
 
 Pause playback and finish exports, then press **Control+C** in the helper's
 terminal. If work is active, it reports a shutdown wait of up to 60 seconds.
-A second **Control+C** forces immediate exit. Startup model loading by itself
-does not cause a long wait. Completed media/model caches and ready export
+A second **Control+C** forces immediate exit. On macOS, the equivalent
+background-service commands are `service.sh status`, `service.sh restart` and
+`service.sh uninstall`; the service runs only after the user logs in.
+
+Startup model loading by itself does not cause a long wait. Completed media/model caches and ready export
 artifacts survive a normal restart; an interrupted queued/building export is
 reconciled and can simply be requested again after startup.
 

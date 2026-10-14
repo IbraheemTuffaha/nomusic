@@ -57,6 +57,11 @@ From the project folder, with any existing nomusic helper stopped:
 
 ```sh
 ./install.sh
+```
+
+On Mac, the installer offers to keep the backend running as a per-user background service. See the [background service guide](docs/background-service.md).
+
+```sh
 backend/.venv/bin/nomusic doctor
 ```
 
@@ -71,21 +76,26 @@ if you already have a backup or use a custom environment.
 
 ## 3. Start the helper
 
-Generate a key once, copy it into the extension settings, then start the helper:
+Generate a key once and copy it into the extension settings. For the optional
+Mac background service, enable it after generating the key. Otherwise start the
+helper in the terminal:
 
 ```sh
 backend/.venv/bin/nomusic auth generate --label "this computer"
-backend/.venv/bin/nomusic serve
+./service.sh install  # when using the Mac background service
+# or: backend/.venv/bin/nomusic serve
 ```
 
-Keep this Terminal window open. The helper listens at `http://127.0.0.1:8723`;
-its model may still be loading after the listening message appears. The
-[local-use guide](docs/local-workflow.md) explains checking readiness.
+When using the background service, do not also run `nomusic serve` in a
+Terminal. For the terminal path, keep the Terminal window open. Either path
+listens at `http://127.0.0.1:8723`; its model may still be loading after the
+listening message appears. The [local-use guide](docs/local-workflow.md)
+explains checking readiness.
 
-To stop, press **Control + C**. Active processing or requests get up to
-60 seconds to finish stopping; a second **Control + C** forces exit immediately.
-Stopping while only the startup model load is running exits promptly.
-Next time, open Terminal in the project folder and run the same serve command.
+To stop the terminal helper, press **Control + C**. Active processing or
+requests get up to 60 seconds to finish stopping; a second **Control + C**
+forces exit immediately. Stopping while only the startup model load is running
+exits promptly. To stop the background service, run `./service.sh uninstall`.
 
 ## 4. Add the extension
 
@@ -125,6 +135,7 @@ and metadata locally. Installation also contacts package and model hosts.
 
 - [Installation and development](docs/installation.md): profiles, upgrades,
   model storage and editable development.
+- [Background service](docs/background-service.md): install, status, restart and removal on macOS.
 - [Reference](docs/reference.md): architecture, all backend settings and API.
 - [Verification](docs/verification.md): installed-package tests, CPU/extension
   smoke and their limits.

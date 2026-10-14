@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     generate = auth_commands.add_parser("generate", help="Create a new operator key")
     generate.add_argument("--label", default=None, help="Optional operator/device label")
     generate.add_argument("--json", action="store_true", help="Print machine-readable output")
+    auth_check = auth_commands.add_parser("check", help="Validate the local operator-key configuration")
     auth_list = auth_commands.add_parser("list", help="List key ids without revealing keys")
     auth_list.add_argument("--json", action="store_true", help="Print machine-readable output")
     revoke = auth_commands.add_parser("revoke", help="Revoke a key by its id")
@@ -87,7 +88,10 @@ def main(argv: list[str] | None = None) -> int:
             from .auth import AuthStore
             from .config import SETTINGS
 
-            store = AuthStore(SETTINGS.auth_file, required=False)
+            store = AuthStore(
+                SETTINGS.auth_file,
+                required=options.auth_command == "check",
+            )
             if options.auth_command == "generate":
                 raw, info = store.generate(options.label)
                 payload = {
@@ -104,6 +108,9 @@ def main(argv: list[str] | None = None) -> int:
                     print(raw)
                     print(f"Key id: {info.key_id}")
                     print("Store it in the extension's trusted backend settings.")
+            elif options.auth_command == "check":
+                store.validate()
+                print(f"Operator-key configuration is valid: {SETTINGS.auth_file}")
             elif options.auth_command == "list":
                 entries = [
                     {

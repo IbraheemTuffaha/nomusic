@@ -85,14 +85,20 @@ def validate_public_url(url: str) -> str:
     return str(url).strip()
 
 
-def _validate_media_targets(info: dict[str, Any], _incomplete: bool) -> str | None:
-    """Reject extractor-selected media URLs on private/special hosts.
+def _validate_media_targets(info: dict[str, Any], incomplete: bool = False) -> str | None:
+    """Reject extractor-selected media URLs on private or special hosts.
 
     The request URL is validated by the route and again immediately before
     yt-dlp starts. Extractors can still select a separate manifest or media
     URL, so yt-dlp's pre-download match hook applies the same policy to those
     delayed destinations.
+
+    yt-dlp calls this as ``match_filter(info, incomplete=...)`` and older
+    callers use ``match_filter(info)``. The parameter name is part of that
+    contract. A partial info dict can already name a media URL, so
+    ``incomplete`` does not skip the check.
     """
+    del incomplete
     candidates: list[str] = []
     for key in ("url", "manifest_url", "fragment_base_url"):
         value = info.get(key)
